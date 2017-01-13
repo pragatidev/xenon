@@ -1420,6 +1420,21 @@ public class ServiceHost implements ServiceRequestSender {
         coreServices.add(new ProcessFactoryService());
         coreServices.add(new ODataQueryService());
 
+        // start AuthN service before factories since its invoked in the IO path on every
+        // request
+        if (this.authenticationService != null) {
+            if (!(this.authenticationService instanceof BasicAuthenticationService)) {
+                addPrivilegedService(this.authenticationService.getClass());
+                startCoreServicesSynchronously(this.authenticationService);
+            } else {
+                // if the authenticationService is set as BasicAuthenticationService use it
+                setBasicAuthenticationService(this.authenticationService);
+            }
+        }
+
+        // start the BasicAuthenticationService anyways
+        coreServices.add(this.basicAuthenticationService);
+
         // Start persisted factories here, after document index is added
         coreServices.add(AuthCredentialsService.createFactory());
         Service userGroupFactory = UserGroupService.createFactory();
@@ -1437,19 +1452,6 @@ public class ServiceHost implements ServiceRequestSender {
         coreServices.add(TenantService.createFactory());
         coreServices.add(new SystemUserService());
         coreServices.add(new GuestUserService());
-
-        if (this.authenticationService != null ) {
-            if (!(this.authenticationService instanceof BasicAuthenticationService)) {
-                addPrivilegedService(this.authenticationService.getClass());
-                startCoreServicesSynchronously(this.authenticationService);
-            } else {
-                // if the authenticationService is set as BasicAuthenticationService use it
-                setBasicAuthenticationService(this.authenticationService);
-            }
-        }
-
-        // start the BasicAuthenticationService anyways
-        coreServices.add(this.basicAuthenticationService);
 
         Service transactionFactoryService = new TransactionFactoryService();
         coreServices.add(transactionFactoryService);
@@ -2386,7 +2388,8 @@ public class ServiceHost implements ServiceRequestSender {
         }
 
         if (!isIdempotent && !post.isSynchronize()) {
-            if (ServiceHost.isServiceStarting(existing.getProcessingStage())) {
+            ProcessingStage ps = existing.getProcessingStage();
+            if (ps == ProcessingStage.STOPPED || ServiceHost.isServiceStarting(ps)) {
                 // there is a possibility of collision with a synchronization attempt: The sync task
                 // attaches a child it enumerated from a peer, starts in stage CREATED while loading
                 // state from index, and then discovers service is deleted. In the meantime a legitimate
@@ -3223,44 +3226,54 @@ public class ServiceHost implements ServiceRequestSender {
             checkAndPopulateAuthzContext(service, inboundOp);
             return;
         }
-        if (this.authenticationService != null
-                && BasicAuthenticationUtils.getAuthToken(inboundOp) == null) {
 
-            if (!getAuthenticationServiceUri().getPath()
-                    .equals(inboundOp.getUri().getPath()) &&
-                    !getBasicAuthenticationServiceUri().getPath().equals(
-                            inboundOp.getUri().getPath())) {
-                inboundOp.nestCompletion((op, ex) -> {
-                    if (ex != null) {
-                        inboundOp.setBodyNoCloning(op.getBodyRaw())
-                            .setStatusCode(op.getStatusCode()).fail(ex);
-                        return;
-                    }
-                    // if the status code was anything but 200, and the operation
-                    // was not marked as failed, terminate the processing chain;
-                    // else proceed with the original request using the guest context
-                    if (op.getStatusCode() != Operation.STATUS_CODE_OK) {
-                        inboundOp.setBodyNoCloning(op.getBodyRaw())
-                            .setStatusCode(op.getStatusCode()).complete();
-                        return;
-                    }
-                    populateAuthorizationContext(inboundOp, authorizationContext -> {
-                        checkAndPopulateAuthzContext(service, inboundOp);
-                    });
-                });
-                queueOrScheduleRequest(this.authenticationService, inboundOp);
-            } else {
-                // allow the call to authenticationService to pass through using
-                // guest context this is needed for getting the token
-                populateAuthorizationContext(inboundOp, authorizationContext -> {
-                    checkAndPopulateAuthzContext(service, inboundOp);
-                });
-            }
-        } else {
+        if (BasicAuthenticationUtils.getAuthToken(inboundOp) != null) {
+            populateAuthorizationContext(inboundOp, (authorizationContext) -> {
+                checkAndPopulateAuthzContext(service, inboundOp);
+            });
+            return;
+        }
+
+        // If the inbound op targets a valid authentication service, then allow it to proceed using
+        // the guest context; this is needed so that clients can get the token.
+        URI authServiceUri = getAuthenticationServiceUri();
+        if (authServiceUri != null
+                && authServiceUri.getPath().equals(inboundOp.getUri().getPath())) {
+            populateAuthorizationContext(inboundOp, (authorizationContext) -> {
+                checkAndPopulateAuthzContext(service, inboundOp);
+            });
+            return;
+        }
+
+        URI basicAuthServiceUri = getBasicAuthenticationServiceUri();
+        if (basicAuthServiceUri != null
+                && basicAuthServiceUri.getPath().equals(inboundOp.getUri().getPath())) {
             populateAuthorizationContext(inboundOp, authorizationContext -> {
                 checkAndPopulateAuthzContext(service, inboundOp);
             });
+            return;
         }
+
+        // Dispatch the operation to the authentication service for handling.
+        inboundOp.nestCompletion((op, ex) -> {
+            if (ex != null) {
+                inboundOp.setBodyNoCloning(op.getBodyRaw())
+                        .setStatusCode(op.getStatusCode()).fail(ex);
+                return;
+            }
+            // If the status code was anything but 200, and the operation
+            // was not marked as failed, terminate the processing chain;
+            // else proceed with the original request using the guest context
+            if (op.getStatusCode() != Operation.STATUS_CODE_OK) {
+                inboundOp.setBodyNoCloning(op.getBodyRaw())
+                        .setStatusCode(op.getStatusCode()).complete();
+                return;
+            }
+            populateAuthorizationContext(inboundOp, authorizationContext -> {
+                checkAndPopulateAuthzContext(service, inboundOp);
+            });
+        });
+        queueOrScheduleRequest(this.authenticationService, inboundOp);
     }
 
     private void checkAndPopulateAuthzContext(Service service, Operation inboundOp) {
@@ -3886,59 +3899,51 @@ public class ServiceHost implements ServiceRequestSender {
     }
 
     private void queueOrScheduleRequest(Service s, Operation op) {
-        boolean processRequest = true;
-        try {
-            ProcessingStage stage = s.getProcessingStage();
-            if (stage == ProcessingStage.AVAILABLE) {
+        ProcessingStage stage = s.getProcessingStage();
+        if (stage == ProcessingStage.AVAILABLE) {
+            queueOrScheduleRequestInternal(s, op);
+            return;
+        }
+
+        if (op.getAction() == Action.DELETE) {
+            queueOrScheduleRequestInternal(s, op);
+            return;
+        }
+
+        if (stage == ProcessingStage.STOPPED) {
+            if (op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_POST_TO_PUT)) {
+                // service stopped after we decided it already existed and attempted
+                // a IDEMPOTENT POST->PUT. Retry the original POST.
+                restoreActionOnChildServiceToPostOnFactory(s.getSelfLink(), op);
+                handleRequest(null, op);
                 return;
             }
-
-            if (op.getAction() == Action.DELETE) {
+            if (s.hasOption(ServiceOption.ON_DEMAND_LOAD)) {
+                retryPauseOrOnDemandLoadConflict(op, true);
                 return;
             }
+            op.setStatusCode(Operation.STATUS_CODE_NOT_FOUND);
+        } else if (stage == ProcessingStage.PAUSED) {
+            retryPauseOrOnDemandLoadConflict(op, false);
+            return;
+        }
 
-            processRequest = false;
+        op.fail(new CancellationException("Service not available, in stage: " + stage));
+    }
 
-            if (stage == ProcessingStage.STOPPED) {
-                if (op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_POST_TO_PUT)) {
-                    // service stopped after we decided it already existed and attempted
-                    // a IDEMPOTENT POST->PUT. Retry the original POST.
-                    restoreActionOnChildServiceToPostOnFactory(s.getSelfLink(), op);
-                    handleRequest(null, op);
-                    return;
+    private void queueOrScheduleRequestInternal(Service s, Operation op) {
+        if (!s.queueRequest(op)) {
+            Runnable r = () -> {
+                OperationContext opCtx = extractAndApplyContext(op);
+                try {
+                    s.handleRequest(op);
+                } catch (Throwable e) {
+                    handleUncaughtException(s, op, e);
+                } finally {
+                    OperationContext.setFrom(opCtx);
                 }
-                if (s.hasOption(ServiceOption.ON_DEMAND_LOAD)) {
-                    retryPauseOrOnDemandLoadConflict(op, true);
-                    return;
-                }
-                op.setStatusCode(Operation.STATUS_CODE_NOT_FOUND);
-            } else if (stage == ProcessingStage.PAUSED) {
-                retryPauseOrOnDemandLoadConflict(op, false);
-                return;
-            }
-
-            op.fail(new CancellationException("Service not available, in stage:" + stage));
-        } catch (Throwable e) {
-            processRequest = false;
-            op.fail(e);
-        } finally {
-            if (!processRequest) {
-                return;
-            }
-
-            if (!s.queueRequest(op)) {
-                Runnable r = () -> {
-                    OperationContext opCtx = extractAndApplyContext(op);
-                    try {
-                        s.handleRequest(op);
-                    } catch (Throwable e) {
-                        handleUncaughtException(s, op, e);
-                    } finally {
-                        OperationContext.setFrom(opCtx);
-                    }
-                };
-                this.executor.execute(r);
-            }
+            };
+            this.executor.execute(r);
         }
     }
 

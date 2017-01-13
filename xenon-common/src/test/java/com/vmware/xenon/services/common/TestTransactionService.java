@@ -432,6 +432,7 @@ public class TestTransactionService extends BasicReusableHostTestCase {
         countAccounts(null, 0);
     }
 
+    @Ignore
     @Test
     public void testSingleClientMultiDocumentConcurrentTransactions() throws Throwable {
         String txid = newTransaction();
@@ -448,6 +449,7 @@ public class TestTransactionService extends BasicReusableHostTestCase {
         countAccounts(null, 0);
     }
 
+    @Ignore
     @Test
     public void testTransactionWithFailedOperations() throws Throwable {
         // create accounts, each with an initial balance of 100
