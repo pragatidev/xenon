@@ -17,6 +17,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +30,7 @@ import org.junit.Test;
 
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
+import com.vmware.xenon.common.ServiceStats.ServiceStatLogHistogram;
 import com.vmware.xenon.common.ServiceStats.TimeSeriesStats;
 import com.vmware.xenon.common.ServiceStats.TimeSeriesStats.AggregationType;
 import com.vmware.xenon.common.ServiceStats.TimeSeriesStats.TimeBin;
@@ -36,16 +38,9 @@ import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.MinimalTestService;
+import com.vmware.xenon.services.common.ServiceUriPaths;
 
 public class TestUtilityService extends BasicReusableHostTestCase {
-
-    private List<Service> createServices(int count) throws Throwable {
-        List<Service> services = this.host.doThroughputServiceStart(
-                count, MinimalTestService.class,
-                this.host.buildMinimalTestState(),
-                null, null);
-        return services;
-    }
 
     @Before
     public void setUp() {
@@ -92,19 +87,14 @@ public class TestUtilityService extends BasicReusableHostTestCase {
 
         this.testWait(ctx2);
 
-        List<Service> services = createServices(count);
-        // verify no stats exist before we enable that capability
-        for (Service s : services) {
-            Map<String, ServiceStat> stats = this.host.getServiceStats(s.getUri());
-            assertTrue(stats != null);
-            assertTrue(stats.isEmpty());
-        }
+        List<URI> services = this.host.createExampleServices(this.host, count, null);
 
         updateBody = ServiceConfigUpdateRequest.create();
-        updateBody.addOptions = EnumSet.of(ServiceOption.INSTRUMENTATION);
+        updateBody.addOptions = EnumSet.of(ServiceOption.PERIODIC_MAINTENANCE);
+        updateBody.peerNodeSelectorPath = ServiceUriPaths.DEFAULT_1X_NODE_SELECTOR;
         ctx = this.testCreate(services.size());
-        for (Service s : services) {
-            configUri = UriUtils.buildConfigUri(s.getUri());
+        for (URI u : services) {
+            configUri = UriUtils.buildConfigUri(u);
             this.host.send(Operation.createPatch(configUri).setBody(updateBody)
                     .setCompletion(ctx.getCompletion()));
         }
@@ -112,39 +102,43 @@ public class TestUtilityService extends BasicReusableHostTestCase {
 
         // get configuration and verify options
         TestContext ctx3 = testCreate(services.size());
-        for (Service s : services) {
-            URI u = UriUtils.buildConfigUri(s.getUri());
+        for (URI serviceUri : services) {
+            URI u = UriUtils.buildConfigUri(serviceUri);
             host.send(Operation.createGet(u).setCompletion((o, e) -> {
                 if (e != null) {
                     ctx3.failIteration(e);
                     return;
                 }
-
                 ServiceConfiguration cfg = o.getBody(ServiceConfiguration.class);
-                if (cfg.options.contains(ServiceOption.INSTRUMENTATION)) {
-                    ctx3.completeIteration();
-                } else {
+                if (!cfg.options.contains(ServiceOption.PERIODIC_MAINTENANCE)) {
                     ctx3.failIteration(new IllegalStateException(Utils.toJsonHtml(cfg)));
+                    return;
                 }
 
+                if (!ServiceUriPaths.DEFAULT_1X_NODE_SELECTOR.equals(cfg.peerNodeSelectorPath)) {
+                    ctx3.failIteration(new IllegalStateException(Utils.toJsonHtml(cfg)));
+                    return;
+                }
+                ctx3.completeIteration();
             }));
         }
         testWait(ctx3);
 
-        ctx = testCreate(services.size());
-        // issue some updates so stats get updated
-        for (Service s : services) {
-            this.host.send(Operation.createPatch(s.getUri())
-                    .setBody(this.host.buildMinimalTestState())
-                    .setCompletion(ctx.getCompletion()));
-        }
-        testWait(ctx);
+        // since we enabled periodic maintenance, verify the new maintenance related stat is present
+        this.host.waitFor("maintenance stat not present", () -> {
+            for (URI u : services) {
+                Map<String, ServiceStat> stats = this.host.getServiceStats(u);
+                ServiceStat maintStat = stats.get(Service.STAT_NAME_MAINTENANCE_COUNT);
+                if (maintStat == null) {
+                    return false;
+                }
+                if (maintStat.latestValue == 0) {
+                    return false;
+                }
+            }
+            return true;
+        });
 
-        for (Service s : services) {
-            Map<String, ServiceStat> stats = this.host.getServiceStats(s.getUri());
-            assertTrue(stats != null);
-            assertTrue(!stats.isEmpty());
-        }
     }
 
     @Test
@@ -182,7 +176,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
     }
 
     @Test
-    public void testUtilityStats() throws Throwable {
+    public void statRESTActions() throws Throwable {
         String name = UUID.randomUUID().toString();
         ExampleServiceState s = new ExampleServiceState();
         s.name = name;
@@ -219,8 +213,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         stat.sourceTimeMicrosUtc = updatedMicrosUtc1;
         this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
-        allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
-                this.host, exampleServiceState.documentSelfLink));
+        allStats = getStats(exampleServiceState);
         retStatEntry = allStats.entries.get("key1");
         assertTrue(retStatEntry.accumulatedValue == 150);
         assertTrue(retStatEntry.latestValue == 50);
@@ -237,8 +230,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         stat.sourceTimeMicrosUtc = updatedMicrosUtc2;
         this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
-        allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
-                this.host, exampleServiceState.documentSelfLink));
+        allStats = getStats(exampleServiceState);
         retStatEntry = allStats.entries.get("key1");
         assertTrue(retStatEntry.accumulatedValue == 150);
         assertTrue(retStatEntry.latestValue == 50);
@@ -260,8 +252,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         stat.sourceTimeMicrosUtc = null;
         this.host.sendAndWaitExpectSuccess(Operation.createPut(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
-        allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
-                this.host, exampleServiceState.documentSelfLink));
+        allStats = getStats(exampleServiceState);
         retStatEntry = allStats.entries.get("key1");
         assertTrue(retStatEntry.accumulatedValue == 75);
         assertTrue(retStatEntry.latestValue == 75);
@@ -277,8 +268,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         stats.entries.put("key3", stat);
         this.host.sendAndWaitExpectSuccess(Operation.createPut(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stats));
-        allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
-                this.host, exampleServiceState.documentSelfLink));
+        allStats = getStats(exampleServiceState);
         if (allStats.entries.size() != 1) {
             // there is a possibility of node group maintenance kicking in and adding a stat
             ServiceStat nodeGroupStat = allStats.entries.get(
@@ -299,11 +289,206 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         stat.latestValue = 25;
         this.host.sendAndWaitExpectSuccess(Operation.createPatch(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
-        allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
-                this.host, exampleServiceState.documentSelfLink));
+        allStats = getStats(exampleServiceState);
         retStatEntry = allStats.entries.get("key3");
         assertTrue(retStatEntry.latestValue == 225);
         assertTrue(retStatEntry.version == 2);
+
+        verifyGetWithODataOnStats(exampleServiceState);
+
+        verifyStatCreationAttemptAfterGet();
+
+    }
+
+    private void verifyGetWithODataOnStats(ExampleServiceState exampleServiceState) {
+        URI exampleStatsUri = UriUtils.buildStatsUri(this.host,
+                exampleServiceState.documentSelfLink);
+        // bulk PUT to set stats to a known state
+        ServiceStats stats = new ServiceStats();
+        stats.kind = ServiceStats.KIND;
+        ServiceStat stat = new ServiceStat();
+        stat.name = "key1";
+        stat.latestValue = 100;
+        stats.entries.put(stat.name, stat);
+        stat = new ServiceStat();
+        stat.name = "key2";
+        stat.latestValue = 0.0;
+        stats.entries.put(stat.name, stat);
+        stat = new ServiceStat();
+        stat.name = "key3";
+        stat.latestValue = -200;
+        stats.entries.put(stat.name, stat);
+        stat = new ServiceStat();
+        stat.name = "someKey" + ServiceStats.STAT_NAME_SUFFIX_PER_DAY;
+        stat.latestValue = 1000;
+        stats.entries.put(stat.name, stat);
+        stat = new ServiceStat();
+        stat.name = "someOtherKey" + ServiceStats.STAT_NAME_SUFFIX_PER_DAY;
+        stat.latestValue = 2000;
+        stats.entries.put(stat.name, stat);
+        this.host.sendAndWaitExpectSuccess(Operation.createPut(exampleStatsUri).setBody(stats));
+
+        // negative tests
+        URI exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_COUNT, Boolean.TRUE.toString());
+        this.host.sendAndWaitExpectFailure(Operation.createGet(exampleStatsUriWithODATA));
+
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_ORDER_BY, "name");
+        this.host.sendAndWaitExpectFailure(Operation.createGet(exampleStatsUriWithODATA));
+
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_SKIP_TO, "100");
+        this.host.sendAndWaitExpectFailure(Operation.createGet(exampleStatsUriWithODATA));
+
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_TOP, "100");
+        this.host.sendAndWaitExpectFailure(Operation.createGet(exampleStatsUriWithODATA));
+
+        // attempt long value LE on latestVersion, should fail
+        String odataFilterValue = String.format("%s le %d",
+                ServiceStat.FIELD_NAME_LATEST_VALUE,
+                1001);
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        this.host.sendAndWaitExpectFailure(Operation.createGet(exampleStatsUriWithODATA));
+
+        // Positive filter tests
+        String statName = "key1";
+        // test filter for exact match
+        odataFilterValue = String.format("%s eq %s",
+                ServiceStat.FIELD_NAME_NAME,
+                statName);
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        ServiceStats filteredStats = getStats(exampleStatsUriWithODATA);
+        assertTrue(filteredStats.entries.size() == 1);
+        assertTrue(filteredStats.entries.containsKey(statName));
+
+        // test filter with prefix match
+        odataFilterValue = String.format("%s eq %s*",
+                ServiceStat.FIELD_NAME_NAME,
+                "key");
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        filteredStats = getStats(exampleStatsUriWithODATA);
+        // three entries start with "key"
+        assertTrue(filteredStats.entries.size() == 3);
+        assertTrue(filteredStats.entries.containsKey("key1"));
+        assertTrue(filteredStats.entries.containsKey("key2"));
+        assertTrue(filteredStats.entries.containsKey("key3"));
+
+        // test filter with suffix match, common for time series filtering
+        odataFilterValue = String.format("%s eq *%s",
+                ServiceStat.FIELD_NAME_NAME,
+                ServiceStats.STAT_NAME_SUFFIX_PER_DAY);
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        filteredStats = getStats(exampleStatsUriWithODATA);
+        // two entries end with "Day"
+        assertTrue(filteredStats.entries.size() == 2);
+        assertTrue(filteredStats.entries
+                .containsKey("someKey" + ServiceStats.STAT_NAME_SUFFIX_PER_DAY));
+        assertTrue(filteredStats.entries
+                .containsKey("someOtherKey" + ServiceStats.STAT_NAME_SUFFIX_PER_DAY));
+
+        // filter on latestValue, GE
+        odataFilterValue = String.format("%s ge %f",
+                ServiceStat.FIELD_NAME_LATEST_VALUE,
+                0.0);
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        filteredStats = getStats(exampleStatsUriWithODATA);
+        assertTrue(filteredStats.entries.size() == 4);
+
+        // filter on latestValue, GT
+        odataFilterValue = String.format("%s gt %f",
+                ServiceStat.FIELD_NAME_LATEST_VALUE,
+                0.0);
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        filteredStats = getStats(exampleStatsUriWithODATA);
+        assertTrue(filteredStats.entries.size() == 3);
+
+        // filter on latestValue, eq
+        odataFilterValue = String.format("%s eq %f",
+                ServiceStat.FIELD_NAME_LATEST_VALUE,
+                -200.0);
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        filteredStats = getStats(exampleStatsUriWithODATA);
+        assertTrue(filteredStats.entries.size() == 1);
+
+        // filter on latestValue, le
+        odataFilterValue = String.format("%s le %f",
+                ServiceStat.FIELD_NAME_LATEST_VALUE,
+                1000.0);
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        filteredStats = getStats(exampleStatsUriWithODATA);
+        assertTrue(filteredStats.entries.size() == 2);
+
+        // filter on latestValue, lt AND gt
+        odataFilterValue = String.format("%s lt %f and %s gt %f",
+                ServiceStat.FIELD_NAME_LATEST_VALUE,
+                2000.0,
+                ServiceStat.FIELD_NAME_LATEST_VALUE,
+                1000.0);
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        filteredStats = getStats(exampleStatsUriWithODATA);
+        // two entries end with "Day"
+        assertTrue(filteredStats.entries.size() == 0);
+
+        // test dual filter with suffix match, and latest value LEQ
+        odataFilterValue = String.format("%s eq *%s and %s le %f",
+                ServiceStat.FIELD_NAME_NAME,
+                ServiceStats.STAT_NAME_SUFFIX_PER_DAY,
+                ServiceStat.FIELD_NAME_LATEST_VALUE,
+                1001.0);
+        exampleStatsUriWithODATA = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        filteredStats = getStats(exampleStatsUriWithODATA);
+        // single entry ends with "Day" and has latestValue <= 1000
+        assertTrue(filteredStats.entries.size() == 1);
+        assertTrue(filteredStats.entries
+                .containsKey("someKey" + ServiceStats.STAT_NAME_SUFFIX_PER_DAY));
+
+    }
+
+    private void verifyStatCreationAttemptAfterGet() throws Throwable {
+        // Create a stat without a log histogram or time series, then try to recreate with
+        // the extra features and make sure its updated
+
+        List<Service> services = this.host.doThroughputServiceStart(
+                1, MinimalTestService.class,
+                this.host.buildMinimalTestState(), EnumSet.of(ServiceOption.INSTRUMENTATION), null);
+
+        final String statName = "foo";
+        for (Service service : services) {
+            service.setStat(statName, 1.0);
+            ServiceStat st = service.getStat(statName);
+            assertTrue(st.timeSeriesStats == null);
+            assertTrue(st.logHistogram == null);
+            ServiceStat stNew = new ServiceStat();
+            stNew.name = statName;
+            stNew.logHistogram = new ServiceStatLogHistogram();
+            stNew.timeSeriesStats = new TimeSeriesStats(60,
+                    TimeUnit.MINUTES.toMillis(1), EnumSet.of(AggregationType.AVG));
+            service.setStat(stNew, 11.0);
+            st = service.getStat(statName);
+            assertTrue(st.timeSeriesStats != null);
+            assertTrue(st.logHistogram != null);
+        }
+    }
+
+    private ServiceStats getStats(ExampleServiceState exampleServiceState) {
+        return this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
+                this.host, exampleServiceState.documentSelfLink));
+    }
+
+    private ServiceStats getStats(URI statsUri) {
+        return this.host.getServiceState(null, ServiceStats.class, statsUri);
     }
 
     @Test
@@ -321,6 +506,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
             timeSeriesStats.add(startTime, value, 1);
         }
         assertTrue(timeSeriesStats.bins.size() == numBins);
+
         // insert additional unique datapoints; the earliest entries should be dropped
         for (int i = 0; i < numBins / 2; i++) {
             startTime += TimeUnit.MILLISECONDS.toMicros(interval);
@@ -347,6 +533,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         }
         TimeBin lastBin = timeSeriesStats.bins.get(timeSeriesStats.bins.lastKey());
         assertTrue(lastBin.avg.equals(accumulatedValue / count));
+        assertTrue(lastBin.var.equals((1.0 * numBins) / 2.0));
         assertTrue(lastBin.sum.equals((2 * count) - 1));
         assertTrue(lastBin.count == count);
         assertTrue(lastBin.max.equals(newValue));
@@ -445,9 +632,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
                 this.host, returnExampleState.documentSelfLink)).setBody(sourceStat1));
         this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
                 this.host, returnExampleState.documentSelfLink)).setBody(sourceStat2));
-        allStats = this.host.getServiceState(null, ServiceStats.class,
-                UriUtils.buildStatsUri(
-                        this.host, returnExampleState.documentSelfLink));
+        allStats = getStats(returnExampleState);
         retStatEntry = allStats.entries.get(sourceStat1.name);
         assertTrue(retStatEntry.accumulatedValue == 100);
         assertTrue(retStatEntry.latestValue == 100);
@@ -600,4 +785,44 @@ public class TestUtilityService extends BasicReusableHostTestCase {
             assertTrue(maxCount >= 1);
         }
     }
+
+    @Test
+    public void statsKeyOrder() {
+
+        ExampleServiceState state = new ExampleServiceState();
+        state.name = "foo";
+        Operation post = Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state);
+        state = this.sender.sendAndWait(post, ExampleServiceState.class);
+
+        ServiceStats stats = new ServiceStats();
+        ServiceStat stat = new ServiceStat();
+        stat.name = "keyBBB";
+        stat.latestValue = 10;
+        stats.entries.put(stat.name, stat);
+        stat = new ServiceStat();
+        stat.name = "keyCCC";
+        stat.latestValue = 10;
+        stats.entries.put(stat.name, stat);
+        stat = new ServiceStat();
+        stat.name = "keyAAA";
+        stat.latestValue = 10;
+        stats.entries.put(stat.name, stat);
+
+        URI exampleStatsUri = UriUtils.buildStatsUri(this.host, state.documentSelfLink);
+        this.sender.sendAndWait(Operation.createPut(exampleStatsUri).setBody(stats));
+
+        // odata stats prefix query
+        String odataFilterValue = String.format("%s eq %s*", ServiceStat.FIELD_NAME_NAME, "key");
+        URI filteredStats = UriUtils.extendUriWithQuery(exampleStatsUri,
+                UriUtils.URI_PARAM_ODATA_FILTER, odataFilterValue);
+        ServiceStats result = getStats(filteredStats);
+
+        // verify stats key order
+        assertEquals(3, result.entries.size());
+        List<String> statList = new ArrayList<>(result.entries.keySet());
+        assertEquals("stat index 0", "keyAAA", statList.get(0));
+        assertEquals("stat index 1", "keyBBB", statList.get(1));
+        assertEquals("stat index 2", "keyCCC", statList.get(2));
+    }
+
 }

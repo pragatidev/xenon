@@ -20,9 +20,11 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import com.vmware.xenon.common.Operation.AuthorizationContext;
+import com.vmware.xenon.common.OperationProcessingChain.OperationProcessingContext;
+import com.vmware.xenon.common.RequestRouter.Route.RouteDocumentation;
+import com.vmware.xenon.common.RequestRouter.Route.SupportLevel;
 import com.vmware.xenon.common.ServiceHost.ServiceNotFoundException;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
-import com.vmware.xenon.common.ServiceStats.TimeSeriesStats.AggregationType;
 import com.vmware.xenon.common.jwt.Signer;
 import com.vmware.xenon.common.jwt.Verifier;
 import com.vmware.xenon.services.common.ServiceUriPaths;
@@ -34,6 +36,7 @@ import com.vmware.xenon.services.common.ServiceUriPaths;
 public class StatelessService implements Service {
 
     private long maintenanceIntervalMicros;
+    private Long cacheClearDelayMicros;
     private OperationProcessingChain opProcessingChain;
     private ProcessingStage stage = ProcessingStage.CREATED;
     private ServiceHost host;
@@ -107,13 +110,30 @@ public class StatelessService implements Service {
         try {
             if (opProcessingStage == OperationProcessingStage.PROCESSING_FILTERS) {
                 OperationProcessingChain opProcessingChain = getOperationProcessingChain();
-                if (opProcessingChain != null && !opProcessingChain.processRequest(op)) {
+                if (opProcessingChain != null) {
+                    OperationProcessingContext context = opProcessingChain.createContext(getHost());
+                    context.setService(this);
+                    opProcessingChain.processRequest(op, context, o -> {
+                        handleRequest(op, OperationProcessingStage.EXECUTING_SERVICE_HANDLER);
+                    });
                     return;
                 }
                 opProcessingStage = OperationProcessingStage.EXECUTING_SERVICE_HANDLER;
             }
 
             if (opProcessingStage == OperationProcessingStage.EXECUTING_SERVICE_HANDLER) {
+
+                op.nestCompletion(o -> {
+                    if (op.getStatusCode() == Operation.STATUS_CODE_NOT_MODIFIED) {
+                        // nullify the body since HTTP-304 cannot have body in response.
+                        // It is defined for GET, but not defined for other actions.
+                        // For now, apply the same behavior to all http actions.
+                        // If we want to apply only for GET, this logic can move to handleGetCompletion
+                        op.setBodyNoCloning(null);
+                    }
+                    op.complete();
+                });
+
                 if (op.getAction() == Action.GET) {
                     if (ServiceHost.isForServiceNamespace(this, op)) {
                         handleGet(op);
@@ -159,17 +179,19 @@ public class StatelessService implements Service {
                     handlePut(op);
                 }
             }
-        } catch (Throwable e) {
+        } catch (Exception e) {
             op.fail(e);
         }
     }
 
+    @RouteDocumentation(supportLevel = SupportLevel.NOT_SUPPORTED)
     public void handlePut(Operation put) {
-        getHost().failRequestActionNotSupported(put);
+        Operation.failActionNotSupported(put);
     }
 
+    @RouteDocumentation(supportLevel = SupportLevel.NOT_SUPPORTED)
     public void handlePatch(Operation patch) {
-        getHost().failRequestActionNotSupported(patch);
+        Operation.failActionNotSupported(patch);
     }
 
     public void handleOptions(Operation options) {
@@ -203,8 +225,9 @@ public class StatelessService implements Service {
         options.complete();
     }
 
+    @RouteDocumentation(supportLevel = SupportLevel.NOT_SUPPORTED)
     public void handlePost(Operation post) {
-        getHost().failRequestActionNotSupported(post);
+        Operation.failActionNotSupported(post);
     }
 
     public void handleGet(Operation get) {
@@ -308,6 +331,9 @@ public class StatelessService implements Service {
 
     @Override
     public URI getUri() {
+        if (this.host == null) {
+            return null;
+        }
         return UriUtils.buildUri(this.host, this.selfLink);
     }
 
@@ -401,22 +427,6 @@ public class StatelessService implements Service {
         return this.utilityService.getStat(name);
     }
 
-    public ServiceStat getHistogramStat(String name) {
-        return ServiceStatUtils.getHistogramStat(this, name);
-    }
-
-    public ServiceStat getTimeSeriesStat(String name, int numBins, long binDurationMillis,
-            EnumSet<AggregationType> aggregationType) {
-        return ServiceStatUtils.getTimeSeriesStat(this, name, numBins, binDurationMillis,
-                aggregationType);
-    }
-
-    public ServiceStat getTimeSeriesHistogramStat(String name, int numBins, long binDurationMillis,
-            EnumSet<AggregationType> aggregationType) {
-        return ServiceStatUtils.getTimeSeriesHistogramStat(this, name, numBins, binDurationMillis,
-                aggregationType);
-    }
-
     /**
      * Value indicating whether GET on /available returns 200 or 503
      * The method is a convenience method since it relies on STAT_NAME_AVAILABLE to report
@@ -435,7 +445,7 @@ public class StatelessService implements Service {
             return true;
         }
         // processing stage must also indicate service is started
-        if (this.stage != ProcessingStage.AVAILABLE && this.stage != ProcessingStage.PAUSED) {
+        if (this.stage != ProcessingStage.AVAILABLE) {
             return false;
         }
         ServiceStat st = this.getStat(STAT_NAME_AVAILABLE);
@@ -469,18 +479,23 @@ public class StatelessService implements Service {
     }
 
     @Override
-    public ServiceRuntimeContext setProcessingStage(ProcessingStage stage) {
+    public void setProcessingStage(ProcessingStage stage) {
         if (this.stage == stage) {
-            return null;
+            return;
         }
 
         this.stage = stage;
-        if (stage != ProcessingStage.AVAILABLE) {
-            return null;
+
+        if (stage == ProcessingStage.AVAILABLE) {
+            getHost().processPendingServiceAvailableOperations(this, null, false);
+            getHost().getOperationTracker().processPendingServiceStartOperations(
+                    getSelfLink(), ProcessingStage.AVAILABLE, this);
         }
 
-        getHost().processPendingServiceAvailableOperations(this, null, false);
-        return null;
+        if (stage == ProcessingStage.STOPPED) {
+            getHost().getOperationTracker().processPendingServiceStartOperations(
+                    getSelfLink(), ProcessingStage.STOPPED, this);
+        }
     }
 
     @Override
@@ -504,7 +519,7 @@ public class StatelessService implements Service {
 
         try {
             d = this.stateType.newInstance();
-        } catch (Throwable e) {
+        } catch (Exception e) {
             logSevere(e);
             return null;
         }
@@ -576,7 +591,17 @@ public class StatelessService implements Service {
 
     @Override
     public String getPeerNodeSelectorPath() {
-        throw new RuntimeException("Replication is not supported");
+        return null;
+    }
+
+    @Override
+    public void setDocumentIndexPath(String uriPath) {
+        throw new RuntimeException("Indexing is not supported");
+    }
+
+    @Override
+    public String getDocumentIndexPath() {
+        return null;
     }
 
     @Override
@@ -616,11 +641,27 @@ public class StatelessService implements Service {
         }
 
         this.maintenanceIntervalMicros = micros;
+        if (getHost() != null
+                && getProcessingStage() == ProcessingStage.AVAILABLE
+                && micros < getHost().getMaintenanceCheckIntervalMicros()) {
+            getHost().scheduleServiceMaintenance(this);
+        }
+    }
+
+    @Override
+    public void setCacheClearDelayMicros(long micros) {
+        this.cacheClearDelayMicros = micros;
     }
 
     @Override
     public long getMaintenanceIntervalMicros() {
         return this.maintenanceIntervalMicros;
+    }
+
+    @Override
+    public long getCacheClearDelayMicros() {
+        return this.cacheClearDelayMicros != null ? this.cacheClearDelayMicros :
+            this.host.getServiceCacheClearDelayMicros();
     }
 
     @Override
@@ -647,10 +688,8 @@ public class StatelessService implements Service {
             return;
         }
 
-        ServiceConfiguration cfg = new ServiceConfiguration();
-        cfg.options = getOptions();
-        cfg.maintenanceIntervalMicros = getMaintenanceIntervalMicros();
-        request.setBodyNoCloning(cfg).complete();
+        ServiceConfiguration config = Utils.buildServiceConfig(new ServiceConfiguration(), this);
+        request.setBodyNoCloning(config).complete();
     }
 
     /**
@@ -742,7 +781,7 @@ public class StatelessService implements Service {
         if (requestUri.startsWith(uiResourcePath)) {
             Exception e = new ServiceNotFoundException(UriUtils.buildUri(uri.getScheme(), uri.getHost(),
                     uri.getPort(), uri.getPath().substring(uiResourcePath.length()), uri.getQuery()).toString());
-            ServiceErrorResponse r = Utils.toServiceErrorResponse(e, get);
+            ServiceErrorResponse r = Utils.toServiceErrorResponse(e);
             r.statusCode = Operation.STATUS_CODE_NOT_FOUND;
             r.stackTrace = null;
 
@@ -817,7 +856,7 @@ public class StatelessService implements Service {
         if (request.getInstrumentationContext() == null) {
             return;
         }
-        setStat(request.getAction() + STAT_NAME_OPERATION_DURATION,
+        setStat(ServiceStatUtils.getPerActionDurationName(request.getAction()),
                 (System.nanoTime() / 1000)
                         - request.getInstrumentationContext().handleInvokeTimeMicros);
 

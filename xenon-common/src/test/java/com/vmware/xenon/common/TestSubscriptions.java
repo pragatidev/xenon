@@ -92,9 +92,8 @@ public class TestSubscriptions extends BasicTestCase {
         // test host to receive notifications
         VerificationHost localHost = this.host;
         int serviceCount = 1;
-        List<URI> exampleURIs = new ArrayList<>();
         // create example service documents across all nodes
-        serviceHost.createExampleServices(serviceHost, serviceCount, exampleURIs, null);
+        List<URI> exampleURIs = serviceHost.createExampleServices(serviceHost, serviceCount, null);
         TestContext oneUseNotificationCtx = this.host.testCreate(1);
         StatelessService notificationTarget = new StatelessService() {
             @Override
@@ -315,19 +314,55 @@ public class TestSubscriptions extends BasicTestCase {
     }
 
     @Test
+    public void testSubscriptionsWithExpiry() throws Throwable {
+        MinimalTestService s = new MinimalTestService();
+        MinimalTestServiceState serviceState = new MinimalTestServiceState();
+        serviceState.id = UUID.randomUUID().toString();
+        String minimalServiceUUID = UUID.randomUUID().toString();
+        TestContext notifyContext = this.host.testCreate(1);
+        TestContext notifyDeleteContext = this.host.testCreate(1);
+        this.host.startServiceAndWait(s, minimalServiceUUID, serviceState);
+
+        Service notificationTarget = new StatelessService() {
+            @Override
+            public void authorizeRequest(Operation op) {
+                op.complete();
+                return;
+            }
+
+            @Override
+            public void handleRequest(Operation op) {
+                if (!op.isNotification()) {
+                    if (op.getAction() == Action.DELETE && op.getUri().equals(getUri())) {
+                        notifyDeleteContext.completeIteration();
+                    }
+                    super.handleRequest(op);
+                    return;
+                }
+                if (op.getAction() == Action.PUT) {
+                    notifyContext.completeIteration();
+                }
+            }
+        };
+        Operation subscribe = Operation.createPost(UriUtils.buildUri(host, minimalServiceUUID));
+        subscribe.setReferer(host.getReferer());
+        ServiceSubscriber subscriber = new ServiceSubscriber();
+        subscriber.replayState = true;
+        // Set a 500ms expiry
+        subscriber.documentExpirationTimeMicros = Utils
+                .fromNowMicrosUtc(TimeUnit.MILLISECONDS.toMicros(500));
+        host.startSubscriptionService(subscribe, notificationTarget, subscriber);
+        host.testWait(notifyContext);
+        host.testWait(notifyDeleteContext);
+    }
+
+    @Test
     public void subscribeAndWaitForServiceAvailability() throws Throwable {
         // until HTTP2 support is we must only subscribe to less than max connections!
         // otherwise we deadlock: the connection for the queued subscribe is used up,
         // no more connections can be created, to that owner.
         this.serviceCount = NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST / 2;
-        // set the connection limit higher for the test host since it will be issuing parallel
-        // subscribes, POSTs
-        this.host.getClient().setConnectionLimitPerHost(this.serviceCount * 4);
         setUpPeers();
-
-        for (VerificationHost h : this.host.getInProcessHostMap().values()) {
-            h.getClient().setConnectionLimitPerHost(this.serviceCount * 4);
-        }
 
         this.host.waitForReplicatedFactoryServiceAvailable(
                 this.host.getPeerServiceUri(ExampleService.FACTORY_LINK));

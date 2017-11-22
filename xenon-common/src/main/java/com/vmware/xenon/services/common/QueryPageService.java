@@ -25,14 +25,20 @@ import com.vmware.xenon.common.StatelessService;
 import com.vmware.xenon.common.TaskState.TaskStage;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.services.common.LuceneDocumentIndexService.DeleteQueryRuntimeContextRequest;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification;
+import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
+import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryRuntimeContext;
 
 public class QueryPageService extends StatelessService {
     public static final String KIND = Utils.buildKind(QueryTask.class);
 
+    private static final long DEFAULT_TTL_MICROS = TimeUnit.MINUTES.toMicros(1);
+
     private QuerySpecification spec;
     private String documentSelfLink;
     private String indexLink;
+    private long documentExpirationTimeMicros;
 
     public QueryPageService(QuerySpecification spec, String indexLink) {
         super(QueryTask.class);
@@ -71,15 +77,16 @@ public class QueryPageService extends StatelessService {
         ServiceDocument initState = post.getBody(ServiceDocument.class);
 
         this.documentSelfLink = initState.documentSelfLink;
+        this.documentExpirationTimeMicros = initState.documentExpirationTimeMicros;
 
-        long interval = initState.documentExpirationTimeMicros - Utils.getSystemNowMicrosUtc();
-        if (interval < 0) {
+        long ttl = this.documentExpirationTimeMicros - Utils.getSystemNowMicrosUtc();
+        if (ttl < 0) {
             logWarning("Task expiration is in the past, extending it");
             // task has already expired. Add some more time instead of failing
-            interval = TimeUnit.SECONDS.toMicros(getHost().getMaintenanceIntervalMicros() * 2);
+            ttl = Math.max(getHost().getMaintenanceIntervalMicros() * 2, DEFAULT_TTL_MICROS);
         }
         super.toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
-        super.setMaintenanceIntervalMicros(interval);
+        super.setMaintenanceIntervalMicros(ttl);
 
         post.complete();
     }
@@ -92,8 +99,7 @@ public class QueryPageService extends StatelessService {
         QueryTask task = QueryTask.create(clonedSpec);
         task.documentKind = KIND;
         task.documentSelfLink = this.documentSelfLink;
-        task.documentExpirationTimeMicros = Utils
-                .fromNowMicrosUtc(getMaintenanceIntervalMicros());
+        task.documentExpirationTimeMicros = this.documentExpirationTimeMicros;
         task.taskInfo.stage = TaskStage.CREATED;
         task.taskInfo.isDirect = true;
         task.indexLink = this.indexLink;
@@ -130,7 +136,7 @@ public class QueryPageService extends StatelessService {
                     });
 
             sendRequest(localPatch);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             handleQueryCompletion(task, e, get);
         }
     }
@@ -138,7 +144,11 @@ public class QueryPageService extends StatelessService {
     private void handleQueryCompletion(QueryTask task, Throwable e, Operation get) {
         if (e != null) {
             LuceneQueryPage ctx = (LuceneQueryPage) task.querySpec.context.nativePage;
-            if (ctx.isFirstPage() && (e instanceof AlreadyClosedException)
+            // When forward only is specified, previous page link is always empty, and currently
+            // no way of knowing whether it is on the first page or not.
+            // Thus, when it is forward only, do not attempt to retry query.
+            boolean isForwardOnly = task.querySpec.options.contains(QueryOption.FORWARD_ONLY);
+            if (!isForwardOnly && ctx.isFirstPage() && (e instanceof AlreadyClosedException)
                     && !getHost().isStopping()) {
                 // The lucene index service periodically grooms index writers and index searchers.
                 // When the system is under load, the grooming will occur more often, potentially
@@ -155,16 +165,42 @@ public class QueryPageService extends StatelessService {
             }
 
             // fail the paginated query, client has to re-create the query task
-            QueryTask t = new QueryTask();
-            t.taskInfo.stage = TaskStage.FAILED;
-            t.taskInfo.failure = Utils.toServiceErrorResponse(e);
-            get.setBody(t).fail(e);
+            QueryTaskUtils.failTask(get, e);
             return;
         }
 
-        // null the native query context in the cloned spec, so it does not serialize on the wire
-        task.querySpec.context = null;
-        task.taskInfo.stage = TaskStage.FINISHED;
-        QueryTaskUtils.expandLinks(getHost(), task, get);
+        try {
+            boolean singleUse = task.querySpec.options.contains(QueryOption.SINGLE_USE);
+            if (singleUse) {
+                getHost().stopService(this);
+            }
+
+            // null the native query context in the cloned spec, so it does not serialize on the wire,
+            // and complete the request.
+            QueryRuntimeContext context = task.querySpec.context;
+            task.querySpec.context = null;
+            task.taskInfo.stage = TaskStage.FINISHED;
+            QueryTaskUtils.expandLinks(getHost(), task, get);
+
+            if (singleUse && task.results.nextPageLink == null) {
+                DeleteQueryRuntimeContextRequest request = new DeleteQueryRuntimeContextRequest();
+                request.documentKind = DeleteQueryRuntimeContextRequest.KIND;
+                request.context = context;
+
+                Operation patch = Operation.createPatch(this, task.indexLink)
+                        .setBodyNoCloning(request)
+                        .setCompletion((op, ex) -> {
+                            if (ex != null) {
+                                logWarning("Failed to delete runtime context: %s", Utils.toString(ex));
+                            }
+                        });
+
+                sendRequest(patch);
+            }
+        } catch (Exception ex) {
+            // fail the paginated query, client has to re-create the query task
+            QueryTaskUtils.failTask(get, ex);
+            return;
+        }
     }
 }

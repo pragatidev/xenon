@@ -19,7 +19,9 @@ import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.logging.Level;
@@ -29,8 +31,10 @@ import org.junit.Test;
 
 import com.vmware.xenon.common.BasicReusableHostTestCase;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentQueryResult;
+import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.TaskState;
 import com.vmware.xenon.common.TaskState.TaskStage;
 import com.vmware.xenon.common.UriUtils;
@@ -39,6 +43,7 @@ import com.vmware.xenon.common.test.TestRequestSender.FailureResponse;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.ExampleTaskService.ExampleTaskServiceState;
+import com.vmware.xenon.services.common.QueryTask.Query;
 
 /**
  * Validate that the ExampleTaskService works.
@@ -80,7 +85,7 @@ public class TestExampleTaskService extends BasicReusableHostTestCase {
         // stop the host, and verify task deals with restart
         this.host.stop();
         this.host.setPort(0);
-        if (!VerificationHost.restartStatefulHost(this.host)) {
+        if (!VerificationHost.restartStatefulHost(this.host, true)) {
             this.host.log("Failed restart of host, aborting");
             return;
         }
@@ -117,15 +122,58 @@ public class TestExampleTaskService extends BasicReusableHostTestCase {
     @Test
     public void testDirectTask() {
         createExampleServices();
+        URI callBackQueryUri = UriUtils.buildDocumentQueryUri(
+                this.host, ServiceUriPaths.CORE_CALLBACKS + "/*", false, false, EnumSet.of(Service.ServiceOption.NONE));
+        // Get the current list of callbacks and compare it at the end to verify that new callbacks were cleaned.
+        ServiceDocumentQueryResult prevCallbacks =
+                this.sender.sendAndWait(Operation.createGet(callBackQueryUri), ServiceDocumentQueryResult.class);
 
-        ExampleTaskServiceState state = new ExampleTaskServiceState();
-        state.taskInfo = TaskState.createDirect();
+        List<Operation> posts = new ArrayList<>();
+        for (int i = 0; i < this.serviceCount; i++) {
+            ExampleTaskServiceState state = new ExampleTaskServiceState();
+            state.taskInfo = TaskState.createDirect();
+            // specialize each task to only delete a service with the specific id;
+            state.customQueryClause = Query.Builder.create()
+                    .addFieldClause(ExampleServiceState.FIELD_NAME_ID, i + "").build();
+            Operation post = Operation.createPost(this.host, ExampleTaskService.FACTORY_LINK)
+                    .setBody(state);
+            posts.add(post);
+        }
 
-        Operation post = Operation.createPost(this.host, ExampleTaskService.FACTORY_LINK).setBody(state);
-        ExampleTaskServiceState result = this.sender.sendAndWait(post, ExampleTaskServiceState.class);
+        Map<String, ServiceStat> factoryStatsBefore = this.host
+                .getServiceStats(posts.get(0).getUri());
+        ServiceStat subCountStatBefore = factoryStatsBefore
+                .get(TaskFactoryService.STAT_NAME_ACTIVE_SUBSCRIPTION_COUNT);
+        if (subCountStatBefore == null) {
+            subCountStatBefore = new ServiceStat();
+        }
 
-        assertNotNull(result.taskInfo);
-        assertEquals(TaskStage.FINISHED, result.taskInfo.stage);
+        List<ExampleTaskServiceState> results = this.sender.sendAndWait(posts,
+                ExampleTaskServiceState.class);
+
+        for (ExampleTaskServiceState result : results) {
+            assertNotNull(result.taskInfo);
+            assertEquals(TaskStage.FINISHED, result.taskInfo.stage);
+        }
+
+        ServiceStat beforeStat = subCountStatBefore;
+        this.host.waitFor("subscriptions never stopped", () -> {
+            Map<String, ServiceStat> factoryStatsAfter = this.host
+                    .getServiceStats(posts.get(0).getUri());
+
+            ServiceStat subCountStat = factoryStatsAfter
+                    .get(TaskFactoryService.STAT_NAME_ACTIVE_SUBSCRIPTION_COUNT);
+            if (subCountStat == null || subCountStat.latestValue > beforeStat.latestValue) {
+                return false;
+            }
+            return true;
+        });
+
+        this.host.waitFor("callbacks never stopped", () -> {
+            ServiceDocumentQueryResult currentCallbacks =
+                    this.sender.sendAndWait(Operation.createGet(callBackQueryUri), ServiceDocumentQueryResult.class);
+            return currentCallbacks.documentLinks.size() <= prevCallbacks.documentLinks.size();
+        });
     }
 
     private void verifyExpectedHandleStartError(ExampleTaskServiceState badState, String expectedMessage) {
@@ -150,6 +198,7 @@ public class TestExampleTaskService extends BasicReusableHostTestCase {
         for (int i = 0; i < this.serviceCount; i++) {
             ExampleServiceState example = new ExampleServiceState();
             example.name = String.format("example-%s", i);
+            example.id = i + "";
             ops.add(Operation.createPost(exampleFactoryUri).setBody(example));
         }
         this.sender.sendAndWait(ops);

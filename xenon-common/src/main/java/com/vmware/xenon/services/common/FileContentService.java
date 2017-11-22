@@ -40,5 +40,4 @@ public class FileContentService extends StatelessService {
     public void handleGet(Operation get) {
         FileUtils.readFileAndComplete(get, this.file);
     }
-
 }

@@ -54,7 +54,7 @@
                     <hr class="content-divider">
                     <div class="query-clause-container">
                         <div class="connector"></div>
-                        <xe-query-clause *ngFor="let clause of interactiveQueryClauses"
+                        <xe-query-clause class="query-clause" *ngFor="let clause of interactiveQueryClauses"
                             [id]="clause.id" [isFirst]="clause.id === 1"
                             (deleteClause)="onDeleteClause($event)"></xe-query-clause>
                         <button class="btn btn-link btn-add-clause"
@@ -80,7 +80,7 @@
                 {{'ACTION_CLEAR' | translate}}
             </button>
             <div class="result-count">
-                <div class="stats stats-horizontal" *ngIf="getQueryResult().results">
+                <div class="stats stats-horizontal" *ngIf="isQueried">
                     <span class="stats-number">{{getQueryResultCount()}}</span>
                     <span class="stats-label">
                         {{'RESULT' | translate}}<br>{{'AVAILABLE' | translate }}
@@ -90,16 +90,21 @@
             <aside>
                 <a class="btn btn-link btn-collapse-expand" data-toggle="collapse" href="#queryBuilderContainer"
                     aria-expanded="true" aria-controls="queryBuilderContainer"
-                    title="{{ 'ACTION_COLLAPSE_HELP' | translate }}">
+                    title="{{ 'ACTION_COLLAPSE_EXPAND' | translate }} {{ 'QUERY_BUILDER' | translate }}">
                 </a>
             </aside>
         </div>
         <main class="content-area content-area-with-nested-container component-container horizontal"
-                *ngIf="getQueryResult().results?.documentLinks.length > 0">
-            <div class="left-side-area area">
+                *ngIf="getQueryResultCount() > 0">
+            <div class="left-side-area area"
+                    infinite-scroll
+                    [infiniteScrollThrottle]="100"
+                    [scrollWindow]="false"
+                    [infiniteScrollDisabled]="getQueryResultLinks().length < 25"
+                    (scrolled)="onLoadNextPage()">
                 <div class="list-group">
                     <a class="list-group-item list-group-item-action"
-                        *ngFor="let queryResultLink of getQueryResult().results?.documentLinks"
+                        *ngFor="let queryResultLink of getQueryResultLinks()"
                         [class.active]="isResultLinkSelected(queryResultLink)"
                         (click)="onSelectQueryResult($event, queryResultLink)">
                         {{queryResultLink}}

@@ -56,6 +56,10 @@ class ServiceMaintenanceTracker {
             interval = this.host.getMaintenanceIntervalMicros();
         }
 
+        if (interval < this.host.getMaintenanceCheckIntervalMicros()) {
+            this.host.setMaintenanceCheckIntervalMicros(interval);
+        }
+
         long nextExpirationMicros = Math.max(now, now + interval - SCHEDULING_EPSILON_MICROS);
         String selfLink = s.getSelfLink();
 
@@ -82,8 +86,9 @@ class ServiceMaintenanceTracker {
     }
 
     public void performMaintenance(Operation op, long deadline) {
-        long now;
-        while ((now = Utils.getSystemNowMicrosUtc()) < deadline) {
+        long now = Utils.getSystemNowMicrosUtc();
+        // at least one set of expired service maintained regardless of deadline
+        do {
             if (this.host.isStopping()) {
                 op.fail(new CancellationException("Host is stopping"));
                 return;
@@ -131,7 +136,7 @@ class ServiceMaintenanceTracker {
 
                 performServiceMaintenance(servicePath, s);
             }
-        }
+        } while ((now = Utils.getSystemNowMicrosUtc()) < deadline);
     }
 
     private void performServiceMaintenance(String servicePath, Service s) {
@@ -160,7 +165,7 @@ class ServiceMaintenanceTracker {
                             }
                         });
 
-        this.host.schedule(() -> {
+        Runnable t = () -> {
             try {
                 OperationContext.setAuthorizationContext(this.host
                         .getSystemAuthorizationContext());
@@ -169,7 +174,7 @@ class ServiceMaintenanceTracker {
                 }
                 start[0] = Utils.getSystemNowMicrosUtc();
                 s.handleMaintenance(servicePost);
-            } catch (Throwable ex) {
+            } catch (Exception ex) {
                 // Mostly at this point, CompletionHandler for servicePost has already consumed in
                 // "s.handleMaintenance()" and have set null (based on the handleMaintenance impl).
                 // Calling fail() will not trigger any CompletionHandler, therefore explicitly
@@ -178,7 +183,13 @@ class ServiceMaintenanceTracker {
                         servicePath, Utils.toString(ex));
                 servicePost.fail(ex);
             }
-        }, SCHEDULING_EPSILON_MICROS, TimeUnit.MICROSECONDS);
+        };
+
+        if (s.hasOption(ServiceOption.CORE)) {
+            this.host.scheduleCore(t, SCHEDULING_EPSILON_MICROS, TimeUnit.MICROSECONDS);
+        } else {
+            this.host.schedule(t, SCHEDULING_EPSILON_MICROS, TimeUnit.MICROSECONDS);
+        }
     }
 
     public synchronized void close() {
@@ -187,7 +198,7 @@ class ServiceMaintenanceTracker {
     }
 
     private void updateStats(Service s, long actual, long limit, String servicePath) {
-        ServiceStats.ServiceStat durationStat = ServiceStatUtils.getHistogramStat(s,
+        ServiceStats.ServiceStat durationStat = ServiceStatUtils.getOrCreateHistogramStat(s,
                 Service.STAT_NAME_MAINTENANCE_DURATION);
         s.setStat(durationStat, actual);
         if (limit * 2 < actual) {

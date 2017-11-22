@@ -17,19 +17,30 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 
+import static com.vmware.xenon.common.TestAuthentication.TestAuthenticationService.RANDOM_COOKIE;
+import static com.vmware.xenon.common.TestAuthentication.TestAuthenticationService.RANDOM_CUSTOM_HEADER;
 import static com.vmware.xenon.services.common.authn.BasicAuthenticationUtils.constructBasicAuth;
 
+import java.security.GeneralSecurityException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
+import io.netty.handler.codec.http.cookie.ClientCookieDecoder;
+import io.netty.handler.codec.http.cookie.Cookie;
 import org.junit.After;
 import org.junit.Test;
 
+import com.vmware.xenon.common.Claims.Builder;
 import com.vmware.xenon.common.Operation.AuthorizationContext;
-import com.vmware.xenon.common.http.netty.CookieJar;
+import com.vmware.xenon.common.http.netty.NettyHttpListener;
+import com.vmware.xenon.common.jwt.Signer;
+import com.vmware.xenon.common.jwt.Verifier;
+import com.vmware.xenon.common.jwt.Verifier.TokenException;
 import com.vmware.xenon.common.test.AuthTestUtils;
 import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.TestNodeGroupManager;
@@ -37,13 +48,13 @@ import com.vmware.xenon.common.test.TestRequestSender;
 import com.vmware.xenon.common.test.TestRequestSender.FailureResponse;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
+import com.vmware.xenon.services.common.GuestUserService;
 import com.vmware.xenon.services.common.ServiceUriPaths;
 import com.vmware.xenon.services.common.SystemUserService;
 import com.vmware.xenon.services.common.authn.AuthenticationConstants;
 import com.vmware.xenon.services.common.authn.AuthenticationRequest;
 import com.vmware.xenon.services.common.authn.AuthenticationRequest.AuthenticationRequestType;
 import com.vmware.xenon.services.common.authn.BasicAuthenticationService;
-import com.vmware.xenon.services.common.authn.BasicAuthenticationUtils;
 
 public class TestAuthentication {
 
@@ -56,18 +67,27 @@ public class TestAuthentication {
 
     private List<VerificationHost> hostsToCleanup = new ArrayList<>();
 
-    private VerificationHost createAndStartHost(boolean enableAuth, Service authenticationService)
-            throws Throwable {
+    private VerificationHost createAndStartHost(boolean enableAuth, boolean secureAuthCookie,
+            Service authenticationService) throws Throwable {
         VerificationHost host = VerificationHost.create(0);
         host.setAuthorizationEnabled(enableAuth);
+
+        // The NettyHttpListener for the host is not allocated until host start time, so this
+        // attribute cannot be enabled without allocating a listener.
+        if (secureAuthCookie) {
+            NettyHttpListener listener = new NettyHttpListener(host);
+            listener.setSecureAuthCookie(true);
+            host.setListener(listener);
+        }
 
         // set the authentication service
         if (authenticationService != null) {
             host.setAuthenticationService(authenticationService);
         }
 
-        host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS
-                .toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
+        host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(
+                VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
+
         host.start();
 
         // add to the list for cleanup after each test run
@@ -80,7 +100,10 @@ public class TestAuthentication {
         public static final String SELF_LINK = UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHN,
                 "test");
 
+        public static String RANDOM_CUSTOM_HEADER = "x-random-header";
+        public static String RANDOM_COOKIE = "random-cookie";
         public static String ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJ4biIsInN1YiI6Ii9jb3JlL2F1dGh6L3Vz";
+        public static String INVALID_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJ4biIsInN1YiI6Ii9jb3JlL2F1dGh6L3VzZXJzL2Zvb0B2bXdhcmUuY29tIiwiZXhwIjozMTU1Njg4OTg2NDQwMzE5OX0.IMX1XTP_1uQLBRe2Ep7c6yAoFgik2th5m6OGqlZPJCc";
 
         @Override
         public void handleGet(Operation op) {
@@ -97,7 +120,7 @@ public class TestAuthentication {
                 return;
             }
             op.removePragmaDirective(Operation.PRAGMA_DIRECTIVE_VERIFY_TOKEN);
-            String token = BasicAuthenticationUtils.getAuthToken(op);
+            String token = op.getRequestHeader(Operation.REQUEST_AUTH_TOKEN_HEADER);
             if (token == null) {
                 op.fail(new IllegalArgumentException("Token is empty"));
                 return;
@@ -106,11 +129,50 @@ public class TestAuthentication {
             if (token.equals(ACCESS_TOKEN)) {
                 // create and return a claims object for system user since our test uses system user
                 Claims claims = getClaims();
-                op.setBody(claims);
+                op.addResponseHeader(RANDOM_CUSTOM_HEADER, UUID.randomUUID().toString());
+                op.setCookies(
+                        Collections.singletonMap(RANDOM_COOKIE, UUID.randomUUID().toString()));
+                AuthorizationContext.Builder ab = AuthorizationContext.Builder.create();
+                ab.setClaims(claims);
+                ab.setToken(token);
+                op.setBody(ab.getResult());
                 op.complete();
                 return;
             }
-            op.fail(new IllegalArgumentException("Invalid Token!"));
+
+            if (token.equals(INVALID_TOKEN)) {
+                ServiceErrorResponse err = new ServiceErrorResponse();
+                err.setInternalErrorCode(ServiceErrorResponse.ERROR_CODE_EXTERNAL_AUTH_FAILED);
+                op.setBody(err);
+                op.fail(Operation.STATUS_CODE_BAD_REQUEST);
+                return;
+            }
+
+            try {
+                Verifier verifier = getTokenVerifier();
+                Claims claims = verifier.verify(token, Claims.class);
+
+                if (claims != null) {
+                    // In case of expired token we would refresh the token
+                    Long expirationTime = claims.getExpirationTime();
+                    if (expirationTime != null
+                            && TimeUnit.SECONDS.toMicros(expirationTime)
+                            <= Utils.getSystemNowMicrosUtc()) {
+                        Claims.Builder cb = new Claims.Builder();
+                        cb.setIssuer(AuthenticationConstants.DEFAULT_ISSUER);
+                        cb.setSubject(claims.getSubject());
+                        cb.setExpirationTime(Instant.MAX.getEpochSecond());
+                        claims = cb.getResult();
+                    }
+                }
+                AuthorizationContext.Builder ab = AuthorizationContext.Builder.create();
+                ab.setClaims(claims);
+                ab.setToken(token);
+                op.setBody(ab.getResult());
+                op.complete();
+            } catch (TokenException | GeneralSecurityException e) {
+                op.fail(new IllegalArgumentException("Invalid Token!"));
+            }
         }
 
         private void associateAuthorizationContext(Service service, Operation op, String token) {
@@ -163,7 +225,7 @@ public class TestAuthentication {
 
     @Test
     public void testSettingAuthenticationService() throws Throwable {
-        VerificationHost host = createAndStartHost(true, new TestAuthenticationService());
+        VerificationHost host = createAndStartHost(true, false, new TestAuthenticationService());
 
         host.log("Testing setAuthenticationService");
 
@@ -179,7 +241,7 @@ public class TestAuthentication {
 
     @Test
     public void testNoAuthenticationService() throws Throwable {
-        VerificationHost host = createAndStartHost(true, null);
+        VerificationHost host = createAndStartHost(true, false, null);
 
         host.log("Testing no authenticationService");
 
@@ -193,7 +255,7 @@ public class TestAuthentication {
     @Test
     public void testAuthenticationServiceRedirect() throws Throwable {
 
-        VerificationHost host = createAndStartHost(true, new TestAuthenticationService());
+        VerificationHost host = createAndStartHost(true, false, new TestAuthenticationService());
         host.log("Testing authenticationService redirect");
 
         TestRequestSender sender = new TestRequestSender(host);
@@ -215,7 +277,7 @@ public class TestAuthentication {
     @Test
     public void testAuthServiceFailure() throws Throwable {
 
-        VerificationHost host = createAndStartHost(true, new FailQueueAuthenticationService());
+        VerificationHost host = createAndStartHost(true, false, new FailQueueAuthenticationService());
 
         TestRequestSender sender = new TestRequestSender(host);
 
@@ -227,22 +289,33 @@ public class TestAuthentication {
 
     @Test
     public void testAuthenticationServiceTokenRequest() throws Throwable {
-        VerificationHost host = createAndStartHost(true, new TestAuthenticationService());
+        VerificationHost host = createAndStartHost(true, false, new TestAuthenticationService());
+        doAuthenticationServiceTokenRequest(host, false);
+    }
+
+    @Test
+    public void testAuthenticationServiceTokenRequestSecureCookie() throws Throwable {
+        VerificationHost host = createAndStartHost(true, true, new TestAuthenticationService());
+        doAuthenticationServiceTokenRequest(host, true);
+    }
+
+    private void doAuthenticationServiceTokenRequest(VerificationHost host, boolean isSecure)
+            throws Throwable {
         TestRequestSender sender = new TestRequestSender(host);
         host.log("Testing authenticationService token request");
 
         // make a request to get the accessToken for the authentication service
         Operation requestOp = Operation.createGet(host, TestAuthenticationService.SELF_LINK)
-                               .forceRemote();
+                .forceRemote();
         Operation responseOp = sender.sendAndWait(requestOp);
 
         String cookieHeader = responseOp.getResponseHeader(SET_COOKIE_HEADER);
         assertNotNull(cookieHeader);
 
-        Map<String, String> cookieElements = CookieJar.decodeCookies(cookieHeader);
         // assert the auth token cookie
-        assertEquals(TestAuthenticationService.ACCESS_TOKEN,
-                cookieElements.get(AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE));
+        Cookie tokenCookie = ClientCookieDecoder.LAX.decode(cookieHeader);
+        assertEquals(TestAuthenticationService.ACCESS_TOKEN, tokenCookie.value());
+        assertEquals(isSecure, tokenCookie.isSecure());
 
         // assert the auth token header
         assertEquals(TestAuthenticationService.ACCESS_TOKEN,
@@ -273,7 +346,7 @@ public class TestAuthentication {
 
     @Test
     public void testWithoutAuthorizationEnabled() throws Throwable {
-        VerificationHost host = createAndStartHost(false, new TestAuthenticationService());
+        VerificationHost host = createAndStartHost(false, false, new TestAuthenticationService());
         host.log("Testing AuthenticationService when authorization is disabled");
 
         // create user foo@vmware.com
@@ -295,7 +368,7 @@ public class TestAuthentication {
 
     @Test
     public void testAuthenticatedRequestInvalidToken() throws Throwable {
-        VerificationHost host = createAndStartHost(true, new TestAuthenticationService());
+        VerificationHost host = createAndStartHost(true, false, new TestAuthenticationService());
         host.log("Testing external authentication request with invalid token");
 
         // create user foo@vmware.com
@@ -318,7 +391,7 @@ public class TestAuthentication {
 
     @Test
     public void testAuthenticatedRequestValidToken() throws Throwable {
-        VerificationHost host = createAndStartHost(true, new TestAuthenticationService());
+        VerificationHost host = createAndStartHost(true, false, new TestAuthenticationService());
         host.log("Testing external authentication request with valid token");
 
         // create user foo@vmware.com
@@ -341,7 +414,7 @@ public class TestAuthentication {
 
     @Test
     public void testAuthenticationViaBasicAuth() throws Throwable {
-        VerificationHost host = createAndStartHost(true, new TestAuthenticationService());
+        VerificationHost host = createAndStartHost(true, false, new TestAuthenticationService());
 
         // create user foo@vmware.com
         createTestUsers(host);
@@ -356,7 +429,7 @@ public class TestAuthentication {
                 .createPost(UriUtils.buildUri(host, BasicAuthenticationService.SELF_LINK))
                 .setBody(authReq)
                 .forceRemote()
-                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal);
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal);
         Operation response = sender.sendAndWait(requestOp);
         assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
         assertNotNull(response.getResponseHeader(SET_COOKIE_HEADER));
@@ -366,7 +439,7 @@ public class TestAuthentication {
 
     @Test
     public void testVerificationValidBasicAuthAccessToken() throws Throwable {
-        VerificationHost host = createAndStartHost(true, null);
+        VerificationHost host = createAndStartHost(true, false, null);
         host.log("Testing verification of valid token for Basic auth");
 
         // create a user so we are able to get valid accessToken to verify
@@ -406,7 +479,7 @@ public class TestAuthentication {
 
     @Test
     public void testVerificationInvalidBasicAuthAccessToken() throws Throwable {
-        VerificationHost host = createAndStartHost(true, null);
+        VerificationHost host = createAndStartHost(true, false, null);
         host.log("Testing verification of invalid token for Basic auth");
 
         // invalid accesstoken
@@ -426,8 +499,52 @@ public class TestAuthentication {
     }
 
     @Test
+    public void testVerificationExpiredBasicAuthAccessToken() throws Throwable {
+        VerificationHost host = createAndStartHost(true, false, null);
+        host.log("Testing verification of expired token for Basic auth");
+
+        // create user foo@vmware.com
+        createTestUsers(host);
+        String userLink = "/core/authz/users/foo@vmware.com";
+
+        Signer signer = new Signer(host.getJWTSecret());
+        long expirationMicros = Utils.fromNowMicrosUtc(TimeUnit.SECONDS.toMicros(5));
+
+        // Create a token with short expiry
+        Claims.Builder builder = new Builder();
+        builder.setExpirationTime(TimeUnit.MICROSECONDS.toSeconds(expirationMicros));
+        builder.setSubject(userLink);
+        Claims claims = builder.getResult();
+
+        String token = signer.sign(claims);
+        TestRequestSender.setAuthToken(token);
+        TestRequestSender sender = new TestRequestSender(host);
+
+        // Make a request to verification service
+        Operation requestOp = Operation.createPost(host, BasicAuthenticationService.SELF_LINK)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERIFY_TOKEN);
+
+        Operation responseOp = sender.sendAndWait(requestOp);
+        AuthorizationContext ctx = responseOp.getBody(AuthorizationContext.class);
+        assertNotNull(ctx);
+        assertEquals(userLink, ctx.getClaims().getSubject());
+        host.waitFor("Timed out waiting from token to expire", () -> {
+            Operation op = Operation.createPost(host, BasicAuthenticationService.SELF_LINK)
+                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERIFY_TOKEN);
+
+            op = sender.sendAndWait(op);
+            AuthorizationContext c = op.getBody(AuthorizationContext.class);
+            assertNotNull(c);
+            return GuestUserService.SELF_LINK.equals(c.getClaims().getSubject());
+        });
+
+        TestRequestSender.clearAuthToken();
+        host.log("Verification of expired token for Basic auth succeeded as expected");
+    }
+
+    @Test
     public void testVerificationValidAuthServiceToken() throws Throwable {
-        VerificationHost host = createAndStartHost(true, new TestAuthenticationService());
+        VerificationHost host = createAndStartHost(true, false, new TestAuthenticationService());
         host.log("Testing verification of valid token for external auth");
 
         TestRequestSender sender = new TestRequestSender(host);
@@ -440,14 +557,42 @@ public class TestAuthentication {
         Operation responseOp = sender.sendAndWait(requestOp);
         Claims claims = responseOp.getBody(Claims.class);
         assertNotNull(claims);
+        assertNotNull(responseOp.getResponseHeader(RANDOM_CUSTOM_HEADER));
+        assertNotNull(responseOp.getCookies().get(RANDOM_COOKIE));
 
         TestRequestSender.clearAuthToken();
         host.log("Verification of valid token for external auth succeeded");
     }
 
+
+    @Test
+    public void testVerificationExternalAuthServiceWithSkipBasicAuth() throws Throwable {
+        VerificationHost host = createAndStartHost(true, false, new TestAuthenticationService());
+        host.log("Testing verification of skipping basic auth");
+
+        // create user foo@vmware.com
+        createTestUsers(host);
+
+        TestRequestSender sender = new TestRequestSender(host);
+        TestRequestSender.setAuthToken(TestAuthenticationService.INVALID_TOKEN);
+
+        // make a request to verification service
+        Operation requestOp = Operation.createPost(host, TestAuthenticationService.SELF_LINK)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERIFY_TOKEN);
+
+        FailureResponse failureResponse = sender.sendAndWaitFailure(requestOp);
+        assertNotNull(failureResponse.failure);
+        assertEquals(Operation.STATUS_CODE_BAD_REQUEST, failureResponse.op.getStatusCode());
+        assertEquals(ServiceErrorResponse.ERROR_CODE_EXTERNAL_AUTH_FAILED,
+                failureResponse.op.getBody(ServiceErrorResponse.class).getErrorCode());
+
+        TestRequestSender.clearAuthToken();
+        host.log("Verification of skipping basic auth succeeded as expected");
+    }
+
     @Test
     public void testVerificationInvalidAuthServiceToken() throws Throwable {
-        VerificationHost host = createAndStartHost(true, new TestAuthenticationService());
+        VerificationHost host = createAndStartHost(true, false, new TestAuthenticationService());
         host.log("Testing verification of invalid token for external auth");
 
         // invalid accesstoken
@@ -457,7 +602,7 @@ public class TestAuthentication {
 
         // make a request to verification service
         Operation requestOp = Operation.createPost(host, TestAuthenticationService.SELF_LINK)
-                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERIFY_TOKEN);;
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERIFY_TOKEN);
 
         FailureResponse failureResponse = sender.sendAndWaitFailure(requestOp);
         assertNotNull(failureResponse.failure);
@@ -467,10 +612,56 @@ public class TestAuthentication {
     }
 
     @Test
+    public void testVerificationExpiredExternalAuthAccessToken() throws Throwable {
+        VerificationHost host = createAndStartHost(true, false, new TestAuthenticationService());
+        host.log("Testing verification of expired token for external auth");
+
+        // create user foo@vmware.com
+        createTestUsers(host);
+        String userLink = "/core/authz/users/foo@vmware.com";
+
+        Signer signer = new Signer(host.getJWTSecret());
+        long expirationMicros = Utils.fromNowMicrosUtc(TimeUnit.SECONDS.toMicros(5));
+
+        // Create a token with short expiry
+        Claims.Builder builder = new Builder();
+        builder.setExpirationTime(TimeUnit.MICROSECONDS.toSeconds(expirationMicros));
+        builder.setSubject(userLink);
+        Claims claims = builder.getResult();
+
+        String token = signer.sign(claims);
+        TestRequestSender.setAuthToken(token);
+        TestRequestSender sender = new TestRequestSender(host);
+
+        // Make a request to verification service
+        Operation requestOp = Operation.createPost(host, TestAuthenticationService.SELF_LINK)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERIFY_TOKEN);
+
+        Operation responseOp = sender.sendAndWait(requestOp);
+        AuthorizationContext ctx = responseOp.getBody(AuthorizationContext.class);
+        assertNotNull(ctx);
+        assertEquals(userLink, ctx.getClaims().getSubject());
+
+        host.waitFor("Timed out waiting from token to expire", () -> {
+            Operation op = Operation.createPost(host, TestAuthenticationService.SELF_LINK)
+                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERIFY_TOKEN);
+
+            op = sender.sendAndWait(op);
+            AuthorizationContext c = op.getBody(AuthorizationContext.class);
+            assertNotNull(c);
+            assertEquals(userLink, c.getClaims().getSubject());
+            return c.getClaims().getExpirationTime() > TimeUnit.MICROSECONDS.toSeconds(expirationMicros);
+        });
+
+        TestRequestSender.clearAuthToken();
+        host.log("Verification of expired token for external auth succeeded as expected");
+    }
+
+    @Test
     public void testExternalAuthenticationMultinode() throws Throwable {
-        VerificationHost host1 = createAndStartHost(true, new TestAuthenticationService());
-        VerificationHost host2 = createAndStartHost(true, new TestAuthenticationService());
-        VerificationHost host3 = createAndStartHost(true, new TestAuthenticationService());
+        VerificationHost host1 = createAndStartHost(true, false, new TestAuthenticationService());
+        VerificationHost host2 = createAndStartHost(true, false, new TestAuthenticationService());
+        VerificationHost host3 = createAndStartHost(true, false, new TestAuthenticationService());
 
         TestNodeGroupManager nodeGroup = new TestNodeGroupManager();
         nodeGroup.addHost(host1);
@@ -502,7 +693,6 @@ public class TestAuthentication {
         host1.log("Replication with external auth in multi-node is working");
     }
 
-
     private void testExternalAuthRedirectMultinode(ServiceHost host) {
         TestRequestSender sender = new TestRequestSender(host);
 
@@ -523,16 +713,15 @@ public class TestAuthentication {
 
         // make a request to get the accessToken for the authentication service
         Operation requestOp = Operation.createGet(host, TestAuthenticationService.SELF_LINK)
-                               .forceRemote();
+                .forceRemote();
         Operation responseOp = sender.sendAndWait(requestOp);
 
         String cookieHeader = responseOp.getResponseHeader(SET_COOKIE_HEADER);
         assertNotNull(cookieHeader);
 
-        Map<String, String> cookieElements = CookieJar.decodeCookies(cookieHeader);
         // assert the auth token cookie
-        assertEquals(TestAuthenticationService.ACCESS_TOKEN,
-                cookieElements.get(AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE));
+        Cookie tokenCookie = ClientCookieDecoder.LAX.decode(cookieHeader);
+        assertEquals(TestAuthenticationService.ACCESS_TOKEN, tokenCookie.value());
 
         // assert the auth token header
         assertEquals(TestAuthenticationService.ACCESS_TOKEN,

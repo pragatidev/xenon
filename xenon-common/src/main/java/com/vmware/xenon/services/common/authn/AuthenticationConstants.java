@@ -24,4 +24,6 @@ public final class AuthenticationConstants {
     public static final String DEFAULT_ISSUER = "xn";
 
     public static final String REQUEST_AUTH_TOKEN_COOKIE = "xenon-auth-cookie";
+
+    public static final String STAT_NAME_DURATION_MICROS_PREFIX = "authenticationDurationMicros";
 }

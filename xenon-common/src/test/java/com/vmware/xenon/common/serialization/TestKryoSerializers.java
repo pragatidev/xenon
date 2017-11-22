@@ -18,6 +18,13 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -37,6 +44,7 @@ import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
 import com.vmware.xenon.common.TestUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.serialization.KryoSerializers.KryoForObjectThreadLocal;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 
@@ -57,6 +65,118 @@ public class TestKryoSerializers {
                 o.position());
         assertNull(deser.documentSelfLink);
         assertNull(deser.documentKind);
+    }
+
+    public void makeTestData() throws IOException {
+        String prefix = "pre-1.1.1-";
+        ByteBuffer byteBuffer;
+
+        byteBuffer = KryoSerializers.serializeObject(Collections.EMPTY_LIST, 1000);
+        writeToFile(byteBuffer, prefix + "emptyList");
+
+        byteBuffer = KryoSerializers.serializeObject(Collections.EMPTY_SET, 1000);
+        writeToFile(byteBuffer, prefix + "emptySet");
+
+        byteBuffer = KryoSerializers.serializeObject(Collections.emptyNavigableSet(), 1000);
+        writeToFile(byteBuffer, prefix + "emptyNavigableSet");
+
+        byteBuffer = KryoSerializers.serializeObject(Collections.emptySortedSet(), 1000);
+        writeToFile(byteBuffer, prefix + "emptySortedSet");
+
+        byteBuffer = KryoSerializers.serializeObject(Collections.emptyMap(), 1000);
+        writeToFile(byteBuffer, prefix + "emptyMap");
+
+        byteBuffer = KryoSerializers.serializeObject(Collections.emptyNavigableMap(), 1000);
+        writeToFile(byteBuffer, prefix + "emptyNavigableMap");
+
+        byteBuffer = KryoSerializers.serializeObject(Collections.emptySortedMap(), 1000);
+        writeToFile(byteBuffer, prefix + "emptySortedMap");
+
+        byteBuffer = KryoSerializers.serializeObject(Arrays.asList("test"), 1000);
+        writeToFile(byteBuffer, prefix + "asList");
+
+        byteBuffer = KryoSerializers.serializeObject(Collections.singletonList("test"), 1000);
+        writeToFile(byteBuffer, prefix + "singletonList");
+
+        byteBuffer = KryoSerializers.serializeObject(Collections.singleton("test"), 1000);
+        writeToFile(byteBuffer, prefix + "singletonSet");
+
+        byteBuffer = KryoSerializers.serializeObject(Collections.singletonMap("k", "v"), 1000);
+        writeToFile(byteBuffer, prefix + "singletonMap");
+    }
+
+    @Test
+    public void readPre111() throws Exception {
+        String prefix = "pre-1.1.1-";
+
+        Field kryoHandleBuiltinCollections = KryoSerializers.class.getDeclaredField("KRYO_HANDLE_BUILTIN_COLLECTIONS");
+        kryoHandleBuiltinCollections.setAccessible(true);
+
+        try {
+            KryoSerializers.register(new KryoForObjectThreadLocal(), false);
+            kryoHandleBuiltinCollections.set(null, false);
+            readFileAndDeserialize(prefix + "emptyList");
+
+            readFileAndDeserialize(prefix + "emptyMap");
+            readFileAndDeserialize(prefix + "emptyNavigableMap");
+            readFileAndDeserialize(prefix + "emptySortedMap");
+
+            readFileAndDeserialize(prefix + "emptySet");
+
+            // Legacy Kryo does not support these classes;
+            // @see com.esotericsoftware.kryo.Kryo constructor for details
+
+            // readFileAndDeserialize(prefix + "asList");
+            // readFileAndDeserialize(prefix + "emptyNavigableSet");
+            // readFileAndDeserialize(prefix + "emptySortedSet");
+
+            readFileAndDeserialize(prefix + "singletonSet");
+            readFileAndDeserialize(prefix + "singletonList");
+            readFileAndDeserialize(prefix + "singletonMap");
+        } finally {
+            // restore context not to mess up other tests
+            kryoHandleBuiltinCollections.set(null, false);
+            KryoSerializers.register(null, false);
+        }
+    }
+
+    @Test
+    public void readPost111() throws IOException {
+        String prefix = "post-1.1.1-";
+        assertCollectionEqualAndUsable(Collections.emptyList(), readFileAndDeserialize(prefix + "emptyList"));
+        assertCollectionEqualAndUsable(Arrays.asList("test"), readFileAndDeserialize(prefix + "asList"));
+
+        assertCollectionEqualAndUsable(Collections.emptyMap(), readFileAndDeserialize(prefix + "emptyMap"));
+        assertCollectionEqualAndUsable(Collections.emptyNavigableMap(),
+                readFileAndDeserialize(prefix + "emptyNavigableMap"));
+        assertCollectionEqualAndUsable(Collections.emptySortedMap(), readFileAndDeserialize(prefix + "emptySortedMap"));
+
+        assertCollectionEqualAndUsable(Collections.emptySet(), readFileAndDeserialize(prefix + "emptySet"));
+        assertCollectionEqualAndUsable(Collections.emptyNavigableSet(),
+                readFileAndDeserialize(prefix + "emptyNavigableSet"));
+        assertCollectionEqualAndUsable(Collections.emptySortedSet(), readFileAndDeserialize(prefix + "emptySortedSet"));
+
+        assertCollectionEqualAndUsable(Collections.singleton("test"), readFileAndDeserialize(prefix + "singletonSet"));
+        assertCollectionEqualAndUsable(Collections.singletonList("test"),
+                readFileAndDeserialize(prefix + "singletonList"));
+        assertCollectionEqualAndUsable(Collections.singletonMap("k", "v"),
+                readFileAndDeserialize(prefix + "singletonMap"));
+    }
+
+    private Object readFileAndDeserialize(String name) throws IOException {
+        File dest = new File("src/test/resources/kryo/" + name + ".kryo");
+        try (FileInputStream fis = new FileInputStream(dest)) {
+            byte[] contents = new byte[1000];
+            int limit = fis.read(contents);
+            return KryoSerializers.deserializeObject(contents, 0, limit);
+        }
+    }
+
+    private void writeToFile(ByteBuffer buf, String name) throws IOException {
+        File dest = new File("src/test/resources/kryo/" + name + ".kryo");
+        try (FileOutputStream fos = new FileOutputStream(dest)) {
+            fos.write(buf.array(), buf.position(), buf.limit());
+        }
     }
 
     @Test
@@ -127,7 +247,6 @@ public class TestKryoSerializers {
         assertCollectionEqualAndUsable(target, serAndDeser(target));
     }
 
-
     @Test
     public void testEmptyCollectionClone() {
         Object target;
@@ -165,7 +284,6 @@ public class TestKryoSerializers {
             Map<Object, Object> second = (Map<Object, Object>) deserialized;
             // wrap in another map to exclude check on concrete type
             assertEquals(new HashMap<>(first), new HashMap<>(second));
-
 
             assertTypesCompliant(Map.class, first, second);
             assertTypesCompliant(NavigableMap.class, first, second);

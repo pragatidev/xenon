@@ -35,21 +35,29 @@
         .left-side-area {
             min-width: baselinerem(12);
             width: 20%;
-            overflow-y: scroll;
+            background: $grey-50;
+            box-shadow: none;
 
             .list-group-item {
-                border-left: none;
-                border-right: none;
+                border: none;
                 padding-left: baselinerem(1.5);
+                cursor: pointer;
+                background: transparent;
+                color: $grey-500;
+                display: block;
+                @include break-word();
+                @include transition(all);
 
-                &:first-child {
-                    border-radius: 0;
-                    border-top: none;
+                &:hover {
+                    box-shadow: rpx(4) 0 0 $light-blue-300 inset;
+                    background: $white-base;
+                    color: $grey-600;
                 }
 
-                &:last-child {
-                    border-radius: 0;
-                    border-bottom: none;
+                &:focus, &:active, &.active {
+                    box-shadow: rpx(4) 0 0 $light-blue-400 inset;
+                    background: $white-base;
+                    color: $black-base;
                 }
             }
         }
@@ -57,7 +65,7 @@
         .content-area {
             padding: 0;
 
-            > .service-instance-detail-container {
+            > .child-service-detail-container {
                 @include flexbox();
                 @include flex(1 1 auto);
             }

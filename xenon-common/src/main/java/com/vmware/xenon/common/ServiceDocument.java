@@ -21,6 +21,7 @@ import java.lang.annotation.Target;
 import java.util.EnumSet;
 
 import com.vmware.xenon.common.Service.Action;
+import com.vmware.xenon.common.ServiceDocumentDescription.DocumentIndexingOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
 
@@ -97,6 +98,12 @@ public class ServiceDocument {
     @Target(ElementType.TYPE)
     public @interface IndexingParameters {
         /**
+         * Document indexing options.
+         * @return
+         */
+        DocumentIndexingOption[] indexing() default {};
+
+        /**
          * Max size of a serialized document
          * @return
          */
@@ -118,8 +125,11 @@ public class ServiceDocument {
      * Annotations for ServiceDocumentDescription
      */
     @Retention(RetentionPolicy.RUNTIME)
-    @Target(ElementType.FIELD)
+    @Target({ElementType.FIELD, ElementType.TYPE})
     public @interface Documentation {
+        // sets property name
+        String name() default "";
+
         // sets propertyDocumentation
         String description() default "";
 
@@ -344,9 +354,9 @@ public class ServiceDocument {
             String currentSignature = Utils.computeSignature(currentDocument, description);
             String newSignature = Utils.computeSignature(newDocument, description);
             return currentSignature.equals(newSignature);
-        } catch (Throwable throwable) {
-            if (throwable instanceof IllegalArgumentException) {
-                throw (IllegalArgumentException) throwable;
+        } catch (Exception e) {
+            if (e instanceof IllegalArgumentException) {
+                throw (IllegalArgumentException) e;
             }
             return false;
         }

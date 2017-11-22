@@ -15,10 +15,15 @@ package com.vmware.xenon.host;
 
 import java.net.URI;
 import java.nio.file.Path;
+import java.security.Security;
 import java.util.logging.Level;
 
-import io.netty.handler.ssl.SslContext;
+import io.netty.handler.codec.http2.Http2SecurityUtil;
+import io.netty.handler.ssl.ApplicationProtocolConfig;
+import io.netty.handler.ssl.ApplicationProtocolNames;
+import io.netty.handler.ssl.OpenSsl;
 import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.SupportedCipherSuiteFilter;
 
 import com.vmware.xenon.common.CommandLineArgumentParser;
 import com.vmware.xenon.common.ServiceHost;
@@ -38,6 +43,12 @@ import com.vmware.xenon.ui.UiService;
  * A URL with port=0 is valid for --nodeGroupPublicUri and in this case a random free port will be used.
  */
 public class XenonHostWithPeerListener extends ServiceHost {
+
+    static {
+        String disabledAlgorithms = Security.getProperty("jdk.tls.disabledAlgorithms");
+        disabledAlgorithms = "TLSv1, TLSv1.1, " + disabledAlgorithms;
+        Security.setProperty("jdk.tls.disabledAlgorithms", disabledAlgorithms);
+    }
 
     private CustomArguments hostArgs;
 
@@ -114,22 +125,30 @@ public class XenonHostWithPeerListener extends ServiceHost {
 
         boolean isHttps = uri.getScheme().equals("https");
         if (isHttps) {
-            SslContext context;
+            SslContextBuilder builder;
             if (this.hostArgs.peerCertificateFile != null && this.hostArgs.peerKeyFile != null) {
-                context = SslContextBuilder.forServer(
+                builder = SslContextBuilder.forServer(
                         this.hostArgs.peerCertificateFile.toFile(),
                         this.hostArgs.peerKeyFile.toFile(),
-                        this.hostArgs.peerKeyPassphrase)
-                        .build();
+                        this.hostArgs.peerKeyPassphrase);
             } else {
-                context = SslContextBuilder.forServer(
+                builder = SslContextBuilder.forServer(
                         this.hostArgs.certificateFile.toFile(),
                         this.hostArgs.keyFile.toFile(),
-                        this.hostArgs.keyPassphrase)
-                        .build();
+                        this.hostArgs.keyPassphrase);
             }
 
-            peerListener.setSSLContext(context);
+            if (OpenSsl.isAlpnSupported()) {
+                builder.ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
+                        .applicationProtocolConfig(new ApplicationProtocolConfig(
+                                ApplicationProtocolConfig.Protocol.ALPN,
+                                ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                                ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                                ApplicationProtocolNames.HTTP_2,
+                                ApplicationProtocolNames.HTTP_1_1));
+            }
+
+            peerListener.setSSLContext(builder.build());
         }
 
         peerListener.start(uri.getPort(), uri.getHost());

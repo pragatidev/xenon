@@ -14,14 +14,12 @@
 package com.vmware.xenon.services.common;
 
 import java.util.Objects;
-import java.util.concurrent.CancellationException;
 
 import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
-import com.vmware.xenon.common.ServiceRuntimeContext;
 import com.vmware.xenon.common.StatefulService;
 import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.services.common.QueryTask.Query;
@@ -30,18 +28,13 @@ public class ResourceGroupService extends StatefulService {
     public static final String FACTORY_LINK = ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS;
 
     public static Service createFactory() {
-        // workaround for GSON issue https://github.com/google/gson/issues/764
-        // We serialize the complex type once, on service creation, to avoid possible GSON race
-        ResourceGroupState st = new ResourceGroupState();
-        st.query = QueryTask.Query.Builder.create().addFieldClause("one", "one").build();
-        Utils.toJson(st);
         return FactoryService.createIdempotent(ResourceGroupService.class);
     }
 
     /**
      * The {@link ResourceGroupState} holds a query that is used to represent a group of
      * resources (services). {@link ResourceGroupState} and {@link UserGroupService.UserGroupState)
-     * are used together in a {@link AuthorizationContextService.Role} to specify what resources
+     * are used together in a {@link AuthorizationContextServiceHelper.Role} to specify what resources
      * a set of users has access to.
      */
     public static class ResourceGroupState extends ServiceDocument {
@@ -116,11 +109,8 @@ public class ResourceGroupService extends StatefulService {
     }
 
     @Override
-    public ServiceRuntimeContext setProcessingStage(Service.ProcessingStage stage) {
-        if (stage == Service.ProcessingStage.PAUSED) {
-            throw new CancellationException("Cannot pause service.");
-        }
-        return super.setProcessingStage(stage);
+    public void setProcessingStage(Service.ProcessingStage stage) {
+        super.setProcessingStage(stage);
     }
 
     @Override
@@ -152,10 +142,11 @@ public class ResourceGroupService extends StatefulService {
         ResourceGroupState currentState = getState(op);
         ServiceDocumentDescription documentDescription = getStateDescription();
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
-            op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
-        } else {
-            setState(op, newState);
+            // do not update state
+            op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED);
         }
+
+        setState(op, newState);
         op.complete();
     }
 

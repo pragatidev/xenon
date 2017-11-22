@@ -1,31 +1,29 @@
 // angular
-import { ChangeDetectionStrategy, OnInit, OnDestroy } from '@angular/core';
+import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Location } from '@angular/common';
 import { ActivatedRoute, Router } from '@angular/router';
 import { Subscription } from 'rxjs/Subscription';
 import * as _ from 'lodash';
 
 // app
-import { BaseComponent } from '../../../frameworks/core/index';
+import { URL } from '../../../modules/app/enums/index';
+import { ModalContext, Node, QueryTask, ServiceDocument,
+    ServiceDocumentQueryResult } from '../../../modules/app/interfaces/index';
+import { ODataUtil, StringUtil } from '../../../modules/app/utils/index';
+import { BaseService, NodeSelectorService, NotificationService } from '../../../modules/app/services/index';
 
-import { URL } from '../../../frameworks/app/enums/index';
-import { ModalContext, Node, ServiceDocument, ServiceDocumentQueryResult } from '../../../frameworks/app/interfaces/index';
-import { StringUtil } from '../../../frameworks/app/utils/index';
-
-import { BaseService, NodeSelectorService, NotificationService } from '../../../frameworks/app/services/index';
-
-@BaseComponent({
+@Component({
     selector: 'xe-service-detail',
     moduleId: module.id,
     templateUrl: './service-detail.component.html',
-    styleUrls: ['./service-detail.component.css'],
-    changeDetection: ChangeDetectionStrategy.Default
+    styleUrls: ['./service-detail.component.css']
 })
 
 export class ServiceDetailComponent implements OnInit, OnDestroy {
     /**
-     * Context object for rendering create instance modal.
+     * Context object for rendering create child service modal.
      */
-    createInstanceModalContext: ModalContext = {
+    createChildServiceModalContext: ModalContext = {
         name: '',
         data: {
             documentSelfLink: '',
@@ -34,177 +32,235 @@ export class ServiceDetailComponent implements OnInit, OnDestroy {
     };
 
     /**
-     * links to all the available services.
+     * Links to all the available services.
      */
-    private _serviceLinks: string[] = [];
+    private serviceLinks: string[] = [];
 
     /**
-     * links to all the available instances within the specified service.
+     * Links to all the available child services within the specified service.
      */
-    private _serviceInstancesLinks: string[] = [];
+    private childServicesLinks: string[] = [];
+
+    /**
+     * Link to the next page of the child services
+     */
+    private childServiceNextPageLink: string;
+
+    /**
+     * A lock to prevent the same next page link from being requested multiple times when scrolling
+     */
+    private childServiceNextPageLinkRequestLocked: boolean = false;
 
     /**
      * Id for the selected service. E.g. /core/examples
      */
-    private _selectedServiceId: string = '';
+    private selectedServiceId: string;
 
     /**
-     * Id for the selected service instance.
+     * Id for the selected child service.
      */
-    private _selectedServiceInstanceId: string = '';
+    private selectedChildServiceId: string;
 
     /**
      * Subscriptions to services.
      */
-    private _activatedRouteParamsSubscription: Subscription;
-    private _nodeSelectorServiceGetSelectedSubscription: Subscription;
-    private _baseServiceGetLinksSubscription: Subscription;
-    private _baseServiceGetServiceInstanceListSubscription: Subscription;
+    private activatedRouteParamsSubscription: Subscription;
+    private nodeSelectorServiceGetSelectedSubscription: Subscription;
+    private baseServiceGetLinksSubscription: Subscription;
+    private baseServiceGetChildServiceListSubscription: Subscription;
+    private baseServiceGetChildServiceListNextPageSubscription: Subscription;
 
     constructor(
-        private _baseService: BaseService,
-        private _nodeSelectorService: NodeSelectorService,
-        private _notificationService: NotificationService,
-        private _activatedRoute: ActivatedRoute,
-        private _router: Router) {}
+        private baseService: BaseService,
+        private nodeSelectorService: NodeSelectorService,
+        private notificationService: NotificationService,
+        private activatedRoute: ActivatedRoute,
+        private router: Router,
+        private browserLocation: Location) {}
 
     ngOnInit(): void {
         // Update data when selected node changes
-        this._nodeSelectorServiceGetSelectedSubscription =
-            this._nodeSelectorService.getSelectedNode().subscribe(
+        this.nodeSelectorServiceGetSelectedSubscription =
+            this.nodeSelectorService.getSelectedNode().subscribe(
                 (selectedNode: Node) => {
                     // Navigate to the parent service grid when selected node changes
-                    this._router.navigate(['/main/service'], {
-                        relativeTo: this._activatedRoute,
+                    this.router.navigate(['/main/service'], {
+                        relativeTo: this.activatedRoute,
                         queryParams: {
-                            'node': this._activatedRoute.snapshot.queryParams['node']
+                            'node': this.activatedRoute.snapshot.queryParams['node']
                         }
                     });
                 });
 
-        this._activatedRouteParamsSubscription =
-            this._activatedRoute.params.subscribe(
+        this.activatedRouteParamsSubscription =
+            this.activatedRoute.params.subscribe(
                 (params: {[key: string]: any}) => {
-                    this._selectedServiceId =
+                    this.selectedServiceId =
                         StringUtil.decodeFromId(params['id'] as string);
 
-                    this._selectedServiceInstanceId = params['instanceId'];
+                    this.selectedChildServiceId = params['childId'];
 
                     // Set modal context
-                    this.createInstanceModalContext.name = this._selectedServiceId;
-                    this.createInstanceModalContext.data['documentSelfLink'] = this._selectedServiceId;
-                    this.createInstanceModalContext.data['body'] = '';
+                    this.createChildServiceModalContext.name = this.selectedServiceId;
+                    this.createChildServiceModalContext.data['documentSelfLink'] = this.selectedServiceId;
+                    this.createChildServiceModalContext.data['body'] = '';
 
-                    this._getData();
+                    this.getData();
                 });
     }
 
     ngOnDestroy(): void {
-        if (!_.isUndefined(this._baseServiceGetLinksSubscription)) {
-            this._baseServiceGetLinksSubscription.unsubscribe();
+        if (!_.isUndefined(this.baseServiceGetLinksSubscription)) {
+            this.baseServiceGetLinksSubscription.unsubscribe();
         }
 
-        if (!_.isUndefined(this._baseServiceGetServiceInstanceListSubscription)) {
-            this._baseServiceGetServiceInstanceListSubscription.unsubscribe();
+        if (!_.isUndefined(this.baseServiceGetChildServiceListSubscription)) {
+            this.baseServiceGetChildServiceListSubscription.unsubscribe();
         }
 
-        if (!_.isUndefined(this._nodeSelectorServiceGetSelectedSubscription)) {
-            this._nodeSelectorServiceGetSelectedSubscription.unsubscribe();
+        if (!_.isUndefined(this.nodeSelectorServiceGetSelectedSubscription)) {
+            this.nodeSelectorServiceGetSelectedSubscription.unsubscribe();
         }
 
-        if (!_.isUndefined(this._activatedRouteParamsSubscription)) {
-            this._activatedRouteParamsSubscription.unsubscribe();
+        if (!_.isUndefined(this.activatedRouteParamsSubscription)) {
+            this.activatedRouteParamsSubscription.unsubscribe();
         }
     }
 
     getServiceLinks(): string[] {
-        return this._serviceLinks;
+        return this.serviceLinks;
     }
 
-    getServiceInstanceLinks(): string[] {
-        return _.map(this._serviceInstancesLinks, (serviceInstanceLink: string) => {
-            return StringUtil.parseDocumentLink(serviceInstanceLink).id;
+    getChildServiceLinks(): string[] {
+        return _.map(this.childServicesLinks, (childServiceLink: string) => {
+            return StringUtil.parseDocumentLink(childServiceLink, this.selectedServiceId).id;
         });
     }
 
     getSelectedServiceId(): string {
-        return this._selectedServiceId;
+        return this.selectedServiceId;
     }
 
     getSelectedServiceRouterId(id: string): string {
         return StringUtil.encodeToId(id);
     }
 
-    getSelectedServiceInstanceId(): string {
-        return this._selectedServiceInstanceId;
+    getSelectedChildServiceId(): string {
+        return this.selectedChildServiceId;
     }
 
-    onCreateInstance(event: MouseEvent): void {
-        var selectedServiceId: string = this.createInstanceModalContext.data['documentSelfLink'];
-        var body: string = this.createInstanceModalContext.data['body'];
+    onCreateChildService(event: MouseEvent): void {
+        var selectedServiceId: string = this.createChildServiceModalContext.data['documentSelfLink'];
+        var body: string = this.createChildServiceModalContext.data['body'];
 
         if (!selectedServiceId || !body) {
             return;
         }
 
-        this._baseService.post(selectedServiceId, body).subscribe(
+        this.baseService.post(selectedServiceId, body).subscribe(
             (document: ServiceDocument) => {
-                var documentId: string = document.documentSelfLink ?
-                    StringUtil.parseDocumentLink(document.documentSelfLink).id : '';
-                this._notificationService.set([{
+                this.notificationService.set([{
                     type: 'SUCCESS',
-                    messages: [`Instance ${documentId} Created`]
+                    messages: [`Child Service ${document.documentSelfLink} Created`]
                 }]);
 
                 // Reset body
-                this.createInstanceModalContext.data['body'] = '';
+                this.createChildServiceModalContext.data['body'] = '';
             },
             (error) => {
                 // TODO: Better error handling
-                this._notificationService.set([{
+                this.notificationService.set([{
                     type: 'ERROR',
                     messages: [`[${error.statusCode}] ${error.message}`]
                 }]);
             });
     }
 
-    private _getData(): void {
-        // Only get _serviceLinks once
-        if (_.isEmpty(this._serviceLinks)) {
-            // Reset _serviceInstancesLinks when the service itself changes
-            this._serviceInstancesLinks = [];
+    onSelectChildService(event: MouseEvent, childServiceId: string): void {
+        event.stopImmediatePropagation();
 
-            this._baseServiceGetLinksSubscription =
-                this._baseService.post(URL.Root, URL.RootPostBody).subscribe(
+        // Manually update the url to represent the selected child service instead of
+        // using router navigate, to prevent the page from flashing (thus all the child services
+        // get reloaded and pagination get massed up), and offer better performance.
+        var serviceId: string = this.activatedRoute.snapshot.params['id'];
+        var basePath = this.browserLocation.path();
+
+        if (_.isUndefined(this.selectedChildServiceId)) {
+            this.browserLocation.replaceState(basePath.replace(serviceId, `${serviceId}/${childServiceId}`));
+        } else {
+            this.browserLocation.replaceState(basePath.replace(this.selectedChildServiceId, childServiceId));
+        }
+
+        this.selectedChildServiceId = childServiceId;
+    }
+
+    onLoadNextPage(): void {
+        if (_.isUndefined(this.childServiceNextPageLink) || this.childServiceNextPageLinkRequestLocked) {
+            return;
+        }
+
+        this.childServiceNextPageLinkRequestLocked = true;
+        this.baseServiceGetChildServiceListNextPageSubscription =
+            this.baseService.getDocument(this.childServiceNextPageLink, '', false).subscribe(
+                (document: QueryTask) => {
+                    if (_.isEmpty(document.results) || this.childServiceNextPageLink === document.results.nextPageLink) {
+                        return;
+                    }
+
+                    this.childServiceNextPageLinkRequestLocked = false;
+                    this.childServicesLinks = _.concat(this.childServicesLinks, document.results.documentLinks);
+
+                    // NOTE: Need to use forwarding link here since the paginated data is stored on a particular node
+                    if (document.results.nextPageLink) {
+                        this.childServiceNextPageLink = this.baseService.getForwardingLink(document.results.nextPageLink);
+                    }
+                },
+                (error) => {
+                    // TODO: Better error handling
+                    this.notificationService.set([{
+                        type: 'ERROR',
+                        messages: [`Failed to retrieve factory service details: [${error.statusCode}] ${error.message}`]
+                    }]);
+                });
+    }
+
+    private getData(): void {
+        // Only get serviceLinks once
+        if (_.isEmpty(this.serviceLinks)) {
+            // Reset childServicesLinks when the service itself changes
+            this.childServicesLinks = [];
+
+            this.baseServiceGetLinksSubscription =
+                this.baseService.post(URL.Root, URL.RootPostBody).subscribe(
                     (document: ServiceDocumentQueryResult) => {
-                        this._serviceLinks = document.documentLinks;
+                        this.serviceLinks = _.sortBy(document.documentLinks);
                     },
                     (error) => {
                         // TODO: Better error handling
-                        this._notificationService.set([{
+                        this.notificationService.set([{
                             type: 'ERROR',
                             messages: [`Failed to retrieve factory services: [${error.statusCode}] ${error.message}`]
                         }]);
                     });
         }
 
-        // - When _serviceInstancesLinks is not available, get it
-        // - When switching between instances (thus _selectedServiceInstanceId is
-        //      available), skip querying service instances since it will
-        //      not change anyway
-        if (_.isEmpty(this._serviceInstancesLinks) || _.isNull(this._selectedServiceInstanceId)) {
-            this._baseServiceGetServiceInstanceListSubscription =
-                this._baseService.getDocumentLinks(this._selectedServiceId).subscribe(
-                    (serviceInstanceLinks: string[]) => {
-                        this._serviceInstancesLinks = serviceInstanceLinks;
-                    },
-                    (error) => {
-                        // TODO: Better error handling
-                        this._notificationService.set([{
-                            type: 'ERROR',
-                            messages: [`Failed to retrieve factory service details: [${error.statusCode}] ${error.message}`]
-                        }]);
-                    });
-        }
+        this.baseServiceGetChildServiceListSubscription =
+            this.baseService.getDocument(this.selectedServiceId, `${ODataUtil.limit()}&${ODataUtil.orderBy('documentSelfLink')}`).subscribe(
+                (document: ServiceDocumentQueryResult) => {
+                    this.childServicesLinks = document.documentLinks;
+                    console.log(document);
+
+                    // NOTE: Need to use forwarding link here since the paginated data is stored on a particular node
+                    if (document.nextPageLink) {
+                        this.childServiceNextPageLink = this.baseService.getForwardingLink(document.nextPageLink);
+                    }
+                },
+                (error) => {
+                    // TODO: Better error handling
+                    this.notificationService.set([{
+                        type: 'ERROR',
+                        messages: [`Failed to retrieve factory service details: [${error.statusCode}] ${error.message}`]
+                    }]);
+                });
     }
 }

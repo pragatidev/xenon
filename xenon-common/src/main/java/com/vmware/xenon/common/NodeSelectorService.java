@@ -18,6 +18,7 @@ import java.util.Collection;
 import java.util.EnumSet;
 
 import com.vmware.xenon.common.Operation.OperationOption;
+import com.vmware.xenon.common.config.XenonConfiguration;
 import com.vmware.xenon.services.common.NodeState;
 
 /**
@@ -29,33 +30,41 @@ import com.vmware.xenon.services.common.NodeState;
  * all interaction with a service, regardless of location should be through REST asynchronous operations
  */
 public interface NodeSelectorService extends Service {
-    public static final String STAT_NAME_QUEUED_REQUEST_COUNT = "queuedRequestCount";
-    public static final String STAT_NAME_LIMIT_EXCEEDED_FAILED_REQUEST_COUNT = "limitExceededFailedRequestCount";
-    public static final String STAT_NAME_SYNCHRONIZATION_COUNT = "synchronizationCount";
+    String STAT_NAME_QUEUED_REQUEST_COUNT = "queuedRequestCount";
+    String STAT_NAME_LIMIT_EXCEEDED_FAILED_REQUEST_COUNT = "limitExceededFailedRequestCount";
+    String STAT_NAME_SYNCHRONIZATION_COUNT = "synchronizationCount";
 
-    public static final OperationOption FORWARDING_OPERATION_OPTION = getOperationOption(
-            "NodeSelectorService.FORWARDING_OPERATION_OPTION", OperationOption.CONNECTION_SHARING);
+    OperationOption FORWARDING_OPERATION_OPTION = XenonConfiguration.choice(
+            NodeSelectorService.class,
+            "FORWARDING_OPERATION_OPTION",
+            OperationOption.class,
+            OperationOption.CONNECTION_SHARING
+    );
 
-    public static final OperationOption REPLICATION_OPERATION_OPTION = getOperationOption(
-            "NodeSelectorService.REPLICATION_OPERATION_OPTION", null);
+    OperationOption REPLICATION_OPERATION_OPTION = XenonConfiguration.choice(
+            NodeSelectorService.class,
+            "REPLICATION_OPERATION_OPTION",
+            OperationOption.class,
+            null
+    );
 
-    public static final int REPLICATION_TAG_CONNECTION_LIMIT = Integer.getInteger(
-            Utils.PROPERTY_NAME_PREFIX
-                    + "NodeSelectorService.REPLICATION_TAG_CONNECTION_LIMIT", 32);
+    int REPLICATION_TAG_CONNECTION_LIMIT = XenonConfiguration.integer(
+            NodeSelectorService.class,
+            "REPLICATION_TAG_CONNECTION_LIMIT",
+            32
+    );
 
-    public static final int FORWARDING_TAG_CONNECTION_LIMIT = Integer.getInteger(
-            Utils.PROPERTY_NAME_PREFIX
-                    + "NodeSelectorService.FORWARDING_TAG_CONNECTION_LIMIT", 32);
+    int SYNCHRONIZATION_TAG_CONNECTION_LIMIT = XenonConfiguration.integer(
+            NodeSelectorService.class,
+            "SYNCHRONIZATION_TAG_CONNECTION_LIMIT",
+            32
+    );
 
-    static OperationOption getOperationOption(String name, OperationOption defaultOpt) {
-        String paramName = Utils.PROPERTY_NAME_PREFIX + name;
-        String paramValue = System.getProperty(paramName);
-        if (OperationOption.CONNECTION_SHARING.name().equals(paramValue)) {
-            return OperationOption.CONNECTION_SHARING;
-        } else {
-            return defaultOpt;
-        }
-    }
+    int FORWARDING_TAG_CONNECTION_LIMIT = XenonConfiguration.integer(
+            NodeSelectorService.class,
+            "FORWARDING_TAG_CONNECTION_LIMIT",
+            32
+    );
 
     /**
      * Request to select one or more nodes from the available nodes in the node group, and optionally
@@ -150,6 +159,15 @@ public interface NodeSelectorService extends Service {
     }
 
     /**
+     * Request to update replication quorum
+     */
+    public static class UpdateReplicationQuorumRequest extends ServiceDocument {
+        public static final String KIND = Utils.buildKind(UpdateReplicationQuorumRequest.class);
+        public Integer replicationQuorum;
+        public boolean isGroupUpdate;
+    }
+
+    /**
      * Returns the node group path associated with this selector
      */
     String getNodeGroupPath();
@@ -160,4 +178,9 @@ public interface NodeSelectorService extends Service {
      * Note: The body should be cloned before queuing or using in a different thread context
      */
     void selectAndForward(Operation op, SelectAndForwardRequest body);
+
+    /**
+     * Set replication quorum, which decides the success and failure threshold of a service update
+     */
+    void updateReplicationQuorum(Operation op, UpdateReplicationQuorumRequest r);
 }

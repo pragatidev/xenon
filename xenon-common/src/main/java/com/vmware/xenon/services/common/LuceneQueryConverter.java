@@ -13,6 +13,8 @@
 
 package com.vmware.xenon.services.common;
 
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 
 import org.apache.lucene.document.DoublePoint;
@@ -20,17 +22,23 @@ import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.PhraseQuery;
 import org.apache.lucene.search.PrefixQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.SortedNumericSortField;
+import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.WildcardQuery;
+import org.apache.lucene.util.BytesRef;
 
+import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
+import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
+import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryRuntimeContext;
 
 /**
  * Convert {@link QueryTask.QuerySpecification} to native Lucene query.
@@ -40,7 +48,30 @@ final class LuceneQueryConverter {
 
     }
 
-    static Query convertToLuceneQuery(QueryTask.Query query) {
+    static final int BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD = 16;
+
+    static Query convert(QueryTask.Query query, QueryRuntimeContext context) {
+
+        if (query.occurance == null) {
+            query.occurance = QueryTask.Query.Occurance.MUST_OCCUR;
+        }
+
+        // Special case for top level occurance which was ignored otherwise
+        if (query.booleanClauses != null) {
+            if (query.term != null) {
+                throw new IllegalArgumentException(
+                        "term and booleanClauses are mutually exclusive");
+            }
+
+            Query booleanClauses = convertToLuceneQuery(query, context);
+            BooleanQuery.Builder builder = new BooleanQuery.Builder();
+            return builder.add(booleanClauses, convertToLuceneOccur(query.occurance)).build();
+        }
+
+        return convertToLuceneQuery(query, context);
+    }
+
+    static Query convertToLuceneQuery(QueryTask.Query query, QueryRuntimeContext context) {
         if (query.occurance == null) {
             query.occurance = QueryTask.Query.Occurance.MUST_OCCUR;
         }
@@ -51,7 +82,7 @@ final class LuceneQueryConverter {
                         "term and booleanClauses are mutually exclusive");
             }
 
-            return convertToLuceneBooleanQuery(query);
+            return convertToLuceneBooleanQuery(query, context);
         }
 
         if (query.term == null) {
@@ -62,6 +93,17 @@ final class LuceneQueryConverter {
         validateTerm(term);
         if (term.matchType == null) {
             term.matchType = QueryTask.QueryTerm.MatchType.TERM;
+        }
+
+        if (context != null && query.occurance != QueryTask.Query.Occurance.MUST_NOT_OCCUR &&
+                ServiceDocument.FIELD_NAME_KIND.equals(term.propertyName)) {
+            if (context.kindScope == null) {
+                // assume most queries contain 1 or 2 document kinds. Initialize with size 4
+                // to prevent resizing when the second kind is added. The default size of 16
+                // has never been filled up.
+                context.kindScope = new HashSet<>(4);
+            }
+            context.kindScope.add(term.matchValue);
         }
 
         if (query.term.range != null) {
@@ -95,10 +137,24 @@ final class LuceneQueryConverter {
     }
 
     static Query convertToLucenePrefixQuery(QueryTask.Query query) {
+        // if the query is a prefix on a self link that matches all documents, then
+        // special case the query to a MatchAllDocsQuery to avoid looking through
+        // the entire index as the number of terms is equal to the size of the index
+        if ((query.term.propertyName.equals(ServiceDocument.FIELD_NAME_SELF_LINK)) &&
+                query.term.matchValue.equals(UriUtils.URI_PATH_CHAR)) {
+            return new MatchAllDocsQuery();
+        }
         return new PrefixQuery(convertToLuceneTerm(query.term));
     }
 
     static Query convertToLuceneWildcardTermQuery(QueryTask.Query query) {
+        // if the query is a wildcard on a self link that matches all documents, then
+        // special case the query to a MatchAllDocsQuery to avoid looking through
+        // the entire index as the number of terms is equal to the size of the index
+        if ((query.term.propertyName.equals(ServiceDocument.FIELD_NAME_SELF_LINK)) &&
+                query.term.matchValue.equals(UriUtils.URI_WILDCARD_CHAR)) {
+            return new MatchAllDocsQuery();
+        }
         return new WildcardQuery(convertToLuceneTerm(query.term));
     }
 
@@ -119,18 +175,40 @@ final class LuceneQueryConverter {
         }
     }
 
-    static Query convertToLuceneBooleanQuery(QueryTask.Query query) {
+    static Query convertToLuceneBooleanQuery(QueryTask.Query query, QueryRuntimeContext context) {
         BooleanQuery.Builder parentQuery = new BooleanQuery.Builder();
 
+        int rewriteThreshold = Math.min(BOOLEAN_REWRITE_TERM_COUNT_THRESHOLD, BooleanQuery.getMaxClauseCount());
+        if (query.booleanClauses.size() >= rewriteThreshold) {
+            List<BytesRef> termList = new ArrayList<>();
+            String termKey = null;
+            boolean isTermQuery = true;
+            for (QueryTask.Query q : query.booleanClauses) {
+                if (q.term == null || q.occurance != QueryTask.Query.Occurance.SHOULD_OCCUR
+                        || (termKey != null && !termKey.equals(q.term.propertyName))) {
+                    isTermQuery = false;
+                    break;
+                }
+                termList.add(new BytesRef(q.term.matchValue));
+                if (termKey == null) {
+                    termKey = q.term.propertyName;
+                }
+            }
+            // convert to a TermInSet query
+            if (isTermQuery) {
+                return new TermInSetQuery(termKey, termList);
+            }
+        }
         // Recursively build the boolean query. We allow arbitrary nesting and grouping.
         for (QueryTask.Query q : query.booleanClauses) {
-            buildBooleanQuery(parentQuery, q);
+            buildBooleanQuery(parentQuery, q, context);
         }
         return parentQuery.build();
     }
 
-    static void buildBooleanQuery(BooleanQuery.Builder parent, QueryTask.Query clause) {
-        Query lq = convertToLuceneQuery(clause);
+    static void buildBooleanQuery(BooleanQuery.Builder parent, QueryTask.Query clause,
+            QueryRuntimeContext context) {
+        Query lq = convertToLuceneQuery(clause, context);
         BooleanClause bc = new BooleanClause(lq, convertToLuceneOccur(clause.occurance));
         parent.add(bc);
     }
@@ -256,7 +334,9 @@ final class LuceneQueryConverter {
             sortField = new SortedNumericSortField(sortTerm.propertyName, type, order);
             break;
         default:
-            sortField = new SortField(sortTerm.propertyName, type, order);
+            sortField = new SortField(LuceneIndexDocumentHelper.createSortFieldPropertyName(sortTerm.propertyName),
+                    type,
+                    order);
             break;
         }
         return sortField;

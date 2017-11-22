@@ -17,6 +17,7 @@ import java.io.UnsupportedEncodingException;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.util.Base64;
+import java.util.EnumSet;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -28,6 +29,7 @@ import com.vmware.xenon.common.StatelessService;
 import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.common.jwt.Verifier;
 import com.vmware.xenon.common.jwt.Verifier.TokenException;
+import com.vmware.xenon.services.common.GuestUserService;
 import com.vmware.xenon.services.common.QueryTask;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.ServiceUriPaths;
@@ -37,16 +39,14 @@ import com.vmware.xenon.services.common.ServiceUriPaths;
  */
 public final class BasicAuthenticationUtils {
 
-    public static final String WWW_AUTHENTICATE_HEADER_NAME = "WWW-Authenticate";
+    public static final String WWW_AUTHENTICATE_HEADER_NAME = "www-authenticate";
     public static final String WWW_AUTHENTICATE_HEADER_VALUE = "Basic realm=\"xenon\"";
-    public static final String AUTHORIZATION_HEADER_NAME = "Authorization";
     public static final String BASIC_AUTH_NAME = "Basic";
-    private static final String BASIC_AUTH_SEPERATOR = " ";
-    private static final String BASIC_AUTH_USER_SEPERATOR = ":";
+    private static final String BASIC_AUTH_SEPARATOR = " ";
+    private static final String BASIC_AUTH_USER_SEPARATOR = ":";
 
-    private static final long AUTH_TOKEN_EXPIRATION_MICROS = Long.getLong(
-            Utils.PROPERTY_NAME_PREFIX + "BasicAuthenticationService.AUTH_TOKEN_EXPIRATION_MICROS",
-            TimeUnit.HOURS.toMicros(1));
+    public static final EnumSet<QueryTask.QuerySpecification.QueryOption> QUERY_OPTIONS_TOP_RESULTS =
+            EnumSet.of(QueryTask.QuerySpecification.QueryOption.TOP_RESULTS);
 
     private BasicAuthenticationUtils() {
 
@@ -83,10 +83,11 @@ public final class BasicAuthenticationUtils {
      * @param service service invoking this method
      * @param op Operation context of the login request
      * @param authContext authContext to perform the login checks
+     * @param expirationTimeMicros expiration time for the auth token
      */
     public static void handleLogin(StatelessService service, Operation op,
-            BasicAuthenticationContext authContext) {
-        queryUserService(service, op, authContext);
+            BasicAuthenticationContext authContext, long expirationTimeMicros) {
+        queryUserService(service, op, authContext, expirationTimeMicros);
     }
 
     /**
@@ -97,11 +98,11 @@ public final class BasicAuthenticationUtils {
      */
     public static String[] parseRequest(StatelessService service, Operation op) {
         // Attempt to fetch and use userInfo, if AUTHORIZATION_HEADER_NAME is null.
-        String authHeader = op.getRequestHeader(AUTHORIZATION_HEADER_NAME);
+        String authHeader = op.getRequestHeader(Operation.AUTHORIZATION_HEADER);
         String userInfo = op.getUri().getUserInfo();
         String authString;
         if (authHeader != null) {
-            String[] authHeaderParts = authHeader.split(BASIC_AUTH_SEPERATOR);
+            String[] authHeaderParts = authHeader.split(BASIC_AUTH_SEPARATOR);
             // malformed header; send a 400 response
             if (authHeaderParts.length != 2 || !authHeaderParts[0].equalsIgnoreCase(BASIC_AUTH_NAME)) {
                 op.fail(Operation.STATUS_CODE_BAD_REQUEST);
@@ -125,7 +126,7 @@ public final class BasicAuthenticationUtils {
             return null;
         }
 
-        String[] userNameAndPassword = authString.split(BASIC_AUTH_USER_SEPERATOR);
+        String[] userNameAndPassword = authString.split(BASIC_AUTH_USER_SEPARATOR);
         if (userNameAndPassword.length != 2) {
             op.fail(Operation.STATUS_CODE_BAD_REQUEST);
             return null;
@@ -151,13 +152,17 @@ public final class BasicAuthenticationUtils {
      * This method invokes the query specified by the service to check if the user is
      * valid
      * @param service service invoking this method
-     * @param op Operation context of the login request
+     * @param parentOp Operation context of the login request
      * @param authContext authContext to perform the login checks
+     * @param expirationTimeMicros expiration time for the auth token
      */
-    private static void queryUserService(StatelessService service, Operation parentOp, BasicAuthenticationContext authContext) {
+    private static void queryUserService(StatelessService service, Operation parentOp,
+            BasicAuthenticationContext authContext, long expirationTimeMicros) {
         QueryTask q = new QueryTask();
         q.querySpec = new QueryTask.QuerySpecification();
         q.querySpec.query = authContext.userQuery;
+        q.querySpec.options = QUERY_OPTIONS_TOP_RESULTS;
+        q.querySpec.resultLimit = 1;
         q.taskInfo.isDirect = true;
 
         Operation.CompletionHandler userServiceCompletion = (o, ex) -> {
@@ -175,11 +180,12 @@ public final class BasicAuthenticationUtils {
 
             // The user is valid; query the auth provider to check if the credentials match
             String userLink = rsp.results.documentLinks.get(0);
-            queryAuthStore(service, parentOp, userLink, authContext);
+            queryAuthStore(service, parentOp, userLink, authContext, expirationTimeMicros);
         };
 
         Operation queryOp = Operation
-                .createPost(AuthUtils.buildAuthProviderHostUri(service.getHost(), ServiceUriPaths.CORE_QUERY_TASKS))
+                .createPost(AuthUtils.buildAuthProviderHostUri(service.getHost(),
+                        ServiceUriPaths.CORE_LOCAL_QUERY_TASKS))
                 .setBody(q)
                 .setCompletion(userServiceCompletion);
         service.setAuthorizationContext(queryOp, service.getSystemAuthorizationContext());
@@ -190,16 +196,19 @@ public final class BasicAuthenticationUtils {
      * This method invokes the query specified by the service to check if
      * the user credentials are valid
      * @param service service invoking this method
-     * @param parentOop Operation context of the login request
+     * @param parentOp Operation context of the login request
      * @param userLink service link for the user
      * @param authContext authContext to perform the login checks
+     * @param expirationTimeMicros expiration time for the auth token
      */
     private static void queryAuthStore(StatelessService service, Operation parentOp, String userLink,
-            BasicAuthenticationContext authContext) {
+            BasicAuthenticationContext authContext, long expirationTimeMicros) {
         // query against the auth credentials store
         QueryTask authQuery = new QueryTask();
         authQuery.querySpec = new QueryTask.QuerySpecification();
         authQuery.querySpec.query = authContext.authQuery;
+        authQuery.querySpec.options = QUERY_OPTIONS_TOP_RESULTS;
+        authQuery.querySpec.resultLimit = 1;
         authQuery.taskInfo.isDirect = true;
         Operation.CompletionHandler authCompletionHandler = (authOp, authEx) -> {
             if (authEx != null) {
@@ -216,17 +225,8 @@ public final class BasicAuthenticationUtils {
                 return;
             }
 
-            AuthenticationRequest authRequest = parentOp.getBody(AuthenticationRequest.class);
-            long expirationTime;
-            if (authRequest.sessionExpirationSeconds != null) {
-                expirationTime = Utils.fromNowMicrosUtc(TimeUnit.SECONDS
-                        .toMicros(authRequest.sessionExpirationSeconds));
-            } else {
-                expirationTime = Utils.fromNowMicrosUtc(AUTH_TOKEN_EXPIRATION_MICROS);
-            }
-
             // set token validity
-            if (!associateAuthorizationContext(service, parentOp, userLink, expirationTime)) {
+            if (!associateAuthorizationContext(service, parentOp, userLink, expirationTimeMicros)) {
                 parentOp.fail(Operation.STATUS_CODE_SERVER_FAILURE_THRESHOLD);
                 return;
             }
@@ -235,7 +235,8 @@ public final class BasicAuthenticationUtils {
         };
 
         Operation queryAuth = Operation
-                .createPost(AuthUtils.buildAuthProviderHostUri(service.getHost(), ServiceUriPaths.CORE_QUERY_TASKS))
+                .createPost(AuthUtils.buildAuthProviderHostUri(service.getHost(),
+                        ServiceUriPaths.CORE_LOCAL_QUERY_TASKS))
                 .setBody(authQuery)
                 .setCompletion(authCompletionHandler);
         service.setAuthorizationContext(queryAuth, service.getSystemAuthorizationContext());
@@ -247,14 +248,14 @@ public final class BasicAuthenticationUtils {
      * @param service service invoking this method
      * @param op Operation context of the login request
      * @param userLink service link for the user
-     * @param expirationTime expiration time for the auth token
+     * @param expirationTimeMicros expiration time for the auth token
      * @return
      */
-    private static boolean associateAuthorizationContext(StatelessService service, Operation op, String userLink, long expirationTime) {
+    private static boolean associateAuthorizationContext(StatelessService service, Operation op, String userLink, long expirationTimeMicros) {
         Claims.Builder builder = new Claims.Builder();
         builder.setIssuer(AuthenticationConstants.DEFAULT_ISSUER);
         builder.setSubject(userLink);
-        builder.setExpirationTime(expirationTime);
+        builder.setExpirationTime(TimeUnit.MICROSECONDS.toSeconds(expirationTimeMicros));
 
         // Generate token for set of claims
         Claims claims = builder.getResult();
@@ -294,7 +295,23 @@ public final class BasicAuthenticationUtils {
             // use JWT token verifier for basic auth
             Verifier verifier = service.getTokenVerifier();
             Claims claims = verifier.verify(token, Claims.class);
-            op.setBody(claims);
+
+            if (claims != null) {
+                // In case of expired token we would just use guest context.
+                Long expirationTime = claims.getExpirationTime();
+                if (expirationTime != null
+                        && TimeUnit.SECONDS.toMicros(expirationTime)
+                        <= Utils.getSystemNowMicrosUtc()) {
+                    service.logFine("Token expired for %s", claims.getSubject());
+                    AuthorizationContext guestCtx = service
+                            .getAuthorizationContextForSubject(GuestUserService.SELF_LINK);
+                    claims = guestCtx.getClaims();
+                }
+            }
+            AuthorizationContext.Builder ab = AuthorizationContext.Builder.create();
+            ab.setClaims(claims);
+            ab.setToken(token);
+            op.setBody(ab.getResult());
             op.complete();
         } catch (TokenException | GeneralSecurityException e) {
             service.logWarning("Error verifying token: %s", e.getMessage());

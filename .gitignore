@@ -15,6 +15,7 @@ target
 tmp/
 *.git.properties
 *.espressostorage
+*~
 
 # maven-release-plugin artifacts
 /release.properties
@@ -23,6 +24,9 @@ pom.xml.releaseBackup
 # PMD maven plug in artifacts
 *.pmd
 *.pmdruleset.xml
+
+# netbeans
+nbactions.xml
 
 # vagrant
 vagrant/

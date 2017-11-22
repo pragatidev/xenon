@@ -19,11 +19,13 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import com.vmware.xenon.common.NodeSelectorService.SelectOwnerResponse;
 import com.vmware.xenon.common.Operation.CompletionHandler;
+import com.vmware.xenon.common.OperationProcessingChain.OperationProcessingContext;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyDescription;
-import com.vmware.xenon.common.UriUtils.ForwardingTarget;
+import com.vmware.xenon.common.config.XenonConfiguration;
 import com.vmware.xenon.services.common.NodeGroupBroadcastResponse;
 import com.vmware.xenon.services.common.QueryTask;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
@@ -39,6 +41,35 @@ import com.vmware.xenon.services.common.ServiceUriPaths;
  */
 public abstract class FactoryService extends StatelessService {
 
+    public static class FactoryServiceConfiguration extends ServiceConfiguration {
+        public static final String KIND = Utils.buildKind(FactoryServiceConfiguration.class);
+        public EnumSet<ServiceOption> childOptions = EnumSet.noneOf(ServiceOption.class);
+    }
+
+
+    /**
+     * Lower limit on query result limit. This is used when retrying failed synch task and backing off the query
+     * result limit gradually. After result limit has reached to this value, it will not be reduced any further.
+     */
+    private static final int MIN_SYNCH_QUERY_RESULT_LIMIT = 200;
+
+    /**
+     * Maximum synch-task retry limit.
+     * We are using exponential backoff for synchronization retry, that means last synch retry will
+     * be tried after 2 ^ 10 * getMaintenanceIntervalMicros(), which is ~17 minutes if maintenance interval is 1 second.
+     */
+    public static final int MAX_SYNCH_RETRY_COUNT = XenonConfiguration.integer(
+            FactoryService.class,
+            "MAX_SYNCH_RETRY_COUNT",
+            10
+    );
+
+    public static final Integer SELF_QUERY_RESULT_LIMIT = XenonConfiguration.integer(
+            FactoryService.class,
+            "SELF_QUERY_RESULT_LIMIT",
+            1000
+    );
+
     /**
      * Creates a factory service instance that starts the specified child service
      * on POST
@@ -50,7 +81,7 @@ public abstract class FactoryService extends StatelessService {
             Class<? extends ServiceDocument> childServiceDocumentType = s.getStateType();
             FactoryService fs = create(childServiceType, childServiceDocumentType, options);
             return fs;
-        } catch (Throwable e) {
+        } catch (Exception e) {
             Utils.logWarning("Failure creating factory for %s: %s", childServiceType,
                     Utils.toString(e));
             return null;
@@ -90,11 +121,10 @@ public abstract class FactoryService extends StatelessService {
         return create(childServiceType, childServiceDocumentType, ServiceOption.IDEMPOTENT_POST);
     }
 
-    public static final Integer SELF_QUERY_RESULT_LIMIT = Integer.getInteger(
-            Utils.PROPERTY_NAME_PREFIX
-                    + "FactoryService.SELF_QUERY_RESULT_LIMIT", 1000);
+    private boolean useBodyForSelfLink = false;
     private EnumSet<ServiceOption> childOptions;
     private String nodeSelectorLink = ServiceUriPaths.DEFAULT_NODE_SELECTOR;
+    private String documentIndexLink = ServiceUriPaths.CORE_DOCUMENT_INDEX;
     private int selfQueryResultLimit = SELF_QUERY_RESULT_LIMIT;
     private ServiceDocument childTemplate;
     private URI uri;
@@ -137,6 +167,17 @@ public abstract class FactoryService extends StatelessService {
     }
 
     /**
+     * Sets a flag that instructs the FactoryService to use the body of the
+     * POST request to determine a self-link for the child service.
+     *
+     * Note: if body is missing from the request, the factory service will fail
+     * the request with Http 400 error.
+     */
+    public void setUseBodyForSelfLink(boolean useBody) {
+        this.useBodyForSelfLink = useBody;
+    }
+
+    /**
      * Returns true if the option is supported by the child services
      * of the factory.
      */
@@ -167,12 +208,6 @@ public abstract class FactoryService extends StatelessService {
                         String.format("Child service state type %s does not match state type "
                                 + "declared in child service class (%s)", getStateType(),
                                 childStateTypeDeclaredInChild));
-            }
-
-            if (s.hasOption(ServiceOption.PERSISTENCE)) {
-                byte[] buffer = new byte[Service.MAX_SERIALIZED_SIZE_BYTES];
-                // make sure service can be serialized, so it can be paused under memory pressure
-                Utils.toBytes(s, buffer, 0);
             }
         } catch (Throwable e) {
             logSevere(e);
@@ -251,7 +286,11 @@ public abstract class FactoryService extends StatelessService {
         if (op.getAction() == Action.POST) {
             if (opProcessingStage == OperationProcessingStage.PROCESSING_FILTERS) {
                 OperationProcessingChain opProcessingChain = getOperationProcessingChain();
-                if (opProcessingChain != null && !opProcessingChain.processRequest(op)) {
+                if (opProcessingChain != null) {
+                    OperationProcessingContext context = opProcessingChain.createContext(getHost());
+                    opProcessingChain.processRequest(op, context, o -> {
+                        handleRequest(op, OperationProcessingStage.EXECUTING_SERVICE_HANDLER);
+                    });
                     return;
                 }
                 opProcessingStage = OperationProcessingStage.EXECUTING_SERVICE_HANDLER;
@@ -323,18 +362,41 @@ public abstract class FactoryService extends StatelessService {
                 // the body is already in native form (not serialized)
                 initialState = Utils.clone(initialState);
             }
-            String suffix;
-            if (initialState == null) {
-                // create a unique path that is prefixed by the URI path of the factory
-                // We do not use UUID since its not a good primary key, given our index.
-                suffix = buildDefaultChildSelfLink();
-                initialState = new ServiceDocument();
+
+            String suffix = null;
+            if (o.isSynchronizeOwner()) {
+                // If it's a synchronization request, let's re-use the documentSelfLink.
+                suffix = initialState.documentSelfLink;
+
+            } else if (this.useBodyForSelfLink) {
+                if (initialState == null) {
+                    // If the body of the request was null , fail the request with
+                    // HTTP 400 (BAD REQUEST) error.
+                    o.fail(new IllegalArgumentException("body is required"));
+                    return;
+                }
+
+                suffix = buildDefaultChildSelfLink(initialState);
             } else {
-                if (initialState.documentSelfLink == null) {
+                if (initialState == null) {
+                    // create a unique path that is prefixed by the URI path of the factory
+                    // We do not use UUID since its not a good primary key, given our index.
                     suffix = buildDefaultChildSelfLink();
+                    initialState = new ServiceDocument();
                 } else {
-                    // treat the supplied selfLink as a suffix
-                    suffix = initialState.documentSelfLink;
+                    if (initialState.documentSelfLink == null) {
+                        suffix = buildDefaultChildSelfLink();
+                    } else {
+                        // treat the supplied selfLink as a suffix
+                        suffix = initialState.documentSelfLink;
+                    }
+                }
+            }
+
+            if (!o.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_FROM_MIGRATION_TASK)) {
+                if (!UriUtils.isValidDocumentId(suffix, this.getSelfLink())) {
+                    o.fail(new IllegalArgumentException(suffix + " is an invalid id"));
+                    return;
                 }
             }
 
@@ -380,6 +442,16 @@ public abstract class FactoryService extends StatelessService {
         return getHost().nextUUID();
     }
 
+    // This method is called by the factory only when useBodyForSelfLink is set,
+    // through setUseBodyForSelfLink. It can be overridden by factory services to
+    // create a custom self-link based on the body of the POST request.
+    // Note: For negative cases, the override can throw an IllegalArgumentException
+    // to indicate a request with a bad body and will cause the factory service
+    // to return HTTP 400 (Bad-Request) error.
+    protected String buildDefaultChildSelfLink(ServiceDocument document) {
+        return buildDefaultChildSelfLink();
+    }
+
     @Override
     public void handleStop(Operation op) {
         if (!ServiceHost.isServiceStop(op)) {
@@ -413,7 +485,8 @@ public abstract class FactoryService extends StatelessService {
                 o.complete();
             });
 
-            if (o.isWithinTransaction() && this.getHost().getTransactionServiceUri() != null) {
+            if (o.isWithinTransaction() && this.getHost().getTransactionServiceUri() != null
+                    && childService.hasOption(ServiceOption.PERSISTENCE)) {
                 childService.sendRequest(TransactionServiceHelper.notifyTransactionCoordinatorOfNewServiceOp(this,
                         childService, o).setCompletion((notifyOp, notifyFailure) -> {
                             if (notifyFailure != null) {
@@ -481,7 +554,7 @@ public abstract class FactoryService extends StatelessService {
                                     .setCompletion(fc);
 
 
-                            getHost().prepareForwardRequest(forwardOp);
+                            ForwardRequestFilter.prepareForwardRequest(forwardOp);
 
                             // fix up selfLink so it does not have factory prefix
                             if (initialState.documentSelfLink.startsWith(getSelfLink())) {
@@ -504,22 +577,18 @@ public abstract class FactoryService extends StatelessService {
     private void handleGetCompletion(Operation op) {
         String query = op.getUri().getQuery();
         boolean isODataQuery = UriUtils.hasODataQueryParams(op.getUri());
-        boolean expand = UriUtils.hasODataExpandParamValue(op.getUri());
-        if (query == null || (!isODataQuery && expand)) {
+        boolean isNavigationRequest = UriUtils.hasNavigationQueryParams(op.getUri());
+
+        if (query == null || (!isODataQuery && !isNavigationRequest)) {
             completeGetWithQuery(op, this.childOptions);
+        } else if (isNavigationRequest) {
+            handleNavigationRequest(op);
         } else {
             handleGetOdataCompletion(op);
         }
     }
 
     private void handleGetOdataCompletion(Operation op) {
-        String path = UriUtils.getPathParamValue(op.getUri());
-        String peer = UriUtils.getPeerParamValue(op.getUri());
-        if (path != null && peer != null) {
-            handleNavigationRequest(op);
-            return;
-        }
-
         Set<String> expandedQueryPropertyNames = QueryTaskUtils
                 .getExpandedQueryPropertyNames(this.childTemplate.documentDescription);
 
@@ -528,6 +597,12 @@ public abstract class FactoryService extends StatelessService {
             return;
         }
         task.setDirect(true);
+        task.indexLink = this.documentIndexLink;
+
+        if (!UriUtils.hasODataExpandParamValue(op.getUri())) {
+            task.querySpec.options.remove(QueryOption.EXPAND_CONTENT);
+        }
+
 
         // restrict results to same kind and self link prefix as factory children
         String kind = Utils.buildKind(getStateType());
@@ -557,6 +632,11 @@ public abstract class FactoryService extends StatelessService {
             task.querySpec.options.add(QueryOption.INCLUDE_ALL_VERSIONS);
         }
 
+        if (this.childTemplate.documentDescription.documentIndexingOptions.contains(
+                ServiceDocumentDescription.DocumentIndexingOption.INDEX_METADATA)) {
+            task.querySpec.options.add(QueryOption.INDEXED_METADATA);
+        }
+
         if (task.querySpec.resultLimit != null) {
             handleODataLimitRequest(op, task);
             return;
@@ -565,7 +645,7 @@ public abstract class FactoryService extends StatelessService {
         sendRequest(Operation.createPost(this, ServiceUriPaths.CORE_QUERY_TASKS).setBody(task)
                 .setCompletion((o, e) -> {
                     if (e != null) {
-                        op.fail(e);
+                        failODataRequest(op, o, e);
                         return;
                     }
                     ServiceDocumentQueryResult result = o.getBody(QueryTask.class).results;
@@ -576,23 +656,33 @@ public abstract class FactoryService extends StatelessService {
                 }));
     }
 
-    private void handleNavigationRequest(Operation op) {
-        String path = UriUtils.buildUriPath(ServiceUriPaths.DEFAULT_NODE_SELECTOR,
-                ServiceUriPaths.SERVICE_URI_SUFFIX_FORWARDING);
-        String query = UriUtils.buildUriQuery(
-                UriUtils.FORWARDING_URI_PARAM_NAME_PATH, UriUtils.getPathParamValue(op.getUri()),
-                UriUtils.FORWARDING_URI_PARAM_NAME_PEER, UriUtils.getPeerParamValue(op.getUri()),
-                UriUtils.FORWARDING_URI_PARAM_NAME_TARGET, ForwardingTarget.PEER_ID.toString());
-        sendRequest(Operation.createGet(UriUtils.buildUri(this.getHost(), path, query)).setCompletion((o, e) -> {
-            if (e != null) {
-                op.fail(e);
-                return;
-            }
+    private void failODataRequest(Operation originalOp, Operation o, Throwable e) {
+        if (o.getStatusCode() != Operation.STATUS_CODE_FORBIDDEN) {
+            originalOp.setStatusCode(o.getStatusCode()).fail(e);
+            return;
+        }
+        String error = String.format(
+                "Forbidden: please specify %s URI query parameter for ODATA queries",
+                UriUtils.URI_PARAM_ODATA_TENANTLINKS);
+        e = new IllegalAccessException(error);
+        ServiceErrorResponse rsp = ServiceErrorResponse.create(e, o.getStatusCode());
+        originalOp.fail(o.getStatusCode(), e, rsp);
+    }
 
-            ServiceDocumentQueryResult result = o.getBody(QueryTask.class).results;
-            prepareNavigationResult(result);
-            op.setBodyNoCloning(result).complete();
-        }));
+    private void handleNavigationRequest(Operation op) {
+        URI queryPageUri = UriUtils.buildUri(getHost(), UriUtils.getPathParamValue(op.getUri()));
+        String peerId = UriUtils.getPeerParamValue(op.getUri());
+        sendRequest(Operation.createGet(UriUtils.buildForwardToQueryPageUri(queryPageUri, peerId))
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        failODataRequest(op, o, e);
+                        return;
+                    }
+
+                    ServiceDocumentQueryResult result = o.getBody(QueryTask.class).results;
+                    prepareNavigationResult(result);
+                    op.setBodyNoCloning(result).complete();
+                }));
     }
 
     private void handleODataLimitRequest(Operation op, QueryTask task) {
@@ -643,7 +733,7 @@ public abstract class FactoryService extends StatelessService {
         sendRequest(Operation.createPost(this, ServiceUriPaths.CORE_QUERY_TASKS).setBody(task)
                 .setCompletion((o, e) -> {
                     if (e != null) {
-                        op.fail(e);
+                        failODataRequest(op, o, e);
                         return;
                     }
 
@@ -699,6 +789,7 @@ public abstract class FactoryService extends StatelessService {
         }
 
         URI u = UriUtils.buildDocumentQueryUri(getHost(),
+                this.documentIndexLink,
                 UriUtils.buildUriPath(getSelfLink(), UriUtils.URI_WILDCARD_CHAR),
                 doExpand,
                 false,
@@ -755,10 +846,13 @@ public abstract class FactoryService extends StatelessService {
             }
         }
 
-        // apply on demand load to factory so service host can decide to start a service
-        // if it receives a request and the service is not started
-        if (childService.hasOption(ServiceOption.ON_DEMAND_LOAD)) {
-            toggleOption(ServiceOption.ON_DEMAND_LOAD, true);
+        if (childService.hasOption(ServiceOption.PERSISTENCE)) {
+            if (!ServiceUriPaths.CORE_DOCUMENT_INDEX.equals(childService
+                    .getDocumentIndexPath())) {
+                this.documentIndexLink = childService.getDocumentIndexPath();
+            } else if (!ServiceUriPaths.CORE_DOCUMENT_INDEX.equals(this.documentIndexLink)) {
+                childService.setDocumentIndexPath(this.documentIndexLink);
+            }
         }
 
         // apply custom UI option to factory if child service has it to ensure ui consistency
@@ -828,6 +922,12 @@ public abstract class FactoryService extends StatelessService {
         return r;
     }
 
+    private void logTaskFailureWarning(String fmt, Object... args) {
+        if (!getHost().isStopping()) {
+            logWarning(fmt, args);
+        }
+    }
+
     private ServiceDocument getChildTemplate(String childLink) {
         if (this.childTemplate == null) {
             try {
@@ -845,15 +945,30 @@ public abstract class FactoryService extends StatelessService {
     }
 
     @Override
-    public void handleNodeGroupMaintenance(Operation maintOp) {
-        if (hasOption(ServiceOption.ON_DEMAND_LOAD)) {
-            // on demand load child services are synchronized on first use, or when an explicit
-            // migration task runs
-            setAvailable(true);
-            maintOp.complete();
+    public void handleConfigurationRequest(Operation request) {
+        if (request.getAction() == Action.PATCH) {
+            super.handleConfigurationRequest(request);
             return;
         }
 
+        if (request.getAction() != Action.GET) {
+            request.fail(new IllegalArgumentException("Action not supported: " + request.getAction()));
+            return;
+        }
+
+        FactoryServiceConfiguration config = Utils.buildServiceConfig(new FactoryServiceConfiguration(), this);
+        config.childOptions = this.childOptions;
+        request.setBodyNoCloning(config).complete();
+    }
+
+    @Override
+    public void handleNodeGroupMaintenance(Operation maintOp) {
+        // Reset query result limit for new synchronization cycle.
+        this.selfQueryResultLimit = SELF_QUERY_RESULT_LIMIT;
+        synchronizeChildServicesIfOwner(maintOp);
+    }
+
+    void synchronizeChildServicesIfOwner(Operation maintOp) {
         // Become unavailable until synchronization is complete.
         // If we are not the owner, we stay unavailable
         setAvailable(false);
@@ -866,6 +981,7 @@ public abstract class FactoryService extends StatelessService {
             OperationContext.restoreOperationContext(opContext);
             if (e != null) {
                 logWarning("owner selection failed: %s", e.toString());
+                scheduleSynchronizationRetry(maintOp);
                 maintOp.fail(e);
                 return;
             }
@@ -890,7 +1006,7 @@ public abstract class FactoryService extends StatelessService {
     private void synchronizeChildServicesAsOwner(Operation maintOp, long membershipUpdateTimeMicros) {
         maintOp.nestCompletion((o, e) -> {
             if (e != null) {
-                logWarning("synch failed: %s", e.toString());
+                logWarning("Synchronization failed: %s", e.toString());
             }
             maintOp.complete();
         });
@@ -898,37 +1014,101 @@ public abstract class FactoryService extends StatelessService {
     }
 
     private void startFactorySynchronizationTask(Operation parentOp, Long membershipUpdateTimeMicros) {
-        if (this.childOptions.contains(ServiceOption.ON_DEMAND_LOAD)) {
-            setAvailable(true);
-            parentOp.complete();
-            return;
-        }
-
         SynchronizationTaskService.State task = createSynchronizationTaskState(
                 membershipUpdateTimeMicros);
         Operation post = Operation
                 .createPost(this, ServiceUriPaths.SYNCHRONIZATION_TASKS)
                 .setBody(task)
                 .setCompletion((o, e) -> {
-                    // Ignore if the request failed because the current synch-request
-                    // was considered out-dated by the synchronization-task.
-                    if (o.getStatusCode() == Operation.STATUS_CODE_BAD_REQUEST) {
+                    boolean retrySynch = false;
+
+                    if (o.getStatusCode() >= Operation.STATUS_CODE_FAILURE_THRESHOLD) {
                         ServiceErrorResponse rsp = o.getBody(ServiceErrorResponse.class);
-                        logInfo("Failure on POST to synch task: %s", Utils.toJsonHtml(rsp));
-                        if (rsp.getErrorCode() == ServiceErrorResponse.ERROR_CODE_OUTDATED_SYNCH_REQUEST) {
+                        logTaskFailureWarning("HTTP error on POST to synch task: %s", Utils.toJsonHtml(rsp));
+
+                        // Ignore if the request failed because the current synch-request
+                        // was considered out-dated by the synchronization-task.
+                        if (o.getStatusCode() == Operation.STATUS_CODE_BAD_REQUEST &&
+                                rsp.getErrorCode() == ServiceErrorResponse.ERROR_CODE_OUTDATED_SYNCH_REQUEST) {
                             parentOp.complete();
                             return;
                         }
+
+                        retrySynch = true;
                     }
+
                     if (e != null) {
-                        logInfo("Failure on POST to synch task: %s", e.getMessage());
+                        logTaskFailureWarning("Failure on POST to synch task: %s", e.getMessage());
                         parentOp.fail(e);
+                        retrySynch = true;
+                    } else {
+                        SynchronizationTaskService.State rsp = null;
+                        rsp = o.getBody(SynchronizationTaskService.State.class);
+                        if (rsp.taskInfo.stage.equals(TaskState.TaskStage.FAILED)) {
+                            logTaskFailureWarning("Synch task failed %s", Utils.toJsonHtml(rsp));
+                            retrySynch = true;
+                        }
+                        parentOp.complete();
+                    }
+
+                    if (retrySynch) {
+                        scheduleSynchronizationRetry(parentOp);
                         return;
                     }
 
-                    parentOp.complete();
+                    setStat(STAT_NAME_SYNCH_TASK_RETRY_COUNT, 0);
                 });
         sendRequest(post);
+    }
+
+    private void scheduleSynchronizationRetry(Operation parentOp) {
+        if (getHost().isStopping()) {
+            return;
+        }
+
+        adjustStat(STAT_NAME_SYNCH_TASK_RETRY_COUNT, 1);
+
+        ServiceStats.ServiceStat stat = getStat(STAT_NAME_SYNCH_TASK_RETRY_COUNT);
+        if (stat != null && stat.latestValue  > 0) {
+            if (stat.latestValue > MAX_SYNCH_RETRY_COUNT) {
+                logSevere("Synchronization task failed after %d tries", (long)stat.latestValue - 1);
+                adjustStat(STAT_NAME_CHILD_SYNCH_FAILURE_COUNT, 1);
+                return;
+            }
+        }
+
+        this.selfQueryResultLimit = Math.max(this.selfQueryResultLimit / 2, MIN_SYNCH_QUERY_RESULT_LIMIT);
+
+        // Clone the parent operation for reuse outside the schedule call for
+        // the original operation to be freed in current thread.
+        Operation op = parentOp.clone();
+
+        // Use exponential backoff algorithm in retry logic. The idea is to exponentially
+        // increase the delay for each retry based on the number of previous retries.
+        // This is done to reduce the load of retries on the system by all the synch tasks
+        // of all factories at the same time, and giving system more time to stabilize
+        // in next retry then the previous retry.
+        long delay = getExponentialDelay();
+
+        logWarning("Scheduling retry of child service synchronization task in %d seconds",
+                TimeUnit.MICROSECONDS.toSeconds(delay));
+        getHost().scheduleCore(() -> synchronizeChildServicesIfOwner(op),
+                delay, TimeUnit.MICROSECONDS);
+    }
+
+    /**
+     * Exponential backoff rely on synch task retry count stat. If this stat is not available
+     * then we will fall back to constant delay for each retry.
+     * To get exponential delay, multiply retry count's power of 2 with constant delay.
+     */
+    private long getExponentialDelay() {
+        long delay = getHost().getMaintenanceIntervalMicros();
+        ServiceStats.ServiceStat stat = getStat(STAT_NAME_SYNCH_TASK_RETRY_COUNT);
+        if (stat != null && stat.latestValue > 0) {
+            return (1 << ((long)stat.latestValue)) * delay;
+        }
+
+        return delay;
     }
 
     private SynchronizationTaskService.State createSynchronizationTaskState(
@@ -939,7 +1119,7 @@ public abstract class FactoryService extends StatelessService {
         task.factoryStateKind = Utils.buildKind(this.getStateType());
         task.membershipUpdateTimeMicros = membershipUpdateTimeMicros;
         task.nodeSelectorLink = this.nodeSelectorLink;
-        task.queryResultLimit = SELF_QUERY_RESULT_LIMIT;
+        task.queryResultLimit = this.selfQueryResultLimit;
         task.taskInfo = TaskState.create();
         task.taskInfo.isDirect = true;
         return task;
@@ -968,13 +1148,16 @@ public abstract class FactoryService extends StatelessService {
                         NodeSelectorService.SelectOwnerResponse rsp = null;
                         try {
                             rsp = Utils.fromJson(r.getValue(), NodeSelectorService.SelectOwnerResponse.class);
-                        } catch (Throwable e) {
+                        } catch (Exception e) {
                             logWarning("Exception thrown in de-serializing json response. %s", e.toString());
 
                             // Ignore if the remote node returned a bad response. Most likely this is because
                             // the remote node is offline and if so, ownership check for the remote node is
                             // irrelevant.
                             continue;
+                        }
+                        if (rsp == null || rsp.ownerNodeId == null) {
+                            logWarning("%s responded with '%s'", r.getKey(), r.getValue());
                         }
                         if (!rsp.ownerNodeId.equals(this.getHost().getId())) {
                             logWarning("SelectOwner response from %s does not indicate that " +

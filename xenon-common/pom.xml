@@ -5,18 +5,95 @@
   <parent>
     <groupId>com.vmware.xenon</groupId>
     <artifactId>xenon-parent</artifactId>
-    <version>1.3.6-SNAPSHOT</version>
+    <version>1.6.2-SNAPSHOT</version>
   </parent>
 
   <artifactId>xenon-common</artifactId>
 
   <properties>
-    <gson.version>2.3.1</gson.version>
+    <gson.version>2.8.0</gson.version>
     <kryo.version>3.0.2</kryo.version>
-    <lucene.version>6.0.0</lucene.version>
-    <netty.version>4.1.6.Final</netty.version>
-    <tcnative.version>1.1.33.Fork23</tcnative.version>
+    <lucene.version>6.5.0</lucene.version>
+    <netty.version>4.1.15.Final</netty.version>
+    <tcnative.version>2.0.6.Final</tcnative.version>
+    <opentracing.version>0.30.0</opentracing.version>
+    <brave.version>4.8.0</brave.version>
+    <brave_opentracing.version>0.22.1</brave_opentracing.version>
+    <iozipkin.version>2.0.2</iozipkin.version>
+    <jaeger.version>0.21.0</jaeger.version>
+    <findbugs.version>3.0.1</findbugs.version>
+    <jmh.version>1.19</jmh.version>
+    <assertj.version>3.8.0</assertj.version>
+    <docker.java.version>3.0.14</docker.java.version>
   </properties>
+
+  <profiles>
+    <profile>
+      <id>ci</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
+      <properties>
+        <xenon.ci>true</xenon.ci>
+      </properties>
+    </profile>
+    <profile>
+      <id>jmh</id>
+      <properties>
+        <jmh.uberjar>xenon-benchmarks</jmh.uberjar>
+        <skipTests>true</skipTests>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.0.0</version>
+            <executions>
+              <execution>
+                <id>add-test-source</id>
+                <phase>generate-test-sources</phase>
+                <goals>
+                  <goal>add-test-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>src/test/benchmarks</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <artifactId>maven-assembly-plugin</artifactId>
+            <configuration>
+              <descriptors>
+                <descriptor>src/main/assembly/benchmarks.xml</descriptor>
+              </descriptors>
+            </configuration>
+            <executions>
+              <execution>
+                <id>make-assembly</id>
+                <phase>package</phase>
+                <goals>
+                  <goal>single</goal>
+                </goals>
+                <configuration>
+                  <finalName>${jmh.uberjar}</finalName>
+                  <appendAssemblyId>false</appendAssemblyId>
+                  <archive>
+                    <manifest>
+                      <mainClass>org.openjdk.jmh.Main</mainClass>
+                    </manifest>
+                  </archive>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 
   <dependencies>
     <dependency>
@@ -65,10 +142,93 @@
       <version>${lucene.version}</version>
     </dependency>
     <dependency>
+      <groupId>io.opentracing</groupId>
+      <artifactId>opentracing-api</artifactId>
+      <version>${opentracing.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.opentracing</groupId>
+      <artifactId>opentracing-noop</artifactId>
+      <version>${opentracing.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.opentracing.brave</groupId>
+      <artifactId>brave-opentracing</artifactId>
+      <version>${brave_opentracing.version}</version>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>io.zipkin.reporter2</groupId>
+      <artifactId>zipkin-sender-okhttp3</artifactId>
+      <version>${iozipkin.version}</version>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>io.zipkin.reporter2</groupId>
+      <artifactId>zipkin-sender-urlconnection</artifactId>
+      <version>${iozipkin.version}</version>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>com.uber.jaeger</groupId>
+      <artifactId>jaeger-core</artifactId>
+      <version>${jaeger.version}</version>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>io.opentracing</groupId>
+      <artifactId>opentracing-util</artifactId>
+      <version>${opentracing.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.openjdk.jmh</groupId>
+      <artifactId>jmh-core</artifactId>
+      <version>${jmh.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.openjdk.jmh</groupId>
+      <artifactId>jmh-generator-annprocess</artifactId>
+      <version>${jmh.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.opentracing</groupId>
+      <artifactId>opentracing-mock</artifactId>
+      <version>${opentracing.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>io.netty</groupId>
       <artifactId>netty-tcnative-boringssl-static</artifactId>
       <version>${tcnative.version}</version>
       <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.github.docker-java</groupId>
+      <artifactId>docker-java</artifactId>
+      <version>${docker.java.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <version>${assertj.version}</version>
+      <scope>test</scope>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>com.google.code.findbugs</groupId>
+      <artifactId>annotations</artifactId>
+      <version>${findbugs.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.google.code.findbugs</groupId>
+      <artifactId>jsr305</artifactId>
+      <version>${findbugs.version}</version>
+      <scope>provided</scope>
     </dependency>
   </dependencies>
   <build>
@@ -86,7 +246,7 @@
       <plugin>
         <groupId>pl.project13.maven</groupId>
         <artifactId>git-commit-id-plugin</artifactId>
-        <version>2.1.10</version>
+        <version>2.2.2</version>
         <executions>
           <execution>
             <goals>
@@ -99,6 +259,9 @@
           <generateGitPropertiesFile>true</generateGitPropertiesFile>
           <generateGitPropertiesFilename>src/main/resources/xenon.git.properties</generateGitPropertiesFilename>
           <excludeProperties>
+            <excludeProperty>git.tags*</excludeProperty>
+            <excludeProperty>git.dirty*</excludeProperty>
+            <excludeProperty>git.closest.*</excludeProperty>
             <excludeProperty>git.branch.*</excludeProperty>
             <excludeProperty>git.build.*</excludeProperty>
             <excludeProperty>git.commit.message.*</excludeProperty>

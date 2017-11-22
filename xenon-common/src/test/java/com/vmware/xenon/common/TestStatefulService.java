@@ -14,10 +14,15 @@
 package com.vmware.xenon.common;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
+import static com.vmware.xenon.common.Operation.PRAGMA_DIRECTIVE_NO_FORWARDING;
+
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.EnumSet;
 import java.util.HashSet;
@@ -30,10 +35,12 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.junit.After;
 import org.junit.Rule;
 import org.junit.Test;
 
 import com.vmware.xenon.common.DefaultHandlerTestService.DefaultHandlerState;
+import com.vmware.xenon.common.ExampleVersionRetentionService.ExampleVersionRetentionState;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.Service.ServiceOption;
@@ -41,9 +48,14 @@ import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
 import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.TestProperty;
+import com.vmware.xenon.common.test.TestRequestSender;
+import com.vmware.xenon.common.test.TestRequestSender.FailureResponse;
+import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.MinimalTestService;
+import com.vmware.xenon.services.common.QueryTask;
+import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
 import com.vmware.xenon.services.common.ServiceUriPaths;
 
 class DeleteVerificationTestService extends StatefulService {
@@ -77,16 +89,16 @@ class DeleteVerificationTestService extends StatefulService {
         s.name = getSelfLink();
         s.latestValue = 1;
         URI factoryStats = UriUtils.buildStatsUri(UriUtils.buildUri(getHost(),
-                DeleteVerificationTestFactoryService.class));
+                UriUtils.getParentPath(getSelfLink())));
         sendRequest(Operation.createPost(factoryStats).setBody(s));
         delete.complete();
     }
 }
 
-class DeleteVerificationTestFactoryService extends FactoryService {
+class DeleteVerificationTestFactory extends FactoryService {
     public static final String SELF_LINK = ServiceUriPaths.CORE + "/tests/deleteverification";
 
-    public DeleteVerificationTestFactoryService() {
+    public DeleteVerificationTestFactory() {
         super(ExampleServiceState.class);
         super.toggleOption(ServiceOption.INSTRUMENTATION, true);
     }
@@ -94,6 +106,30 @@ class DeleteVerificationTestFactoryService extends FactoryService {
     @Override
     public Service createServiceInstance() throws Throwable {
         Service s = new DeleteVerificationTestService();
+        return s;
+    }
+}
+
+
+class DeleteVerificationNonPersistedTestService extends DeleteVerificationTestService {
+
+    public DeleteVerificationNonPersistedTestService() {
+        super();
+        super.toggleOption(ServiceOption.PERSISTENCE, false);
+    }
+}
+
+class DeleteVerificationNonPersistedTestFactory extends FactoryService {
+    public static final String SELF_LINK = ServiceUriPaths.CORE + "/tests/deleteverification-nonpersisted";
+
+    public DeleteVerificationNonPersistedTestFactory() {
+        super(ExampleServiceState.class);
+        super.toggleOption(ServiceOption.INSTRUMENTATION, true);
+    }
+
+    @Override
+    public Service createServiceInstance() throws Throwable {
+        Service s = new DeleteVerificationNonPersistedTestService();
         return s;
     }
 }
@@ -122,33 +158,6 @@ class DefaultHandlerTestService extends StatefulService {
             logFine("Initial state is %s", Utils.toJsonHtml(s));
         }
         startPost.complete();
-    }
-}
-
-
-/**
- * Test service options.
- */
-class MaintenanceTestService extends StatefulService {
-    public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/tests/maintenanceService";
-    /**
-     * The state includes both a reference and a primitive type so as to test both.
-     */
-    public static class MaintenanceTestState extends ServiceDocument {
-        public String name;
-    }
-
-    public MaintenanceTestService() {
-        super(MaintenanceTestState.class);
-        toggleOption(ServiceOption.PERSISTENCE, true);
-        toggleOption(ServiceOption.REPLICATION, true);
-        toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
-        toggleOption(ServiceOption.ON_DEMAND_LOAD, true);
-    }
-
-    @Override
-    public void handlePeriodicMaintenance(Operation post) {
-        post.complete();
     }
 }
 
@@ -195,10 +204,102 @@ class IdempotentPostService extends StatefulService {
     }
 }
 
+/**
+ * Example service that is used for version retention update
+ */
+class ExampleVersionRetentionService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/tests/example";
+
+    public static class ExampleVersionRetentionState extends ServiceDocument {
+        public String name;
+    }
+
+    public ExampleVersionRetentionService() {
+        super(ExampleVersionRetentionState.class);
+        toggleOption(ServiceOption.PERSISTENCE, true);
+        toggleOption(ServiceOption.REPLICATION, true);
+        toggleOption(ServiceOption.OWNER_SELECTION, true);
+    }
+
+    @Override
+    public ServiceDocument getDocumentTemplate() {
+        ServiceDocument template = super.getDocumentTemplate();
+
+        // instruct the index to only keep the most recent 2 versions
+        template.documentDescription.versionRetentionLimit = 4;
+        template.documentDescription.versionRetentionFloor = 2;
+        return template;
+    }
+}
+
+/**
+ * Example service that is used for document indexing options.
+ */
+class ExampleDocumentIndexingOptionsService extends StatefulService {
+
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/tests/example-document-indexing-options";
+
+    public static class State extends ServiceDocument {
+        public String name;
+    }
+
+    public ExampleDocumentIndexingOptionsService() {
+        super(State.class);
+        toggleOption(ServiceOption.PERSISTENCE, true);
+        toggleOption(ServiceOption.REPLICATION, true);
+        toggleOption(ServiceOption.OWNER_SELECTION, true);
+    }
+
+    @Override
+    public ServiceDocument getDocumentTemplate() {
+        ServiceDocument template = super.getDocumentTemplate();
+
+        // enable metadata indexing
+        template.documentDescription.documentIndexingOptions =
+                EnumSet.of(ServiceDocumentDescription.DocumentIndexingOption.INDEX_METADATA);
+
+        return template;
+    }
+}
+
+class NoUpdateOnPutService extends StatefulService {
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/tests/noupdateonput";
+
+    public static class State extends ServiceDocument {
+        public String name;
+    }
+
+    public NoUpdateOnPutService() {
+        super(State.class);
+        toggleOption(ServiceOption.PERSISTENCE, true);
+        toggleOption(ServiceOption.REPLICATION, true);
+        toggleOption(ServiceOption.OWNER_SELECTION, true);
+    }
+
+    @Override
+    public void handlePut(Operation put) {
+        State newState = getBody(put);
+
+        // update linked state with requested body, so response body is the one from request
+        setState(put, newState);
+
+        // Specify this pragma NOT to update state(not increment version in server side)
+        put.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED);
+
+        put.complete();
+    }
+}
+
+
 public class TestStatefulService extends BasicReusableHostTestCase {
 
     @Rule
     public TestResults testResults = new TestResults();
+
+    @After
+    public void tearDown() {
+        this.host.tearDownInProcessPeers();
+    }
 
     @Test
     public void optionsValidation() throws Throwable {
@@ -273,7 +374,7 @@ public class TestStatefulService extends BasicReusableHostTestCase {
                 .setCompletion(
                         (o, e) -> {
                             if (e != null) {
-                                ServiceErrorResponse rsp = o.getBody(ServiceErrorResponse.class);
+                                ServiceErrorResponse rsp = o.getErrorResponseBody();
                                 if (rsp.message == null || rsp.message.isEmpty()) {
                                     this.host.failIteration(new IllegalStateException(
                                             "Missing error response"));
@@ -348,10 +449,14 @@ public class TestStatefulService extends BasicReusableHostTestCase {
         }
         this.host.testWait();
 
-        for (int i = 0; i < 5; i++) {
+        double avgThpt = 0;
+        for (int i = 0; i < this.iterationCount; i++) {
             double tput = this.host.doServiceUpdates(Action.PUT, c, props, services);
+            avgThpt += tput;
             this.testResults.getReport().all(TestResults.KEY_THROUGHPUT, tput);
         }
+        avgThpt /= this.iterationCount;
+        this.host.log("Avg throughput: %f", avgThpt);
     }
 
     @Test
@@ -431,12 +536,26 @@ public class TestStatefulService extends BasicReusableHostTestCase {
     @Test
     public void expirationInducedDeleteHandlerVerification()
             throws Throwable {
+        DeleteVerificationTestFactory f = new DeleteVerificationTestFactory();
+        DeleteVerificationTestFactory factoryService = (DeleteVerificationTestFactory) this.host
+                .startServiceAndWait(f, DeleteVerificationTestFactory.SELF_LINK, null);
+        expirationInducedDeleteHandlerVerificationDo(factoryService, DeleteVerificationTestFactory.SELF_LINK);
+    }
+
+    @Test
+    public void expirationInducedDeleteHandlerNonPersistedServiceVerification()
+            throws Throwable {
+        DeleteVerificationNonPersistedTestFactory f = new DeleteVerificationNonPersistedTestFactory();
+        DeleteVerificationNonPersistedTestFactory factoryService =
+                (DeleteVerificationNonPersistedTestFactory) this.host.startServiceAndWait(
+                        f, DeleteVerificationNonPersistedTestFactory.SELF_LINK, null);
+        expirationInducedDeleteHandlerVerificationDo(
+                factoryService, DeleteVerificationNonPersistedTestFactory.SELF_LINK);
+    }
+
+    public void expirationInducedDeleteHandlerVerificationDo(StatelessService factoryService, String factoryLink)
+            throws Throwable {
         long count = 10;
-        DeleteVerificationTestFactoryService f = new DeleteVerificationTestFactoryService();
-
-        DeleteVerificationTestFactoryService factoryService = (DeleteVerificationTestFactoryService) this.host
-                .startServiceAndWait(f, DeleteVerificationTestFactoryService.SELF_LINK, null);
-
         Map<URI, ExampleServiceState> services = this.host.doFactoryChildServiceStart(null, count,
                 ExampleServiceState.class,
                 (o) -> {
@@ -457,7 +576,7 @@ public class TestStatefulService extends BasicReusableHostTestCase {
             ServiceStats factoryStats = this.host.getServiceState(null, ServiceStats.class,
                     UriUtils.buildStatsUri(factoryService.getUri()));
             for (String statName : factoryStats.entries.keySet()) {
-                if (statName.startsWith(DeleteVerificationTestFactoryService.SELF_LINK)) {
+                if (statName.startsWith(factoryLink)) {
                     deletedServiceStats.add(statName);
                 }
             }
@@ -573,6 +692,7 @@ public class TestStatefulService extends BasicReusableHostTestCase {
     public void operationQueueLimit() throws Throwable {
         Service lifoService = new MinimalTestService();
         lifoService.toggleOption(ServiceOption.LIFO_QUEUE, true);
+        lifoService.toggleOption(ServiceOption.INSTRUMENTATION, true);
         lifoService = this.host.startServiceAndWait(lifoService, UUID.randomUUID().toString(),
                 null);
 
@@ -635,6 +755,12 @@ public class TestStatefulService extends BasicReusableHostTestCase {
             throw new IllegalStateException("not enough operations where cancelled");
         }
 
+        Map<String, ServiceStat> stats = this.host.getServiceStats(serviceUri);
+        ServiceStat limitExceededCountSt = stats
+                .get(Service.STAT_NAME_REQUEST_FAILURE_QUEUE_LIMIT_EXCEEDED_COUNT);
+        assertTrue(limitExceededCountSt != null);
+        assertTrue(limitExceededCountSt.latestValue > 1);
+
         // make sure no operations are cancelled if we are below the limit
         this.host.testStart(limit - 1);
         for (int i = 0; i < limit - 1; i++) {
@@ -642,14 +768,6 @@ public class TestStatefulService extends BasicReusableHostTestCase {
         }
         this.host.testWait();
 
-    }
-
-    @Test(expected = IllegalStateException.class)
-    public void invalidServiceOptionsValidation() throws Throwable {
-        this.host.startService(Operation.createPost(
-                UriUtils.buildFactoryUri(host, MaintenanceTestService.class)), FactoryService
-                .create(MaintenanceTestService.class, MaintenanceTestService.MaintenanceTestState.class));
-        this.host.waitForServiceAvailable(MaintenanceTestService.FACTORY_LINK);
     }
 
     @Test
@@ -726,41 +844,224 @@ public class TestStatefulService extends BasicReusableHostTestCase {
                         IdempotentPostService.State.class));
         this.host.waitForServiceAvailable(IdempotentPostService.FACTORY_LINK);
 
-        IdempotentPostService.State doc =
-                new IdempotentPostService.State();
+        IdempotentPostService.State doc = new IdempotentPostService.State();
         doc.documentSelfLink = "default";
         doc.name = "testDocument";
 
-        this.host.testStart(1);
-        this.host.send(Operation.createPost(factoryUri)
-                .setBody(doc)
-                .setCompletion(
-                        (o, e) -> {
-                            if (e != null) {
-                                this.host.failIteration(e);
-                                return;
-                            }
+        TestRequestSender sender = this.host.getTestRequestSender();
 
-                            this.host.send(Operation.createPost(factoryUri)
-                                    .setBody(doc)
-                                    .setCompletion(
-                                            (o2, e2) -> {
-                                                if (e2 != null) {
-                                                    this.host.failIteration(e2);
-                                                    return;
-                                                }
+        Operation post = Operation.createPost(factoryUri).setBody(doc);
+        IdempotentPostService.State result = sender.sendAndWait(post, IdempotentPostService.State.class);
+        assertNotNull(result);
+        assertEquals("testDocument", result.name);
+    }
 
-                                                IdempotentPostService.State doc2 = o2.getBody(
-                                                        IdempotentPostService.State.class);
-                                                try {
-                                                    assertNotNull(doc2);
-                                                    assertEquals("testDocument", doc2.name);
-                                                    this.host.completeIteration();
-                                                } catch (AssertionError e3) {
-                                                    this.host.failIteration(e3);
-                                                }
-                                            }));
-                        }));
-        this.host.testWait();
+    /**
+     * Verify when {@link Operation#PRAGMA_DIRECTIVE_NO_INDEX_UPDATE} is specified in handle method, server side
+     * skip indexing.
+     */
+    @Test
+    public void skipPersistDocument() throws Throwable {
+        this.host.startFactory(new NoUpdateOnPutService());
+        this.host.waitForServiceAvailable(NoUpdateOnPutService.FACTORY_LINK);
+
+        String servicePath = UriUtils.buildUriPath(NoUpdateOnPutService.FACTORY_LINK, "foo");
+
+        NoUpdateOnPutService.State initialBody = new NoUpdateOnPutService.State();
+        initialBody.name = "init";
+        initialBody.documentSelfLink = servicePath;
+
+        Operation initialPost = Operation.createPost(this.host, NoUpdateOnPutService.FACTORY_LINK).setBody(initialBody);
+        NoUpdateOnPutService.State postResult = this.sender.sendAndWait(initialPost, NoUpdateOnPutService.State.class);
+        long initialVersion = postResult.documentVersion;
+
+        // register subscription
+        URI subscriptionUri = UriUtils.buildSubscriptionUri(this.host, servicePath);
+        Operation createSubscriptionOp = Operation.createPost(subscriptionUri).setReferer(this.host.getPublicUri());
+        AtomicBoolean isSubscriptionCalled = new AtomicBoolean(false);
+        this.host.startSubscriptionService(createSubscriptionOp, subscriptionOp -> {
+            isSubscriptionCalled.set(true);
+            subscriptionOp.complete();
+        });
+
+        // perform PUT multiple times and verify always it keeps initial state when GET is performed
+        for (int i = 0; i < 100; i++) {
+            String newName = "modified-" + i;
+            NoUpdateOnPutService.State putBody = new NoUpdateOnPutService.State();
+            putBody.name = newName;
+
+            Operation put = Operation.createPut(this.host, servicePath).setBody(putBody);
+            Operation putResponseOp = this.sender.sendAndWait(put);
+            assertEquals(Operation.STATUS_CODE_OK, putResponseOp.getStatusCode());
+
+            assertTrue(putResponseOp.hasBody());
+            NoUpdateOnPutService.State putResponseBody = putResponseOp.getBody(NoUpdateOnPutService.State.class);
+            assertEquals("response of put should be the one specified in request", newName, putResponseBody.name);
+
+            NoUpdateOnPutService.State getBody = this.sender.sendAndWait(Operation.createGet(this.host, servicePath),
+                    NoUpdateOnPutService.State.class);
+
+            assertEquals("document should not be updated", "init", getBody.name);
+            assertEquals("document should not be updated", initialVersion, getBody.documentVersion);
+
+            assertFalse("subscription should not be called for non modification", isSubscriptionCalled.get());
+        }
+    }
+
+    @Test
+    public void patchDeleteThenPost() throws Throwable {
+        int nodeCount = 3;
+
+        this.host.setPeerSynchronizationEnabled(true);
+        this.host.setUpPeerHosts(nodeCount);
+        this.host.joinNodesAndVerifyConvergence(nodeCount, true);
+        this.host.setNodeGroupQuorum(nodeCount);
+
+        for (VerificationHost host : this.host.getInProcessHostMap().values()) {
+            host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
+        }
+
+        TestRequestSender sender = this.host.getTestRequestSender();
+
+        VerificationHost targetHost = this.host.getPeerHost();
+
+        List<Operation> posts = new ArrayList<>();
+        List<Operation> patches = new ArrayList<>();
+        List<Operation> deletes = new ArrayList<>();
+        List<Operation> newPosts = new ArrayList<>();
+        List<Operation> gets = new ArrayList<>();
+        for (int i = 0; i < this.serviceCount; i++) {
+            String name = "doc-" + i;
+            String selfLink = UriUtils.buildUriPath(ExampleService.FACTORY_LINK, name);
+
+            // POST
+            ExampleServiceState doc = new ExampleServiceState();
+            doc.name = name;
+            doc.documentSelfLink = selfLink;
+            posts.add(Operation.createPost(targetHost, ExampleService.FACTORY_LINK).setBody(doc));
+
+            // PATCH
+            doc.name += "-patch";
+            patches.add(Operation.createPatch(targetHost, selfLink)
+                    .setBody(doc));
+
+            // DELETE
+            deletes.add(Operation.createDelete(targetHost, selfLink)
+                    .addRequestHeader(Operation.REPLICATION_QUORUM_HEADER, Operation.REPLICATION_QUORUM_HEADER_VALUE_ALL)
+            );
+
+            // GETs to verify service deletion on all nodes
+            for (VerificationHost host : this.host.getInProcessHostMap().values()) {
+                gets.add(Operation.createGet(host, selfLink).addPragmaDirective(PRAGMA_DIRECTIVE_NO_FORWARDING));
+            }
+
+            // POST
+            doc = new ExampleServiceState();
+            doc.name = name + "-new-post";
+            doc.documentSelfLink = selfLink;
+            newPosts.add(Operation.createPost(targetHost, ExampleService.FACTORY_LINK)
+                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)
+                    .setBody(doc)
+            );
+        }
+
+        sender.sendAndWait(posts);
+        sender.sendAndWait(patches);
+        sender.sendAndWait(deletes);
+
+        // verify docs are deleted on all nodes
+        for (Operation get : gets) {
+            FailureResponse res = sender.sendAndWaitFailure(get);
+            assertEquals("service should be deleted. uri=" + get.getUri(), 404, res.op.getStatusCode());
+        }
+
+        sender.sendAndWait(newPosts);
+    }
+
+    @Test
+    public void testVersionRetentionConfigUpdate() throws InterruptedException {
+        // 1. Create a service instance whose retention limit is 2.
+        host.startFactory(new ExampleVersionRetentionService());
+
+        URI uri = UriUtils.buildUri(this.host, ExampleVersionRetentionService.FACTORY_LINK);
+        ExampleVersionRetentionState serviceState = new ExampleVersionRetentionState();
+        serviceState.name = "example1";
+        serviceState.documentSelfLink = "example1";
+        Operation op = Operation.createPost(uri).setBody(serviceState);
+        serviceState = this.host.getTestRequestSender().sendAndWait(op, ExampleVersionRetentionState.class);
+
+        // 2. Update the same instance multiple times.
+        updateExampleDocument(serviceState, 1, 6);
+
+        // 3. Query all the version
+        queryAllVersions(serviceState, 4, 2);
+
+        // 4. Now update the version retention using config update.
+        URI example1ConfigUri = UriUtils.extendUri(UriUtils.buildUri(this.host, serviceState
+                .documentSelfLink), "config");
+        ServiceConfigUpdateRequest configUpdateRequest = ServiceConfigUpdateRequest.create();
+        configUpdateRequest.versionRetentionLimit = 10L;
+        this.host.getTestRequestSender()
+                .sendAndWait(Operation.createPatch(example1ConfigUri).setBody(configUpdateRequest));
+
+        // 5. Assert that the version is updated
+        Operation getOp = Operation.createGet(example1ConfigUri);
+        ServiceConfiguration serviceConfiguration = this.host.getTestRequestSender().sendAndWait(getOp,
+                ServiceConfiguration.class);
+        assertEquals(10, serviceConfiguration.versionRetentionLimit);
+        assertEquals(5, serviceConfiguration.versionRetentionFloor);
+
+        // 6. Now run more updates
+        updateExampleDocument(serviceState, 6, 15);
+
+        // 7. Now verify the count.
+        queryAllVersions(serviceState, 10, 5);
+    }
+
+    private void updateExampleDocument(ExampleVersionRetentionState serviceState, int start, int end) {
+        List<URI> serviceUris = Arrays.asList(UriUtils.buildUri(this.host, serviceState
+                .documentSelfLink));
+        for (int i = start; i < end; i++) {
+            ExampleVersionRetentionState updateState = new ExampleVersionRetentionState();
+            updateState.name = serviceState.name + " " + i;
+            this.host.doServiceUpdates(serviceUris, Action.PUT, updateState);
+        }
+    }
+
+    private void queryAllVersions(ExampleVersionRetentionState serviceState, int
+            versionRetentionLimit, int versionRetentionFloor) {
+        QueryTask.Query.Builder b = QueryTask.Query.Builder.create();
+        b.addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK,
+                serviceState.documentSelfLink, QueryTask.Query.Occurance.SHOULD_OCCUR);
+
+        QueryTask.QuerySpecification q = new QueryTask.QuerySpecification();
+        q.query = b.build();
+        q.options = EnumSet.of(QueryOption.COUNT, QueryOption.INCLUDE_ALL_VERSIONS);
+
+        this.host.waitFor("Version retention failed to remove some documents", () -> {
+            QueryTask qt = QueryTask.create(q).setDirect(true);
+            this.host.createQueryTaskService(UriUtils.buildUri(this.host, ServiceUriPaths
+                    .CORE_QUERY_TASKS), qt, false, true, qt, null);
+            return qt.results.documentCount >= versionRetentionFloor && qt.results.documentCount
+                    <= versionRetentionLimit;
+        });
+    }
+
+    @Test
+    public void testDocumentIndexingOptionUpdate() throws Throwable {
+        host.startFactory(new ExampleDocumentIndexingOptionsService());
+
+        URI uri = UriUtils.buildUri(this.host, ExampleDocumentIndexingOptionsService.FACTORY_LINK);
+        ExampleDocumentIndexingOptionsService.State initialState =
+                new ExampleDocumentIndexingOptionsService.State();
+        initialState.name = "example1";
+
+        ExampleDocumentIndexingOptionsService.State serviceState =
+                this.host.getTestRequestSender().sendAndWait(
+                        Operation.createPost(uri).setBody(initialState),
+                        ExampleDocumentIndexingOptionsService.State.class);
+
+        assertEquals("example1", serviceState.name);
     }
 }
+

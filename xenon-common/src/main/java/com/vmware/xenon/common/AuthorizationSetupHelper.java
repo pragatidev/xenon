@@ -129,6 +129,7 @@ public class AuthorizationSetupHelper {
     private URI referer;
     private String userSelfLink;
     private String userGroupSelfLink;
+    private String credentialsSelfLink;
     private String resourceGroupSelfLink;
     private String roleSelfLink;
     private Query userGroupQuery;
@@ -154,6 +155,11 @@ public class AuthorizationSetupHelper {
 
     public AuthorizationSetupHelper setUserSelfLink(String userSelfLink) {
         this.userSelfLink = userSelfLink;
+        return this;
+    }
+
+    public AuthorizationSetupHelper setCredentialsSelfLink(String credentialsSelfLink) {
+        this.credentialsSelfLink = credentialsSelfLink;
         return this;
     }
 
@@ -354,9 +360,12 @@ public class AuthorizationSetupHelper {
 
         QueryTask queryTask = QueryTask.Builder.createDirectTask()
                 .setQuery(userQuery)
+                .addOption(QueryTask.QuerySpecification.QueryOption.TOP_RESULTS)
+                .setResultLimit(1)
                 .build();
 
-        URI queryTaskUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_QUERY_TASKS);
+        URI queryTaskUri = AuthUtils
+                .buildAuthProviderHostUri(this.host, ServiceUriPaths.CORE_QUERY_TASKS);
         Operation postQuery = Operation.createPost(queryTaskUri)
                 .setBody(queryTask)
                 .setReferer(this.referer)
@@ -396,7 +405,8 @@ public class AuthorizationSetupHelper {
             user.documentSelfLink = this.userSelfLink;
         }
 
-        URI userFactoryUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_USERS);
+        URI userFactoryUri = AuthUtils
+                .buildAuthProviderHostUri(this.host, ServiceUriPaths.CORE_AUTHZ_USERS);
         Operation postUser = Operation.createPost(userFactoryUri)
                 .setBody(user)
                 .setReferer(this.referer)
@@ -425,8 +435,12 @@ public class AuthorizationSetupHelper {
         AuthCredentialsServiceState auth = new AuthCredentialsServiceState();
         auth.userEmail = this.userEmail;
         auth.privateKey = this.userPassword;
+        if (this.credentialsSelfLink != null) {
+            auth.documentSelfLink = this.credentialsSelfLink;
+        }
 
-        URI credentialFactoryUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_CREDENTIALS);
+        URI credentialFactoryUri = AuthUtils
+                .buildAuthProviderHostUri(this.host, ServiceUriPaths.CORE_CREDENTIALS);
         Operation postCreds = Operation.createPost(credentialFactoryUri)
                 .setBody(auth)
                 .setReferer(this.referer)
@@ -466,8 +480,8 @@ public class AuthorizationSetupHelper {
                 .withSelfLink(this.userGroupSelfLink)
                 .build();
 
-        URI userGroupFactoryUri = UriUtils.buildUri(this.host,
-                ServiceUriPaths.CORE_AUTHZ_USER_GROUPS);
+        URI userGroupFactoryUri = AuthUtils
+                .buildAuthProviderHostUri(this.host, ServiceUriPaths.CORE_AUTHZ_USER_GROUPS);
         Operation postGroup = Operation.createPost(userGroupFactoryUri)
                 .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)
                 .setBody(group)
@@ -481,11 +495,13 @@ public class AuthorizationSetupHelper {
                         setupUser();
                         return;
                     }
+
                     UserGroupState groupResponse = op.getBody(UserGroupState.class);
                     this.userGroupSelfLink = normalizeLink(UserGroupService.FACTORY_LINK,
                             groupResponse.documentSelfLink);
                     this.currentStep = UserCreationStep.UPDATE_USERGROUP_FOR_USER;
                     setupUser();
+
                 });
         addReplicationFactor(postGroup);
         this.host.sendRequest(postGroup);
@@ -502,7 +518,8 @@ public class AuthorizationSetupHelper {
         }
         UserState userState = new UserState();
         userState.userGroupLinks = Collections.singleton(this.userGroupSelfLink);
-        Operation patchUser = Operation.createPatch(UriUtils.buildUri(this.host, this.userSelfLink))
+        Operation patchUser = Operation.createPatch(AuthUtils
+                .buildAuthProviderHostUri(this.host, this.userSelfLink))
                 .setBody(userState)
                 .setReferer(this.referer)
                 .setCompletion((op, ex) -> {
@@ -577,8 +594,8 @@ public class AuthorizationSetupHelper {
                 .withSelfLink(this.resourceGroupSelfLink)
                 .build();
 
-        URI resourceGroupFactoryUri = UriUtils.buildUri(this.host,
-                ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS);
+        URI resourceGroupFactoryUri = AuthUtils
+                .buildAuthProviderHostUri(this.host, ServiceUriPaths.CORE_AUTHZ_RESOURCE_GROUPS);
         Operation postGroup = Operation.createPost(resourceGroupFactoryUri)
                 .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)
                 .setBody(group)
@@ -592,6 +609,7 @@ public class AuthorizationSetupHelper {
                         setupUser();
                         return;
                     }
+
                     ResourceGroupState groupResponse = op.getBody(ResourceGroupState.class);
                     this.resourceGroupSelfLink = normalizeLink(ResourceGroupService.FACTORY_LINK,
                             groupResponse.documentSelfLink);
@@ -619,7 +637,8 @@ public class AuthorizationSetupHelper {
                 .withVerbs(this.verbs)
                 .build();
 
-        URI roleFactoryUri = UriUtils.buildUri(this.host, ServiceUriPaths.CORE_AUTHZ_ROLES);
+        URI roleFactoryUri = AuthUtils
+                .buildAuthProviderHostUri(this.host, ServiceUriPaths.CORE_AUTHZ_ROLES);
         Operation postRole = Operation.createPost(roleFactoryUri)
                 .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)
                 .setBody(role)
@@ -632,6 +651,7 @@ public class AuthorizationSetupHelper {
                         setupUser();
                         return;
                     }
+
                     RoleState roleResponse = op.getBody(RoleState.class);
                     this.roleSelfLink = normalizeLink(RoleService.FACTORY_LINK,
                             roleResponse.documentSelfLink);

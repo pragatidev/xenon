@@ -41,16 +41,16 @@ import com.vmware.xenon.common.ServiceStats;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.config.XenonConfiguration;
 import com.vmware.xenon.services.common.NodeGroupBroadcastResult.PeerNodeResult;
 import com.vmware.xenon.services.common.NodeGroupService.NodeGroupState;
 
 public final class NodeGroupUtils {
-    public static final String PROPERTY_NAME_OPERATION_TIMEOUT_SECONDS = Utils.PROPERTY_NAME_PREFIX
-            + "NodeGroupUtils.operationTimeoutSeconds";
-
-    private static final long OPERATION_TIMEOUT_SECONDS = Long.getLong(
-            PROPERTY_NAME_OPERATION_TIMEOUT_SECONDS,
-            TimeUnit.MICROSECONDS.toSeconds(ServiceHostState.DEFAULT_OPERATION_TIMEOUT_MICROS / 3));
+    private static final long OPERATION_TIMEOUT_SECONDS = XenonConfiguration.number(
+            NodeGroupUtils.class,
+            "operationTimeoutSeconds",
+            TimeUnit.MICROSECONDS.toSeconds(ServiceHostState.DEFAULT_OPERATION_TIMEOUT_MICROS / 3)
+    );
 
     private NodeGroupUtils() {
 
@@ -204,8 +204,9 @@ public final class NodeGroupUtils {
                         }
                         String error = op.getStatusCode() + "";
                         if (op.hasBody()) {
-                            ServiceErrorResponse rsp = op.getBody(ServiceErrorResponse.class);
-                            error = rsp.message + ":" + op.getStatusCode();
+                            ServiceErrorResponse rsp = op.getErrorResponseBody();
+                            String msg = rsp != null ? rsp.message : "";
+                            error = msg + ":" + op.getStatusCode();
                         }
                         errorRsp.append("node ")
                                 .append(op.getUri())
@@ -213,7 +214,7 @@ public final class NodeGroupUtils {
                                 .append(error)
                                 .append("\n");
                     }
-                } catch (Throwable e) {
+                } catch (Exception e) {
                 }
                 parentOp.fail(new IllegalStateException("Failures: " + errorRsp.toString()));
                 return;
@@ -381,7 +382,7 @@ public final class NodeGroupUtils {
                 }
 
                 // service is not yet available, reschedule
-                host.schedule(() -> {
+                host.scheduleCore(() -> {
                     registerForReplicatedServiceAvailability(host, op, servicePath, nodeSelectorPath);
                 }, host.getMaintenanceIntervalMicros(), TimeUnit.MICROSECONDS);
                 return;

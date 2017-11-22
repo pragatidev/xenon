@@ -68,6 +68,12 @@ public class ReplicationTestService extends StatefulService {
             return;
         }
 
+        if (!startPost.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED)) {
+            // this is a restart
+            startPost.complete();
+            return;
+        }
+
         ReplicationTestServiceState initState = startPost
                 .getBody(ReplicationTestServiceState.class);
 
@@ -131,6 +137,18 @@ public class ReplicationTestService extends StatefulService {
             get.fail(new IllegalArgumentException("invalid referer"));
             return;
         }
+
+        String acceptHeaderValue = get.getRequestHeaderAsIs(Operation.ACCEPT_HEADER);
+        if (Operation.MEDIA_TYPE_TEXT_HTML.equals(acceptHeaderValue)) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("<html>\n");
+            sb.append(Utils.toJsonHtml(getState(get)));
+            sb.append("/<html>");
+            get.setContentType(Operation.MEDIA_TYPE_TEXT_HTML)
+                    .setBodyNoCloning(sb.toString()).complete();
+            return;
+        }
+
         get.setBody(getState(get)).complete();
     }
 

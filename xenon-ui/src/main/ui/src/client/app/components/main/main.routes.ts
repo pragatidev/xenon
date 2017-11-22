@@ -1,9 +1,10 @@
 import { Route } from '@angular/router';
 
-import { AuthenticationGuard } from '../../frameworks/app/services/index';
+import { AuthenticationGuard } from '../../modules/app/services/index';
 
-import { MainComponent, DashboardGridComponent, ProcessLogComponent,
-    QueryComponent, ServiceDetailComponent, ServiceGridComponent } from './index';
+import { MainComponent, DashboardGridComponent, OperationTracingComponent,
+    ProcessLogComponent, QueryComponent, ServiceDetailComponent,
+    ServiceGridComponent } from './index';
 
 export const MainRoutes: Route[] = [
     {
@@ -28,7 +29,7 @@ export const MainRoutes: Route[] = [
                         component: ServiceDetailComponent
                     },
                     {
-                        path: 'service/:id/:instanceId',
+                        path: 'service/:id/:childId',
                         component: ServiceDetailComponent
                     },
                     {
@@ -38,6 +39,10 @@ export const MainRoutes: Route[] = [
                     {
                         path: 'query',
                         component: QueryComponent
+                    },
+                    {
+                        path: 'operation-tracing',
+                        component: OperationTracingComponent
                     },
                     {
                         path: '',

@@ -14,11 +14,20 @@
 package com.vmware.xenon.common;
 
 import java.lang.annotation.Annotation;
+import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.net.URI;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
@@ -28,16 +37,27 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
+
+import com.esotericsoftware.kryo.serializers.VersionFieldSerializer.Since;
+
+import com.google.gson.JsonParseException;
+import com.google.gson.annotations.SerializedName;
 
 import com.vmware.xenon.common.RequestRouter.Route;
 import com.vmware.xenon.common.Service.Action;
+
 import com.vmware.xenon.common.ServiceDocument.Documentation;
 import com.vmware.xenon.common.ServiceDocument.IndexingParameters;
 import com.vmware.xenon.common.ServiceDocument.PropertyOptions;
 import com.vmware.xenon.common.ServiceDocument.UsageOption;
 import com.vmware.xenon.common.ServiceDocument.UsageOptions;
+
+import com.vmware.xenon.common.serialization.ReleaseConstants;
 
 public class ServiceDocumentDescription {
 
@@ -81,6 +101,16 @@ public class ServiceDocumentDescription {
         DATE,
         URI,
         ENUM
+    }
+
+    public enum DocumentIndexingOption {
+        /**
+         * Metadata attributes, such as whether a particular document is "current" (e.g. represents
+         * the most up-to-date version of a particular service) or whether the service associated
+         * with the service has been deleted, should be tracked in the index and updated as
+         * documents are modified in order to improve query performance.
+         */
+        INDEX_METADATA,
     }
 
     public enum PropertyUsageOption {
@@ -222,6 +252,17 @@ public class ServiceDocumentDescription {
     public String userInterfaceResourcePath;
 
     /**
+     * Property to be used for describing the custom tag name (swagger) for the service
+     */
+    @Since(ReleaseConstants.RELEASE_VERSION_1_3_6)
+    public String name;
+    /**
+     * Property to be used for describing the custom tag description (swagger) for the service
+     */
+    @Since(ReleaseConstants.RELEASE_VERSION_1_3_6)
+    public String description;
+
+    /**
      * Upper bound on how many state versions to track in the index. Versions that exceed the limit will
      * be permanently deleted.
      */
@@ -238,10 +279,26 @@ public class ServiceDocumentDescription {
      */
     public int serializedStateSizeLimit = DEFAULT_SERIALIZED_STATE_LIMIT;
 
+    /** Used internally to parse example timestamps */
+    private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ISO_INSTANT
+            .withZone(ZoneId.of("UTC"));
+
+    /**
+     * Property to describe the indexing options for the document.
+     */
+    @Since(ReleaseConstants.RELEASE_VERSION_1_5_1)
+    public EnumSet<DocumentIndexingOption> documentIndexingOptions;
+
+    public ServiceDocumentDescription() {
+        this.documentIndexingOptions = EnumSet.noneOf(DocumentIndexingOption.class);
+    }
+
     /**
      * Builder is a parameterized factory for ServiceDocumentDescription instances.
      */
     public static class Builder {
+
+        private static final Logger logger = Logger.getLogger(Builder.class.getName());
 
         public static Builder create() {
             return new Builder();
@@ -252,7 +309,7 @@ public class ServiceDocumentDescription {
 
         public ServiceDocumentDescription buildDescription(
                 Class<? extends ServiceDocument> type) {
-            PropertyDescription root = buildPodoPropertyDescription(type, new HashSet<>(), 0);
+            PropertyDescription root = buildPodoPropertyDescription(type, type, new HashSet<>(), 0);
             ServiceDocumentDescription desc = new ServiceDocumentDescription();
 
             IndexingParameters indexingParameters = type.getAnnotation(IndexingParameters.class);
@@ -260,14 +317,22 @@ public class ServiceDocumentDescription {
                 desc.serializedStateSizeLimit = indexingParameters.serializedStateSize();
                 desc.versionRetentionLimit = indexingParameters.versionRetention();
                 desc.versionRetentionFloor = indexingParameters.versionRetentionFloor();
+                desc.documentIndexingOptions.addAll(Arrays.asList(indexingParameters.indexing()));
             }
 
             desc.propertyDescriptions = root.fieldDescriptions;
+            // Fill in name and description if present at the class level annotation
+            Documentation documentation = type.getAnnotation(Documentation.class);
+            if (documentation != null) {
+                desc.name = documentation.name();
+                desc.description = documentation.description();
+            }
+
             return desc;
         }
 
         public PropertyDescription buildPodoPropertyDescription(Class<?> type) {
-            return buildPodoPropertyDescription(type, new HashSet<>(), 0);
+            return buildPodoPropertyDescription(type, type, new HashSet<>(), 0);
         }
 
         public ServiceDocumentDescription buildDescription(
@@ -289,12 +354,28 @@ public class ServiceDocumentDescription {
             return desc;
         }
 
+        public ServiceDocumentDescription buildDescription(
+                ServiceHost host, Service service,
+                EnumSet<Service.ServiceOption> serviceCaps,
+                RequestRouter serviceRequestRouter) {
+            ServiceDocumentDescription desc = buildDescription(service.getStateType(), serviceCaps);
+
+            // look up a richer description from resource files if one exists
+            desc.description = ServiceDocumentDescriptionHelper
+                    .lookupDocumentationDescription(service.getClass(), desc.description);
+            if (serviceRequestRouter != null) {
+                desc.serviceRequestRoutes = serviceRequestRouter.getRoutes();
+            }
+            return desc;
+        }
+
         protected PropertyDescription buildPodoPropertyDescription(
+                Class<?> documentType,
                 Class<?> clazz,
                 Set<String> visited,
                 int depth) {
             PropertyDescription pd = new PropertyDescription();
-            pd.fieldDescriptions = new HashMap<>();
+            pd.fieldDescriptions = new TreeMap<>();
 
             // Prevent infinite recursion if we have already seen this class type
             String typeName = clazz.getTypeName();
@@ -335,7 +416,7 @@ public class ServiceDocumentDescription {
                 if (fd.usageOptions.contains(PropertyUsageOption.LINKS)) {
                     fd.indexingOptions.add(PropertyIndexingOption.EXPAND);
                 }
-                buildPropertyDescription(fd, f.getType(), f.getGenericType(), f.getAnnotations(),
+                buildPropertyDescription(documentType, fd, f.getType(), f.getGenericType(), f.getAnnotations(),
                         visited, depth);
 
                 if (ServiceDocument.isBuiltInDocumentFieldWithNullExampleValue(f.getName())) {
@@ -343,7 +424,14 @@ public class ServiceDocumentDescription {
                 }
 
                 fd.accessor = f;
-                pd.fieldDescriptions.put(f.getName(), fd);
+                String fieldName;
+                SerializedName sn = f.getAnnotation(SerializedName.class);
+                if (sn != null) {
+                    fieldName = sn.value();
+                } else {
+                    fieldName = f.getName();
+                }
+                pd.fieldDescriptions.put(fieldName, fd);
 
                 if (fd.typeName == TypeName.PODO) {
                     fd.kind = Utils.buildKind(f.getType());
@@ -355,8 +443,9 @@ public class ServiceDocumentDescription {
             return pd;
         }
 
-        @SuppressWarnings("rawtypes")
+        @SuppressWarnings({ "rawtypes", "unchecked" })
         protected void buildPropertyDescription(
+                Class<?> documentType,
                 PropertyDescription pd,
                 Class<?> clazz,
                 Type typ,
@@ -399,14 +488,27 @@ public class ServiceDocumentDescription {
             } else if (String.class.equals(clazz)) {
                 pd.typeName = TypeName.STRING;
                 pd.exampleValue = "example string";
-            } else if (Date.class.equals(clazz)) {
+            } else if (UUID.class.equals(clazz)) {
+                pd.typeName = TypeName.STRING;
+                pd.exampleValue = UUID.randomUUID();
+            } else if (Date.class.equals(clazz) ) {
                 pd.exampleValue = new Date();
+                pd.typeName = TypeName.DATE;
+            } else if (Instant.class.isAssignableFrom(clazz)) {
+                pd.exampleValue = Instant.now();
+                pd.typeName = TypeName.DATE;
+            } else if (ZonedDateTime.class.isAssignableFrom(clazz)) {
+                pd.exampleValue = ZonedDateTime.now();
+                pd.typeName = TypeName.DATE;
+            } else if (LocalDateTime.class.isAssignableFrom(clazz)) {
+                pd.exampleValue = LocalDateTime.now();
                 pd.typeName = TypeName.DATE;
             } else if (URI.class.equals(clazz)) {
                 pd.exampleValue = URI.create("http://localhost:1234/some/service");
                 pd.typeName = TypeName.URI;
             } else {
                 isSimpleType = false;
+                pd.typeName = null;
             }
 
             // allow annotations to modify certain attributes
@@ -416,10 +518,55 @@ public class ServiceDocumentDescription {
                     if (Documentation.class.equals(a.annotationType())) {
                         Documentation df = (Documentation) a;
                         if (df.description() != null && !df.description().isEmpty()) {
-                            pd.propertyDocumentation = df.description();
+                            pd.propertyDocumentation = ServiceDocumentDescriptionHelper
+                                    .lookupDocumentationDescription(documentType, df.description());
                         }
-                        if (df.exampleString() != null && !df.exampleString().isEmpty()) {
-                            pd.exampleValue = df.exampleString();
+                        final String example = df.exampleString();
+                        if (example == null) {
+                            // user explicitly set null value (default is empty string) so set null
+                            pd.exampleValue = null;
+                        } else if (!example.isEmpty()) {
+                            // we can try and coerse the string into the appropriate type
+                            try {
+                                if (!isSimpleType) {
+                                    // try to JSON deserialize the string to the type
+                                    pd.exampleValue = Utils.fromJson(example, clazz);
+                                } else if (pd.typeName != null) {
+                                    switch (pd.typeName) {
+                                    case STRING:
+                                        pd.exampleValue = example;
+                                        break;
+                                    case BOOLEAN:
+                                        pd.exampleValue = Boolean.parseBoolean(example);
+                                        break;
+                                    case DATE:
+                                        pd.exampleValue = Date.from(
+                                                ZonedDateTime.parse(example, DATE_FORMAT)
+                                                        .toInstant());
+                                        break;
+                                    case DOUBLE:
+                                        pd.exampleValue = Double.parseDouble(example);
+                                        break;
+                                    case LONG:
+                                        pd.exampleValue = Long.parseLong(example);
+                                        break;
+                                    case URI:
+                                        pd.exampleValue = URI.create(example);
+                                        break;
+                                    default:
+                                        pd.exampleValue = null;
+                                        break;
+                                    }
+                                }
+                            } catch (IllegalArgumentException
+                                    | DateTimeParseException
+                                    | JsonParseException e) {
+                                // cannot parse example - leave with default
+                                if (logger.isLoggable(Level.FINE)) {
+                                    logger.log(Level.FINE,
+                                            "Invalid example for type " + clazz + ": " + example, e);
+                                }
+                            }
                         }
                     } else if (UsageOptions.class.equals(a.annotationType())) {
                         UsageOptions usageOptions = (UsageOptions) a;
@@ -462,7 +609,7 @@ public class ServiceDocumentDescription {
                     // An example where this is the case is {@link java.util.Properties}.
                     if (!(typ instanceof ParameterizedType)) {
                         PropertyDescription fd = new PropertyDescription();
-                        buildPropertyDescription(fd, String.class, String.class, null, visited,
+                        buildPropertyDescription(documentType, fd, String.class, String.class, null, visited,
                                 depth + 1);
                         pd.elementDescription = fd;
                         return;
@@ -482,9 +629,24 @@ public class ServiceDocumentDescription {
 
                     // Recurse into self
                     PropertyDescription fd = new PropertyDescription();
-                    buildPropertyDescription(fd, componentClass, componentType, null, visited,
+                    buildPropertyDescription(documentType, fd, componentClass, componentType, null, visited,
                             depth + 1);
                     pd.elementDescription = fd;
+                    if (pd.exampleValue == null) {
+                        try {
+                            Map<Object,Object> example;
+                            if (!Modifier.isAbstract(clazz.getModifiers())) {
+                                example = (Map<Object,Object>)clazz.getConstructor((Class[])null).newInstance((Object[])null);
+                            } else {
+                                // parent is abstract Map, probably Map or SortedMap
+                                example = new TreeMap<>();
+                            }
+                            example.put("example", refitValue(componentClass, fd.exampleValue));
+                            pd.exampleValue = example;
+                        } catch (Exception ex) {
+                            logger.log(Level.FINE, "Cannot initialize example for " + pd.kind + ": " + ex.getMessage(), ex);
+                        }
+                    }
                 } else if (Enum.class.isAssignableFrom(clazz)) {
                     pd.typeName = TypeName.ENUM;
                     Object[] enumConstants = clazz.getEnumConstants();
@@ -504,9 +666,18 @@ public class ServiceDocumentDescription {
 
                     // Recurse into self
                     PropertyDescription fd = new PropertyDescription();
-                    buildPropertyDescription(fd, componentClass, componentType, null, visited,
+                    buildPropertyDescription(documentType, fd, componentClass, componentType, null, visited,
                             depth + 1);
                     pd.elementDescription = fd;
+                    if (pd.exampleValue == null) {
+                        try {
+                            Object example = Array.newInstance(componentClass, 1);
+                            Array.set(example, 0, refitValue(componentClass, fd.exampleValue));
+                            pd.exampleValue = example;
+                        } catch (Exception ex) {
+                            logger.log(Level.FINE, "Cannot initialize example for " + pd.kind + ": " + ex.getMessage(), ex);
+                        }
+                    }
                 } else if (Collection.class.isAssignableFrom(clazz)) {
                     pd.typeName = TypeName.COLLECTION;
                     if (depth > 0) {
@@ -529,9 +700,29 @@ public class ServiceDocumentDescription {
 
                     // Recurse into self
                     PropertyDescription fd = new PropertyDescription();
-                    buildPropertyDescription(fd, componentClass, componentType, null, visited,
+                    buildPropertyDescription(documentType, fd, componentClass, componentType, null, visited,
                             depth + 1);
                     pd.elementDescription = fd;
+
+                    // if example not defined, try creating one
+                    if (pd.exampleValue == null && !(EnumSet.class.isAssignableFrom(clazz))) {
+                        try {
+                            Collection<Object> example;
+                            if (!Modifier.isAbstract(clazz.getModifiers())) {
+                                example = (Collection<Object>)clazz.getConstructor((Class[])null).newInstance((Object[])null);
+                            } else if (List.class.isAssignableFrom(clazz)) {
+                                example = new ArrayList<>(1);
+                            } else if (Set.class.isAssignableFrom(clazz)) {
+                                example = new HashSet<>();
+                            } else {
+                                throw new RuntimeException("Unexpected type in example: " + clazz);
+                            }
+                            example.add(refitValue(componentClass, fd.exampleValue));
+                            pd.exampleValue = example;
+                        } catch (Exception ex) {
+                            logger.log(Level.FINE, "Cannot initialize example for " + pd.kind + ": " + ex.getMessage(), ex);
+                        }
+                    }
                 } else {
                     pd.typeName = TypeName.PODO;
                     pd.kind = Utils.buildKind(clazz);
@@ -541,11 +732,62 @@ public class ServiceDocumentDescription {
                         pd.indexingOptions.add(PropertyIndexingOption.EXPAND);
                     }
 
-                    // Recurse into object
-                    PropertyDescription podo = buildPodoPropertyDescription(clazz, visited,
+                    // Recurse into PODO object
+                    PropertyDescription podo = buildPodoPropertyDescription(documentType, clazz, visited,
                             depth + 1);
                     pd.fieldDescriptions = podo.fieldDescriptions;
+                    // populate an example if we can
+                    if (pd.exampleValue == null && podo.fieldDescriptions != null) {
+                        try {
+                            Constructor cons = clazz.getConstructor((Class[])null);
+                            Object example = cons.newInstance((Object[]) null);
+                            // create map of json field name to Field object, dealing with
+                            Map<String, Field> fieldMap = new HashMap<>();
+                            for (Field f : clazz.getFields()) {
+                                String fieldName;
+                                SerializedName sn = f.getAnnotation(SerializedName.class);
+                                if (sn != null) {
+                                    fieldName = sn.value();
+                                } else {
+                                    fieldName = f.getName();
+                                }
+                                fieldMap.put(fieldName, f);
+                            }
+                            podo.fieldDescriptions.entrySet().stream().forEach((entry) -> {
+                                try {
+                                    Field f = fieldMap.get(entry.getKey());
+                                    f.set(example, refitValue(f.getType(), entry.getValue().exampleValue));
+                                } catch (Exception ex) {
+                                    logger.log(Level.FINE, "Cannot initialize example field " + entry.getKey()
+                                            + " for " + pd.kind + ": " + ex.getMessage());
+                                }
+                            });
+
+                            pd.exampleValue = example;
+                        } catch (Exception ex) {
+                            logger.log(Level.FINE, "Cannot initialize example for " + pd.kind + ": " + ex.getMessage());
+                        }
+                    }
                 }
+            }
+        }
+
+        private Object refitValue(Class<?> clazz, Object value) {
+            if (value == null || !Long.class.isAssignableFrom(value.getClass())) {
+                return value;
+            }
+            // We may need to cast the 'Long' value into an Integer or Short or Byte
+            Long longVal = (Long) value;
+            if (Long.class.equals(clazz) || long.class.equals(clazz)) {
+                return longVal;
+            } else if (Integer.class.equals(clazz) || int.class.equals(clazz)) {
+                return longVal.intValue();
+            } else if (Short.class.equals(clazz) || short.class.equals(clazz)) {
+                return longVal.shortValue();
+            } else if (Byte.class.equals(clazz) || byte.class.equals(clazz)) {
+                return longVal.byteValue();
+            } else {
+                throw new IllegalArgumentException("Unexpected value " + value + "of type " + value.getClass() + " for type: " + clazz);
             }
         }
     }

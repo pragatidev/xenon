@@ -95,6 +95,7 @@ class AsyncLogFileReader {
             this.buffer.limit(this.buffer.capacity());
             if (this.remaining != null) {
                 this.buffer.put(this.remaining);
+                this.remaining = null;
             }
 
             this.bufferPosition = this.buffer.capacity() - 1;
@@ -109,7 +110,7 @@ class AsyncLogFileReader {
             }
 
             read(op, CHUNK_SIZE);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             fail(e, op);
         }
     }
@@ -135,7 +136,7 @@ class AsyncLogFileReader {
                                 fail(exc, op);
                             }
                         });
-            } catch (Throwable e) {
+            } catch (Exception e) {
                 fail(e, op);
             }
         } else {

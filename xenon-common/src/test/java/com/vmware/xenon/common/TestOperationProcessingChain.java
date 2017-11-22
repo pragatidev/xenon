@@ -17,12 +17,14 @@ import static org.junit.Assert.assertEquals;
 
 import java.net.URI;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Predicate;
 import java.util.logging.Level;
 
 import org.junit.Before;
 import org.junit.Test;
 
+import com.vmware.xenon.common.OperationProcessingChain.Filter;
+import com.vmware.xenon.common.OperationProcessingChain.FilterReturnCode;
+import com.vmware.xenon.common.OperationProcessingChain.OperationProcessingContext;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.Service.OperationProcessingStage;
 import com.vmware.xenon.common.TestOperationProcessingChain.CounterService.CounterServiceRequest;
@@ -34,27 +36,28 @@ public class TestOperationProcessingChain extends BasicTestCase {
 
     static final int COUNT = 10;
 
-    public static class OperationLogger implements Predicate<Operation> {
+    public static class OperationLogger implements Filter {
         @Override
-        public boolean test(Operation op) {
-            Utils.log(getClass(), getClass().getName(), Level.INFO, "Operation: %s", op);
-            return true;
+        public FilterReturnCode processRequest(Operation op, OperationProcessingContext context) {
+            Utils.log(context.getService().getClass(), context.getService().getClass().getName(),
+                    Level.INFO, "Operation: %s", op);
+            return FilterReturnCode.CONTINUE_PROCESSING;
         }
     }
 
-    public static class OperationPatchDropper implements Predicate<Operation> {
+    public static class OperationPatchDropper implements Filter {
         @Override
-        public boolean test(Operation op) {
+        public FilterReturnCode processRequest(Operation op, OperationProcessingContext context) {
             if (Action.PATCH == op.getAction()) {
                 op.fail(new IllegalArgumentException());
-                return false;
+                return FilterReturnCode.FAILED_STOP_PROCESSING;
             }
 
-            return true;
+            return FilterReturnCode.CONTINUE_PROCESSING;
         }
     }
 
-    public static class OperationNextFiltersBypasser implements Predicate<Operation> {
+    public static class OperationNextFiltersBypasser implements Filter {
         private Service service;
 
         public OperationNextFiltersBypasser(Service service) {
@@ -62,13 +65,15 @@ public class TestOperationProcessingChain extends BasicTestCase {
         }
 
         @Override
-        public boolean test(Operation op) {
-            this.service.getHost().run(() -> {
-                this.service.handleRequest(op,
-                        OperationProcessingStage.EXECUTING_SERVICE_HANDLER);
+        public FilterReturnCode processRequest(Operation op, OperationProcessingContext context) {
+            context.setSuspendConsumer(o -> {
+                this.service.getHost().run(() -> {
+                    this.service.handleRequest(op,
+                            OperationProcessingStage.EXECUTING_SERVICE_HANDLER);
 
+                });
             });
-            return false;
+            return FilterReturnCode.SUSPEND_PROCESSING;
         }
     }
 
@@ -130,9 +135,8 @@ public class TestOperationProcessingChain extends BasicTestCase {
     @Test
     public void testCounterServiceWithOperationFilters() throws Throwable {
         Service counterService = createCounterService();
-        OperationProcessingChain opProcessingChain = new OperationProcessingChain(counterService);
-
-        opProcessingChain.add(new OperationLogger());
+        OperationProcessingChain opProcessingChain = OperationProcessingChain.create(
+                new OperationLogger());
         counterService.setOperationProcessingChain(opProcessingChain);
         for (int i = 0; i < COUNT; i++) {
             incrementCounter(false);
@@ -141,7 +145,10 @@ public class TestOperationProcessingChain extends BasicTestCase {
         assertEquals(COUNT, counter);
 
         this.host.setOperationTimeOutMicros(TimeUnit.MILLISECONDS.toMicros(250));
-        opProcessingChain.add(new OperationPatchDropper());
+        opProcessingChain = OperationProcessingChain.create(
+                new OperationLogger(),
+                new OperationPatchDropper());
+        counterService.setOperationProcessingChain(opProcessingChain);
         incrementCounter(true);
 
         counter = getCounter();
@@ -151,10 +158,10 @@ public class TestOperationProcessingChain extends BasicTestCase {
     @Test
     public void testCounterServiceJumpOperationProcessingStage() throws Throwable {
         Service counterService = createCounterService();
-        OperationProcessingChain opProcessingChain = new OperationProcessingChain(counterService);
-        opProcessingChain.add(new OperationLogger());
-        opProcessingChain.add(new OperationNextFiltersBypasser(counterService));
-        opProcessingChain.add(new OperationPatchDropper());
+        OperationProcessingChain opProcessingChain = OperationProcessingChain.create(
+                new OperationLogger(),
+                new OperationNextFiltersBypasser(counterService),
+                new OperationPatchDropper());
         counterService.setOperationProcessingChain(opProcessingChain);
 
         for (int i = 0; i < COUNT; i++) {
@@ -202,7 +209,7 @@ public class TestOperationProcessingChain extends BasicTestCase {
                     }
 
                     if (expectFailure) {
-                        this.host.failIteration(e);
+                        this.host.failIteration(new IllegalStateException("expected failure"));
                     } else {
                         this.host.completeIteration();
                     }

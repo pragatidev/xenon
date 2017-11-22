@@ -31,6 +31,51 @@ import com.vmware.xenon.services.common.ServiceUriPaths;
 public class TestUriUtils {
 
     @Test
+    public void validDocumentId() throws Throwable {
+        assertTrue(UriUtils.isValidDocumentId(UriUtils.URI_LEGAL_CHARS, "/foo"));
+        assertTrue(isValidUri(UriUtils.URI_LEGAL_CHARS));
+
+        String testId = "/t/e/s/t";
+        assertFalse(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = "/foo/t/e/s/t";
+        assertFalse(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = "/foo/test";
+        assertTrue(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = "/test";
+        assertTrue(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = "{{test}}";
+        assertEquals(UriUtils.isValidDocumentId(testId, "/foo"),
+                isValidUri(testId));
+        assertFalse(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = "test:123123";
+        assertEquals(UriUtils.isValidDocumentId(testId, "/foo"),
+                isValidUri(testId));
+        testId = "123:123123";
+        assertTrue(UriUtils.isValidDocumentId(testId, "/foo"));
+
+        testId = UriUtils.URI_LEGAL_CHARS;
+        assertEquals(UriUtils.isValidDocumentId(testId, "/foo"),
+                isValidUri(testId));
+
+        testId = "/foo/";
+        assertFalse(UriUtils.isValidDocumentId(testId, "/foo"));
+    }
+
+    private boolean isValidUri(String uri) {
+        try {
+            new URI(uri);
+        } catch (URISyntaxException e) {
+            return false;
+        }
+        return true;
+    }
+
+    @Test
     public void normalizePath() throws Throwable {
         String nr = UriUtils.normalizeUriPath("/foo/");
         assertEquals("/foo", nr);
@@ -349,5 +394,31 @@ public class TestUriUtils {
         assertTrue(queryParams.get("d").equals(""));
         assertTrue(queryParams.get("e").equals("f=g"));
         assertTrue(queryParams.get("h").equals(""));
+    }
+
+    @Test
+    public void buildDocumentQueryUri() throws Throwable {
+        ServiceHost host = ServiceHost.create();
+        URI uri = UriUtils.buildDocumentQueryUri(host, "/my-index-service", "my-service", false, false, EnumSet.of(ServiceOption.NONE));
+        assertEquals("/my-index-service", uri.getPath());
+    }
+
+    @Test
+    public void testHasQueryParams() {
+        URI navigationUri = UriUtils.buildUri("http://example.com:8000/?path=abc&peer=pqr");
+        URI randomUri = UriUtils.buildUri("http://example.com:8000/?a=c&x=y");
+
+        assertTrue(UriUtils.hasNavigationQueryParams(navigationUri));
+        assertFalse(UriUtils.hasNavigationQueryParams(randomUri));
+
+        URI odataQueryUri = UriUtils.buildUri("http://example.com:8000/?$filter=abc&$count=true");
+        assertTrue(UriUtils.hasODataQueryParams(odataQueryUri));
+
+        URI fakeOdataQueryUri = UriUtils.buildUri("http://example.com:8000/?$filtered=abc&$counter=true&$expanding");
+
+        assertFalse(UriUtils.hasODataQueryParams(fakeOdataQueryUri));
+        assertFalse(UriUtils.hasODataQueryParams(randomUri));
+
+
     }
 }

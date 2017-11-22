@@ -42,8 +42,16 @@ import com.esotericsoftware.kryo.serializers.VersionFieldSerializer;
 import org.objenesis.strategy.StdInstantiatorStrategy;
 
 import com.vmware.xenon.common.ServiceDocument;
+import com.vmware.xenon.common.config.XenonConfiguration;
 
 public final class KryoSerializers {
+    private static boolean KRYO_HANDLE_BUILTIN_COLLECTIONS = XenonConfiguration.bool(
+            "kryo",
+            "handleBuiltInCollections",
+            true
+    );
+
+
     /**
      * Binary serialization thread local instances that track object references
      */
@@ -92,7 +100,10 @@ public final class KryoSerializers {
         k.addDefaultSerializer(URI.class, URISerializer.INSTANCE);
 
         k.addDefaultSerializer(ByteBuffer.class, ByteBufferSerializer.INSTANCE);
-        configureJdkCollections(k);
+
+        if (KRYO_HANDLE_BUILTIN_COLLECTIONS) {
+            configureJdkCollections(k);
+        }
 
         if (!isObjectSerializer) {
             // For performance reasons, and to avoid memory use, assume documents do not
@@ -305,4 +316,12 @@ public final class KryoSerializers {
         return k.readClassAndObject(in);
     }
 
+    /**
+     * Deserializes ByteBuffer into a native ServiceDocument derived type, using the document
+     * serializer.
+     * @see #deserializeDocument(byte[], int, int)
+     */
+    public static Object deserializeDocument(ByteBuffer bb) {
+        return deserializeDocument(bb.array(), bb.position(), bb.limit());
+    }
 }

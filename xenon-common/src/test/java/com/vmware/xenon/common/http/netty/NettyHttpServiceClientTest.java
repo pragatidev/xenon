@@ -19,6 +19,7 @@ import static org.junit.Assert.assertTrue;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
@@ -113,33 +114,17 @@ public class NettyHttpServiceClientTest {
         HOST.setMaintenanceIntervalMicros(
                 TimeUnit.MILLISECONDS.toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
 
-        ServiceClient client = NettyHttpServiceClient.create(
-                NettyHttpServiceClientTest.class.getSimpleName(),
-                Executors.newFixedThreadPool(4),
-                Executors.newScheduledThreadPool(1), HOST);
-
-        if (NettyChannelContext.isALPNEnabled()) {
-            SslContext http2ClientContext = SslContextBuilder.forClient()
-                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                    .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
-                    .applicationProtocolConfig(new ApplicationProtocolConfig(
-                            ApplicationProtocolConfig.Protocol.ALPN,
-                            ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
-                            ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
-                            ApplicationProtocolNames.HTTP_2))
-                    .build();
-            ((NettyHttpServiceClient) client).setHttp2SslContext(http2ClientContext);
-        }
-
-        SSLContext clientContext = SSLContext.getInstance(ServiceClient.TLS_PROTOCOL_NAME);
-        clientContext.init(null, InsecureTrustManagerFactory.INSTANCE.getTrustManagers(), null);
-        client.setSSLContext(clientContext);
+        ServiceClient client = createNettyServiceClient();
         HOST.setClient(client);
 
         SelfSignedCertificate ssc = new SelfSignedCertificate();
         HOST.setCertificateFileReference(ssc.certificate().toURI());
         HOST.setPrivateKeyFileReference(ssc.privateKey().toURI());
         HOST.setSecurePort(0);
+
+        if (HOST.isStressTest()) {
+            client.setPendingRequestQueueLimit(1000000);
+        }
 
         try {
             HOST.start();
@@ -163,7 +148,31 @@ public class NettyHttpServiceClientTest {
             HOST.testWait();
             HOST.resetAuthorizationContext();
         }
+    }
 
+    private static ServiceClient createNettyServiceClient() throws Throwable {
+        ServiceClient client = NettyHttpServiceClient.create(
+                NettyHttpServiceClientTest.class.getSimpleName(),
+                Executors.newFixedThreadPool(4),
+                Executors.newScheduledThreadPool(1), HOST);
+
+        if (NettyChannelContext.isALPNEnabled()) {
+            SslContext http2ClientContext = SslContextBuilder.forClient()
+                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                    .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
+                    .applicationProtocolConfig(new ApplicationProtocolConfig(
+                            ApplicationProtocolConfig.Protocol.ALPN,
+                            ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                            ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                            ApplicationProtocolNames.HTTP_2))
+                    .build();
+            ((NettyHttpServiceClient) client).setHttp2SslContext(http2ClientContext);
+        }
+
+        SSLContext clientContext = SSLContext.getInstance(ServiceClient.TLS_PROTOCOL_NAME);
+        clientContext.init(null, InsecureTrustManagerFactory.INSTANCE.getTrustManagers(), null);
+        client.setSSLContext(clientContext);
+        return client;
     }
 
     @AfterClass
@@ -212,7 +221,6 @@ public class NettyHttpServiceClientTest {
                 "Starting HTTP GET stress test against %s, request count: %d, connection limit: %d",
                 this.testURI, this.requestCount, this.connectionCount);
 
-        this.host.getClient().setConnectionLimitPerHost(this.connectionCount);
         for (int i = 0; i < 3; i++) {
             long start = System.nanoTime();
             getThirdPartyServerResponse(this.testURI, this.requestCount);
@@ -232,11 +240,10 @@ public class NettyHttpServiceClientTest {
         }
         this.host.setOperationTimeOutMicros(TimeUnit.SECONDS.toMicros(120));
         this.host.setTimeoutSeconds(120);
-        this.host
-                .log(
-                        "Starting HTTP POST stress test against %s, request count: %d, connection limit: %d",
-                        this.testURI, this.requestCount, this.connectionCount);
-        this.host.getClient().setConnectionLimitPerHost(this.connectionCount);
+        this.host.log(
+                "Starting HTTP POST stress test against %s, request count: %d, connection limit: %d",
+                this.testURI, this.requestCount, this.connectionCount);
+
         long start = System.nanoTime();
         ExampleServiceState body = new ExampleServiceState();
         body.name = UUID.randomUUID().toString();
@@ -276,18 +283,26 @@ public class NettyHttpServiceClientTest {
         this.host.testWait();
 
         String tag = ServiceClient.CONNECTION_TAG_DEFAULT;
-        validateTagInfo(tag);
+        validateTagInfo(this.host, tag);
     }
 
-    private void validateTagInfo(String tag) {
-        this.host.waitFor("pending requests", () -> {
-            ConnectionPoolMetrics tagInfo = this.host.getClient().getConnectionPoolMetrics(tag);
+    static void validateTagInfo(VerificationHost host, String tag) {
+        validateTagInfo(host, host.getClient(), tag, null);
+    }
+
+    private static void validateTagInfo(VerificationHost host, ServiceClient client, String tag,
+            Integer limit) {
+        host.waitFor("pending requests", () -> {
+            ConnectionPoolMetrics tagInfo = client.getConnectionPoolMetricsPerTag(tag);
             if (tagInfo == null) {
                 return false;
             }
-            this.host.log("%s", Utils.toJson(tagInfo));
+            host.log("%s", Utils.toJson(tagInfo));
+            if (limit != null && tagInfo.availableConnectionCount > limit) {
+                throw new IllegalStateException("Available: " + tagInfo.availableConnectionCount);
+            }
             if (tagInfo.pendingRequestCount != 0 || tagInfo.inUseConnectionCount > 0) {
-                this.host.log("Requests still pending: %s", Utils.toJson(tagInfo));
+                host.log("Requests still pending: %s", Utils.toJson(tagInfo));
                 return false;
             }
             return true;
@@ -396,12 +411,13 @@ public class NettyHttpServiceClientTest {
             MinimalTestServiceState body = new MinimalTestServiceState();
             body.id = MinimalTestService.STRING_MARKER_TIMEOUT_REQUEST;
 
-            int connectionLimit = NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST;
-            int count = connectionLimit;
-            this.host.getClient().setConnectionLimitPerHost(connectionLimit);
+            int count = NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST;
 
             // Use a random boolean to test the keep-alive and close code paths
             Random r = new Random();
+
+            // Use a custom tag to ensure that connections are not shared with the default pool.
+            String tag = ServiceClient.CONNECTION_TAG_DEFAULT + "-timeout";
 
             // timeout tracking currently works only for remote requests
             this.host.testStart(count);
@@ -409,6 +425,7 @@ public class NettyHttpServiceClientTest {
                 Operation request = Operation
                         .createPatch(services.get(0).getUri())
                         .forceRemote()
+                        .setConnectionTag(tag)
                         .setBody(body)
                         .setKeepAlive(r.nextBoolean())
                         .setCompletion((o, e) -> {
@@ -425,7 +442,7 @@ public class NettyHttpServiceClientTest {
 
             }
             this.host.testWait();
-            validateTagInfo(ServiceClient.CONNECTION_TAG_DEFAULT);
+            validateTagInfo(this.host, this.host.getClient(), tag, 0);
         } finally {
             this.host.toggleNegativeTestMode(false);
             this.host.setOperationTimeOutMicros(
@@ -448,7 +465,7 @@ public class NettyHttpServiceClientTest {
                 services);
 
         String tag = ServiceClient.CONNECTION_TAG_DEFAULT;
-        validateTagInfo(tag);
+        validateTagInfo(this.host, tag);
 
         // check that query and fragment make it to the service
         URI u = services.get(0).getUri();
@@ -620,11 +637,11 @@ public class NettyHttpServiceClientTest {
                     }
                     this.host.failIteration(
                             new IllegalStateException("Operation was expected to fail because " +
-                            "op.getContentLength() is more than allowed"));
+                                    "op.getContentLength() is more than allowed"));
                 });
         this.host.send(put);
         this.host.testWait();
-        validateTagInfo(ServiceClient.CONNECTION_TAG_DEFAULT);
+        validateTagInfo(this.host, ServiceClient.CONNECTION_TAG_DEFAULT);
     }
 
     @Test
@@ -835,21 +852,18 @@ public class NettyHttpServiceClientTest {
 
         if (!this.host.isStressTest()) {
             this.host.log("Single connection runs");
-            this.host.getClient().setConnectionLimitPerHost(1);
             this.host.doPutPerService(
                     this.requestCount,
                     EnumSet.of(TestProperty.FORCE_REMOTE),
                     services);
-            this.host.getClient()
-                    .setConnectionLimitPerHost(NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST);
-            validateTagInfo(tag);
+            validateTagInfo(this.host, tag);
         } else {
             this.host.setOperationTimeOutMicros(
                     TimeUnit.SECONDS.toMicros(this.host.getTimeoutSeconds()));
         }
 
         // use global limit, which applies by default to all tags
-        int limit = this.host.getClient().getConnectionLimitPerHost();
+        int limit = NettyHttpServiceClient.DEFAULT_CONNECTIONS_PER_HOST;
         this.host.connectionTag = null;
         this.host.log("Using client global connection limit %d", limit);
 
@@ -878,13 +892,87 @@ public class NettyHttpServiceClientTest {
                 services);
 
         tag = this.host.connectionTag;
-        validateTagInfo(tag);
+        validateTagInfo(this.host, tag);
+    }
+
+    @Test
+    public void testConnectionLimit() throws Throwable {
+
+        List<Service> services = this.host.doThroughputServiceStart(this.serviceCount,
+                MinimalTestService.class,
+                this.host.buildMinimalTestState(),
+                null, null);
+
+        String tag = "http1.1ConnectionLimitTag";
+        int limit = 8;
+        ServiceClient serviceClient = createNettyServiceClient();
+        serviceClient.setConnectionLimitPerTag(tag, limit);
+        serviceClient.start();
+
+        for (int i = 0; i < this.iterationCount; i++) {
+            doConnectionLimit(services, serviceClient, tag, limit);
+        }
+
+        serviceClient.stop();
+    }
+
+    private void doConnectionLimit(List<Service> services, ServiceClient serviceClient, String tag,
+            int limit) throws Throwable {
+        this.host.testStart(this.requestCount * services.size());
+        for (int i = 0; i < this.requestCount; i++) {
+            for (Service service : services) {
+                Operation getOp = Operation.createGet(service.getUri())
+                        .setReferer(this.host.getReferer())
+                        .setConnectionTag(tag)
+                        .forceRemote()
+                        .setCompletion((o, e) -> this.host.completeIteration());
+                this.host.run(() -> serviceClient.send(getOp));
+            }
+        }
+        this.host.testWait();
+
+        validateTagInfo(this.host, serviceClient, tag, limit);
+    }
+
+    @Test
+    public void testConnectionLimitWithOperationTimeout() throws Throwable {
+
+        List<Service> services = this.host.doThroughputServiceStart(this.serviceCount,
+                MinimalTestService.class,
+                this.host.buildMinimalTestState(),
+                null, null);
+
+        this.host.connectionTag = "connectionLimitWithOperationTimeoutTag";
+        this.host.getClient().setConnectionLimitPerTag(this.host.connectionTag,
+                ServiceClient.DEFAULT_CONNECTION_LIMIT_PER_HOST);
+
+        for (int i = 0; i < this.iterationCount; i++) {
+            doConnectionLimitWithOperationTimeout(services);
+        }
+    }
+
+    private void doConnectionLimitWithOperationTimeout(List<Service> services) {
+        this.host.testStart(this.requestCount * services.size());
+        for (int i = 0; i < this.requestCount; i++) {
+            for (Service service : services) {
+                Operation getOp = Operation.createGet(service.getUri())
+                        .setReferer(this.host.getReferer())
+                        .setConnectionTag(this.host.connectionTag)
+                        .forceRemote()
+                        .setExpiration(Utils.getNowMicrosUtc() + 10)
+                        // Ignore timeout failures
+                        .setCompletion((o, e) -> this.host.completeIteration());
+                this.host.run(() -> this.host.send(getOp));
+            }
+        }
+        this.host.testWait();
+        validateTagInfo(this.host, this.host.getClient(), this.host.connectionTag,
+                ServiceClient.DEFAULT_CONNECTION_LIMIT_PER_HOST);
     }
 
     @Test
     public void throughputNonPersistedServiceGetSingleConnection() throws Throwable {
         long serviceCount = 256;
-        this.host.getClient().setConnectionLimitPerHost(1);
         MinimalTestServiceState body = (MinimalTestServiceState) this.host.buildMinimalTestState();
 
         EnumSet<TestProperty> props = EnumSet.of(TestProperty.FORCE_REMOTE);
@@ -1019,6 +1107,7 @@ public class NettyHttpServiceClientTest {
         List<Map<String, String>> actualCookies = new ArrayList<>();
         Operation getOp = Operation
                 .createGet(UriUtils.buildUri(this.host, link))
+                .setCookies(Collections.singletonMap("custom-cookie", "custom-value"))
                 .setCompletion((o, e) -> {
                     if (e != null) {
                         this.host.failIteration(e);
@@ -1037,8 +1126,10 @@ public class NettyHttpServiceClientTest {
         this.host.testWait();
 
         assertNotNull("expect cookies to be set", actualCookies.get(0));
-        assertEquals(1, actualCookies.get(0).size());
+        assertEquals(2, actualCookies.get(0).size());
         assertEquals("value", actualCookies.get(0).get("key"));
+        // Make sure that the cookies passed with operation are not lost.
+        assertEquals("custom-value", actualCookies.get(0).get("custom-cookie"));
     }
 
     @Test
@@ -1210,7 +1301,16 @@ public class NettyHttpServiceClientTest {
     }
 
     @Test
-    public void keepAliveFalseInServer() throws Throwable {
+    public void testErrorResponse() throws Throwable {
+        testErrorResponse(false);
+    }
+
+    @Test
+    public void testErrorResponseWithKeepAlive() throws Throwable {
+        testErrorResponse(true);
+    }
+
+    private void testErrorResponse(boolean keepAlive) throws Throwable {
 
         // When keepAlive=false is set in server side and channels is closed, response was
         // always code=400, message="Socket channel closed:..."
@@ -1221,18 +1321,19 @@ public class NettyHttpServiceClientTest {
                 get.setStatusCode(Operation.STATUS_CODE_CONFLICT);
                 get.setContentType("text/xml");
                 get.setBody("<error>hello</error>");
-                get.setKeepAlive(false);
+                get.setKeepAlive(keepAlive);
                 get.complete();
             }
         };
-        this.host.startServiceAndWait(failureService, "/keepAliveFalseInServer", null);
 
-        Operation put = Operation.createGet(this.host, "/keepAliveFalseInServer").forceRemote();
+        String servicePath = "/keepAliveInServer" + keepAlive;
+        this.host.startServiceAndWait(failureService, servicePath, null);
+
+        Operation put = Operation.createGet(this.host, servicePath).forceRemote();
         TestRequestSender sender = new TestRequestSender(this.host);
         FailureResponse resp = sender.sendAndWaitFailure(put);
 
         assertEquals(Operation.STATUS_CODE_CONFLICT, resp.op.getStatusCode());
         assertEquals("<error>hello</error>", resp.op.getBodyRaw());
     }
-
 }

@@ -17,11 +17,13 @@ import static org.junit.Assert.assertEquals;
 
 import java.net.URI;
 import java.util.Locale;
-import java.util.function.Predicate;
 
 import org.junit.Before;
 import org.junit.Test;
 
+import com.vmware.xenon.common.OperationProcessingChain.Filter;
+import com.vmware.xenon.common.OperationProcessingChain.FilterReturnCode;
+import com.vmware.xenon.common.OperationProcessingChain.OperationProcessingContext;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.test.TestRequestSender;
 import com.vmware.xenon.common.test.TestRequestSender.FailureResponse;
@@ -50,16 +52,16 @@ public class TestLocalizableValidationException extends BasicReusableHostTestCas
 
         Operation get = Operation
                 .createGet(uri)
-                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY)
                 .setReferer(host.getReferer())
                 .addRequestHeader(Operation.ACCEPT_LANGUAGE_HEADER, Locale.GERMAN.getLanguage());
 
         TestRequestSender sender = this.host.getTestRequestSender();
         FailureResponse result = sender.sendAndWaitFailure(get);
 
-        ServiceErrorResponse response = result.op.getBody(ServiceErrorResponse.class);
+        ServiceErrorResponse response = result.op.getErrorResponseBody();
 
         assertEquals(ERROR_MESSAGE_GERMAN, response.message);
+        assertEquals(Operation.STATUS_CODE_BAD_REQUEST, response.statusCode);
     }
 
     @Test
@@ -68,14 +70,13 @@ public class TestLocalizableValidationException extends BasicReusableHostTestCas
 
         Operation post = Operation
                 .createPost(uri)
-                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY)
                 .setReferer(host.getReferer())
                 .addRequestHeader(Operation.ACCEPT_LANGUAGE_HEADER, Locale.GERMAN.getLanguage());
 
         TestRequestSender sender = this.host.getTestRequestSender();
         FailureResponse result = sender.sendAndWaitFailure(post);
 
-        ServiceErrorResponse response = result.op.getBody(ServiceErrorResponse.class);
+        ServiceErrorResponse response = result.op.getErrorResponseBody();
 
         assertEquals(ERROR_MESSAGE_GERMAN, response.message);
     }
@@ -86,14 +87,13 @@ public class TestLocalizableValidationException extends BasicReusableHostTestCas
 
         Operation post = Operation
                 .createDelete(uri)
-                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY)
                 .setReferer(host.getReferer())
                 .addRequestHeader(Operation.ACCEPT_LANGUAGE_HEADER, Locale.GERMAN.getLanguage());
 
         TestRequestSender sender = this.host.getTestRequestSender();
         FailureResponse result = sender.sendAndWaitFailure(post);
 
-        ServiceErrorResponse response = result.op.getBody(ServiceErrorResponse.class);
+        ServiceErrorResponse response = result.op.getErrorResponseBody();
 
         assertEquals(ERROR_MESSAGE_GERMAN, response.message);
     }
@@ -106,7 +106,8 @@ public class TestLocalizableValidationException extends BasicReusableHostTestCas
             super(ServiceDocument.class);
             toggleOption(ServiceOption.CONCURRENT_GET_HANDLING, true);
             toggleOption(ServiceOption.CONCURRENT_UPDATE_HANDLING, true);
-            FailingServiceOperationProcessingChain processingChain = new FailingServiceOperationProcessingChain(this);
+            OperationProcessingChain processingChain = constructFailingServiceOperationProcessingChain(
+                    this);
             this.setOperationProcessingChain(processingChain);
         }
 
@@ -126,29 +127,25 @@ public class TestLocalizableValidationException extends BasicReusableHostTestCas
 
     }
 
-    public static class FailingServiceOperationProcessingChain extends OperationProcessingChain {
+    private static OperationProcessingChain constructFailingServiceOperationProcessingChain(Service s) {
+        return OperationProcessingChain.create(new Filter() {
 
-        public FailingServiceOperationProcessingChain(TestFailingStatefulService service) {
-            super(service);
-            this.add(new Predicate<Operation>() {
-
-                @Override
-                public boolean test(Operation op) {
-                    if (op.getAction() != Action.DELETE) {
-                        return true;
-                    }
-
-                    service.sendRequest(Operation.createGet(service, TestFailingStatefulService.FACTORY_LINK)
-                            .setCompletion((o, e) -> {
-                                op.fail(ex);
-                                resumeProcessingRequest(op, this);
-                            }));
-
-                    return false;
+            @Override
+            public FilterReturnCode processRequest(Operation op, OperationProcessingContext context) {
+                if (op.getAction() != Action.DELETE) {
+                    return FilterReturnCode.CONTINUE_PROCESSING;
                 }
-            });
-        }
 
+                context.setSuspendConsumer(o -> {
+                    s.sendRequest(Operation.createGet(s, TestFailingStatefulService.FACTORY_LINK)
+                            .setCompletion((oo, e) -> {
+                                context.resumeProcessingRequest(op, FilterReturnCode.FAILED_STOP_PROCESSING, e);
+                                op.fail(ex);
+                            }));
+                });
+                return FilterReturnCode.SUSPEND_PROCESSING;
+            }
+        });
     }
 
 }

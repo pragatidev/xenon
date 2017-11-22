@@ -14,14 +14,12 @@
 package com.vmware.xenon.services.common;
 
 import java.util.Set;
-import java.util.concurrent.CancellationException;
 
 import com.vmware.xenon.common.FactoryService;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
-import com.vmware.xenon.common.ServiceRuntimeContext;
 import com.vmware.xenon.common.StatefulService;
 import com.vmware.xenon.common.Utils;
 
@@ -131,11 +129,8 @@ public class RoleService extends StatefulService {
     }
 
     @Override
-    public ServiceRuntimeContext setProcessingStage(Service.ProcessingStage stage) {
-        if (stage == Service.ProcessingStage.PAUSED) {
-            throw new CancellationException("Cannot pause service.");
-        }
-        return super.setProcessingStage(stage);
+    public void setProcessingStage(Service.ProcessingStage stage) {
+        super.setProcessingStage(stage);
     }
 
     @Override
@@ -166,11 +161,13 @@ public class RoleService extends StatefulService {
 
         RoleState currentState = getState(op);
         ServiceDocumentDescription documentDescription = getStateDescription();
+
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
-            op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
-        } else {
-            setState(op, newState);
+            // do not update state
+            op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED);
         }
+
+        setState(op, newState);
         op.complete();
     }
 

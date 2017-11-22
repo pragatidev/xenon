@@ -1,21 +1,25 @@
-// angular
-import { ChangeDetectionStrategy } from '@angular/core';
+// libs
+import { Component, OnInit } from '@angular/core';
 
 // app
-import { BaseComponent } from '../frameworks/core/index';
+import { AnalyticsService } from '../modules/analytics/services/index';
+import { LogService, AppService } from '../modules/core/services/index';
+import { Config } from '../modules/core/utils/index';
 
-import { AnalyticsService } from '../frameworks/analytics/index';
-import { MultilingualService } from '../frameworks/i18n/index';
-
-@BaseComponent({
+/**
+ * This class represents the main application component.
+ */
+@Component({
     moduleId: module.id,
     selector: 'xe-app',
-    templateUrl: 'app.component.html',
-    changeDetection: ChangeDetectionStrategy.Default // Everything else uses OnPush
+    templateUrl: 'app.component.html'
 })
-
 export class AppComponent {
     constructor(
         public analytics: AnalyticsService,
-        private _multilang: MultilingualService) {}
+        public log: LogService,
+        private appService: AppService
+    ) {
+        log.debug(`Config env: ${Config.ENVIRONMENT().ENV}`);
+    }
 }

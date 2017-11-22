@@ -13,11 +13,20 @@
 
 package com.vmware.xenon.services.common;
 
+import static java.util.function.Function.identity;
+import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toMap;
 import static javax.xml.bind.DatatypeConverter.printBase64Binary;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+
+import static com.vmware.xenon.services.common.LuceneDocumentIndexService.DEFAULT_PAGINATED_SEARCHER_EXPIRATION_DELAY;
+import static com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption.SINGLE_USE;
 
 import java.io.File;
 import java.io.IOException;
@@ -25,6 +34,7 @@ import java.net.URI;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Date;
@@ -37,19 +47,25 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Random;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import javax.xml.bind.DatatypeConverter;
 
+import org.apache.lucene.search.IndexSearcher;
 import org.junit.After;
+import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -67,28 +83,93 @@ import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceConfigUpdateRequest;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
+import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
 import com.vmware.xenon.common.ServiceDocumentQueryResult;
 import com.vmware.xenon.common.ServiceErrorResponse;
 import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState;
 import com.vmware.xenon.common.ServiceStats;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
+import com.vmware.xenon.common.StatefulService;
 import com.vmware.xenon.common.SynchronizationTaskService;
 import com.vmware.xenon.common.TestResults;
 import com.vmware.xenon.common.TestUtilityService;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.test.AuthTestUtils;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
 import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.TestProperty;
 import com.vmware.xenon.common.test.TestRequestSender;
+import com.vmware.xenon.common.test.TestRequestSender.FailureResponse;
 import com.vmware.xenon.common.test.VerificationHost;
+import com.vmware.xenon.services.common.ExampleService.ExampleImmutableService;
+import com.vmware.xenon.services.common.ExampleService.ExampleODLService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
+import com.vmware.xenon.services.common.LuceneDocumentIndexService.BackupResponse;
+import com.vmware.xenon.services.common.LuceneDocumentIndexService.CommitInfo;
+import com.vmware.xenon.services.common.LuceneDocumentIndexService.PaginatedSearcherInfo;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.QueryTask.Query.Occurance;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
+import com.vmware.xenon.services.common.TestLuceneDocumentIndexService.AnotherPersistentService.AnotherPersistentState;
 
 class FaultInjectionLuceneDocumentIndexService extends LuceneDocumentIndexService {
+
+    public void forceClosePaginatedSearchers() {
+
+        logInfo("Closing all paginated searchers (%d)",
+                this.paginatedSearchersByCreationTime.size());
+
+        for (PaginatedSearcherInfo info : this.paginatedSearchersByCreationTime.values()) {
+            try {
+                IndexSearcher s = info.searcher;
+                s.getIndexReader().close();
+                this.searcherUpdateTimesMicros.remove(s.hashCode());
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    public Map<Long, List<PaginatedSearcherInfo>> verifyPaginatedSearcherListsEqual() {
+
+        logInfo("Verifying paginated searcher lists are equal");
+
+        Map<Long, List<PaginatedSearcherInfo>> searchersByExpirationTime = new HashMap<>();
+        long searcherCount = 0;
+
+        synchronized (this.searchSync) {
+            for (Entry<Long, List<PaginatedSearcherInfo>> entry :
+                    this.paginatedSearchersByExpirationTime.entrySet()) {
+                List<PaginatedSearcherInfo> expirationList = entry.getValue();
+                for (PaginatedSearcherInfo info : expirationList) {
+                    assertTrue(this.paginatedSearchersByCreationTime.containsValue(info));
+                }
+                searchersByExpirationTime.put(entry.getKey(), new ArrayList<>(expirationList));
+                searcherCount += expirationList.size();
+            }
+
+            assertEquals(this.paginatedSearchersByCreationTime.size(), searcherCount);
+        }
+
+        return searchersByExpirationTime;
+    }
+
+    public TreeMap<Long, PaginatedSearcherInfo> getPaginatedSearchersByExpirationTime() {
+        return this.paginatedSearchersByCreationTime;
+    }
+
+    public List<PaginatedSearcherInfo> getPaginatedSearcherInfos() {
+        // quick check the paginated searcher cache
+        synchronized (this.searchSync) {
+            long searcherCountInExpiration = this.paginatedSearchersByExpirationTime.values().stream()
+                    .flatMap(Collection::stream).distinct().count();
+            int searcherCountInCreation = this.paginatedSearchersByCreationTime.size();
+            assertEquals(searcherCountInCreation, searcherCountInExpiration);
+        }
+        return new ArrayList<>(this.paginatedSearchersByCreationTime.values());
+    }
+
     /*
      * Called by test code to abruptly close the index writer simulating spurious
      * self close of the index writer, in production environments, due to out of memory
@@ -106,21 +187,65 @@ class FaultInjectionLuceneDocumentIndexService extends LuceneDocumentIndexServic
         }
     }
 
+    public ExecutorService setQueryExecutorService(ExecutorService es) {
+        ExecutorService existing = this.privateQueryExecutor;
+        this.privateQueryExecutor = es;
+        return existing;
+    }
+
+    public ExecutorService setIndexingExecutorService(ExecutorService es) {
+        ExecutorService existing = this.privateIndexingExecutor;
+        this.privateIndexingExecutor = es;
+        return existing;
+    }
 }
 
 public class TestLuceneDocumentIndexService {
 
-    public static class ImmutableExampleService extends ExampleService {
-        public ImmutableExampleService() {
+    public static class InMemoryExampleService extends ExampleService {
+        public static final String FACTORY_LINK = "test/in-memory-examples";
+
+        public InMemoryExampleService() {
             super();
-            super.toggleOption(ServiceOption.ON_DEMAND_LOAD, true);
-            super.toggleOption(ServiceOption.IMMUTABLE, true);
-            // toggle instrumentation off so service stops, instead of pausing
-            super.toggleOption(ServiceOption.INSTRUMENTATION, false);
+            super.setDocumentIndexPath(ServiceUriPaths.CORE_IN_MEMORY_DOCUMENT_INDEX);
         }
 
         public static FactoryService createFactory() {
-            return FactoryService.create(ImmutableExampleService.class);
+            return FactoryService.create(InMemoryExampleService.class);
+        }
+    }
+
+    public static class IndexedMetadataExampleService extends ExampleService {
+        public static final String FACTORY_LINK = "/test/indexed-metadata-examples";
+
+        public static FactoryService createFactory() {
+            return FactoryService.create(IndexedMetadataExampleService.class);
+        }
+
+        @Override
+        public ServiceDocument getDocumentTemplate() {
+            ServiceDocument template = super.getDocumentTemplate();
+            template.documentDescription.documentIndexingOptions = EnumSet.of(
+                    ServiceDocumentDescription.DocumentIndexingOption.INDEX_METADATA);
+            return template;
+        }
+    }
+
+    public static class AnotherPersistentService extends StatefulService {
+        public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/another-persistents";
+
+        public static FactoryService createFactory() {
+            return FactoryService.create(AnotherPersistentService.class);
+        }
+
+        public static class AnotherPersistentState extends ServiceDocument {
+        }
+
+        public AnotherPersistentService() {
+            super(AnotherPersistentState.class);
+            toggleOption(ServiceOption.PERSISTENCE, true);
+            toggleOption(ServiceOption.REPLICATION, true);
+            toggleOption(ServiceOption.OWNER_SELECTION, true);
         }
     }
 
@@ -194,12 +319,14 @@ public class TestLuceneDocumentIndexService {
 
     private FaultInjectionLuceneDocumentIndexService indexService;
 
-    private int expiredDocumentSearchThreshold;
-
     private VerificationHost host;
 
     @Rule
     public TestResults testResults = new TestResults();
+
+    private String indexLink = ServiceUriPaths.CORE_DOCUMENT_INDEX;
+
+    private URI inMemoryIndexServiceUri;
 
     private void setUpHost(boolean isAuthEnabled) throws Throwable {
         if (this.host != null) {
@@ -214,6 +341,7 @@ public class TestLuceneDocumentIndexService {
             // on index stats.
             this.host.setPeerSynchronizationEnabled(false);
             this.indexService = new FaultInjectionLuceneDocumentIndexService();
+            InMemoryLuceneDocumentIndexService inMemoryIndexService = new InMemoryLuceneDocumentIndexService();
             if (this.host.isStressTest()) {
                 this.indexService.toggleOption(ServiceOption.INSTRUMENTATION,
                         this.enableInstrumentation);
@@ -226,7 +354,9 @@ public class TestLuceneDocumentIndexService {
                 this.indexService.toggleOption(ServiceOption.INSTRUMENTATION, true);
                 this.host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS
                         .toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
+                inMemoryIndexService.toggleOption(ServiceOption.INSTRUMENTATION, true);
             }
+
             this.host.setDocumentIndexingService(this.indexService);
             this.host.setPeerSynchronizationEnabled(false);
 
@@ -240,17 +370,32 @@ public class TestLuceneDocumentIndexService {
                         TimeUnit.SECONDS.toMicros(this.serviceCacheClearIntervalSeconds));
             }
 
+            this.host.addPrivilegedService(InMemoryLuceneDocumentIndexService.class);
+
             this.host.start();
+
+            this.host.setSystemAuthorizationContext();
+
+            // start in-memory index service AFTER host has started, so that it can get correct service uri
+            this.host.startServiceAndWait(inMemoryIndexService, InMemoryLuceneDocumentIndexService.SELF_LINK, null);
+            this.inMemoryIndexServiceUri = inMemoryIndexService.getUri();
+            createInMemoryExampleServiceFactory(this.host);
+
+            this.host.resetAuthorizationContext();
 
             if (isAuthEnabled) {
                 createUsersAndRoles();
             }
 
-            this.expiredDocumentSearchThreshold = LuceneDocumentIndexService
-                    .getExpiredDocumentSearchThreshold();
         } catch (Throwable e) {
             throw new Exception(e);
         }
+    }
+
+    @Before
+    public void setUp() {
+        // re-initialize
+        this.indexLink = ServiceUriPaths.CORE_DOCUMENT_INDEX;
     }
 
     @After
@@ -262,6 +407,7 @@ public class TestLuceneDocumentIndexService {
         try {
             this.host.setSystemAuthorizationContext();
             this.host.logServiceStats(this.host.getDocumentIndexServiceUri(), this.testResults);
+            this.host.logServiceStats(this.inMemoryIndexServiceUri, this.testResults);
         } catch (Throwable e) {
             this.host.log("Error logging stats: %s", e.toString());
         }
@@ -269,8 +415,10 @@ public class TestLuceneDocumentIndexService {
         this.host = null;
         LuceneDocumentIndexService.setIndexFileCountThresholdForWriterRefresh(
                 LuceneDocumentIndexService.DEFAULT_INDEX_FILE_COUNT_THRESHOLD_FOR_WRITER_REFRESH);
-        LuceneDocumentIndexService
-                .setExpiredDocumentSearchThreshold(this.expiredDocumentSearchThreshold);
+        LuceneDocumentIndexService.setExpiredDocumentSearchThreshold(
+                LuceneDocumentIndexService.DEFAULT_EXPIRED_DOCUMENT_SEARCH_THRESHOLD);
+
+        TestRequestSender.clearAuthToken();
     }
 
     @Test
@@ -296,9 +444,89 @@ public class TestLuceneDocumentIndexService {
     }
 
     @Test
+    public void documentGetStats() throws Throwable {
+        setUpHost(false);
+        List<String> docLinks = new ArrayList<String>();
+        MinimalFactoryTestService f = new MinimalFactoryTestService();
+        MinimalFactoryTestService factoryService = (MinimalFactoryTestService) this.host
+                .startServiceAndWait(f, UUID.randomUUID().toString(), null);
+        factoryService.setChildServiceCaps(
+                EnumSet.of(ServiceOption.PERSISTENCE));
+        for (int i = 0; i < this.serviceCount; i++) {
+            MinimalTestServiceState initialState = new MinimalTestServiceState();
+            initialState.documentSelfLink = initialState.id = UUID.randomUUID().toString();
+            this.host.sendAndWaitExpectSuccess(
+                    Operation.createPost(factoryService.getUri()).setBody(initialState));
+            docLinks.add(initialState.documentSelfLink);
+        }
+        for (String selfLink: docLinks) {
+            this.host.sendAndWaitExpectSuccess(Operation.createGet(this.host,
+                    UriUtils.buildUriPath(factoryService.getUri().getPath(), selfLink)));
+        }
+
+        Map<String, ServiceStat> stats = this.host.getServiceStats(this.host.getDocumentIndexServiceUri());
+        String statKey = String.format(
+                LuceneDocumentIndexService.STAT_NAME_SINGLE_QUERY_BY_FACTORY_COUNT_FORMAT,
+                factoryService.getUri().getPath());
+        ServiceStat kindStat = stats.get(statKey);
+        assertNotNull(kindStat);
+        assertEquals(this.serviceCount, kindStat.latestValue, 0);
+    }
+
+    @Test
+    public void testQueueDepthStats() throws Throwable {
+        setUpHost(false);
+
+        MinimalFactoryTestService factoryService = (MinimalFactoryTestService)
+                this.host.startServiceAndWait(new MinimalFactoryTestService(),
+                        UUID.randomUUID().toString(), null);
+
+        factoryService.setChildServiceCaps(EnumSet.of(ServiceOption.PERSISTENCE));
+
+        this.host.doFactoryChildServiceStart(null, this.serviceCount, MinimalTestServiceState.class,
+                (o) -> {
+                    MinimalTestServiceState initialState = new MinimalTestServiceState();
+                    initialState.documentSelfLink = initialState.id = UUID.randomUUID().toString();
+                    o.setBody(initialState);
+                }, factoryService.getUri());
+
+        // Create an executor service which rejects all attempts to create new threads.
+        ExecutorService blockingExecutor = Executors.newSingleThreadExecutor((r) -> null);
+        ExecutorService queryExecutor = this.indexService.setQueryExecutorService(blockingExecutor);
+        queryExecutor.shutdown();
+        queryExecutor.awaitTermination(this.host.getTimeoutSeconds(), TimeUnit.SECONDS);
+
+        // Now submit a query and wait for the queue depth stat to be set.
+        QueryTask queryTask = QueryTask.Builder.create()
+                .setQuery(Query.Builder.create()
+                        .addKindFieldClause(MinimalTestServiceState.class)
+                        .build())
+                .build();
+
+        this.host.createQueryTaskService(queryTask);
+
+        this.host.waitFor("Query queue depth stat was not set", () -> {
+            Map<String, ServiceStat> indexStats = this.host.getServiceStats(
+                    this.host.getDocumentIndexServiceUri());
+            ServiceStat queueDepthStat = indexStats.entrySet().stream()
+                    .filter((entry) -> entry.getKey().startsWith(
+                            LuceneDocumentIndexService.STAT_NAME_PREFIX_QUERY_QUEUE_DEPTH))
+                    .filter((entry) -> entry.getKey().endsWith(
+                            ServiceStats.STAT_NAME_SUFFIX_PER_DAY))
+                    .map(Entry::getValue).findFirst().orElse(null);
+            if (queueDepthStat == null) {
+                return false;
+            }
+
+            assertTrue(queueDepthStat.name.contains(ServiceUriPaths.CORE_AUTHZ_GUEST_USER));
+            return queueDepthStat.latestValue == 1;
+        });
+    }
+
+    @Test
     public void corruptedIndexRecovery() throws Throwable {
         setUpHost(false);
-        this.doDurableServiceUpdate(Action.PUT, 100, 2, null);
+        this.doDurableServiceUpdate(Action.PUT, MinimalTestService.class, 100, 2, null);
         Thread.sleep(this.host.getMaintenanceIntervalMicros() / 1000);
 
         // Stop the host, without cleaning up storage.
@@ -359,7 +587,7 @@ public class TestLuceneDocumentIndexService {
                     return 1;
                 }).reduce(0, Integer::sum);
 
-        final int expectedDirectoryPathsWithLuceneInName = 3;
+        final int expectedDirectoryPathsWithLuceneInName = 2;
         assertEquals(expectedDirectoryPathsWithLuceneInName, total);
     }
 
@@ -408,6 +636,347 @@ public class TestLuceneDocumentIndexService {
             Thread.sleep(TimeUnit.MICROSECONDS.toMillis(this.host.getMaintenanceIntervalMicros()));
         }
 
+    }
+
+    @Test
+    public void forceExpirePaginatedSearchersWithoutRecovery() throws Throwable {
+        setUpHost(false);
+        TestRequestSender sender = this.host.getTestRequestSender();
+
+        Map<URI, ExampleServiceState> exampleServices = this.host.doFactoryChildServiceStart(null,
+                this.serviceCount, ExampleServiceState.class,
+                (o) -> {
+                    ExampleServiceState b = new ExampleServiceState();
+                    b.name = Utils.getNowMicrosUtc() + " before stop";
+                    o.setBody(b);
+                }, UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK));
+
+        // create a paginated query that is bound to fail after we close the searchers
+        // underneath it
+        Query query = Query.Builder.create()
+                .addKindFieldClause(ExampleServiceState.class)
+                .build();
+        QueryTask queryTask = QueryTask.Builder.create()
+                .addOption(QueryOption.EXPAND_CONTENT)
+                .setResultLimit(2)
+                .setQuery(query).build();
+        boolean isDirect = true;
+        this.host.createQueryTaskService(queryTask, false, isDirect, queryTask, null);
+
+        // fetch the first page, since the QueryPageService will only retry refresh, transparently,
+        // if the first page has never been fetched and we want to avoid that: we want to see
+        // the query page fail
+        QueryTask firstPageResults = sender.sendGetAndWait(
+                UriUtils.buildUri(this.host, queryTask.results.nextPageLink), QueryTask.class);
+        assertTrue(!firstPageResults.results.documentLinks.isEmpty());
+        assertTrue(firstPageResults.results.nextPageLink != null);
+
+        // close the index searchers supporting paginated queries, then attempt to grab
+        // a query page.
+        this.indexService.forceClosePaginatedSearchers();
+
+        Operation getSecondPage = Operation.createGet(this.host,
+                firstPageResults.results.nextPageLink);
+        FailureResponse rsp = sender.sendAndWaitFailure(getSecondPage);
+        ServiceErrorResponse errorBody = rsp.op.getErrorResponseBody();
+        assertTrue(errorBody.message.contains("IndexReader"));
+
+        ServiceStat readerClosedStat = this.getLuceneStat(
+                LuceneDocumentIndexService.STAT_NAME_READER_ALREADY_CLOSED_EXCEPTION_COUNT);
+        assertEquals(1, readerClosedStat.version);
+
+        // issue some updates, they should all succeed, the index should be healthy
+        updateServices(exampleServices, false);
+
+        // make sure index recovery did not run
+        ServiceStat writerClosedStat = this.getLuceneStat(
+                LuceneDocumentIndexService.STAT_NAME_WRITER_ALREADY_CLOSED_EXCEPTION_COUNT);
+        assertEquals(0, writerClosedStat.version);
+    }
+
+    @Test
+    public void testLuceneQueryConversion() throws Throwable {
+        Query topLevelQuery = Query.Builder.create()
+                .addFieldClause("name", "foo", Occurance.SHOULD_OCCUR)
+                .addFieldClause("id", "foo-id", Occurance.SHOULD_OCCUR)
+                .build();
+
+        org.apache.lucene.search.Query luceneQuery = LuceneQueryConverter.convertToLuceneQuery(topLevelQuery, null);
+
+        // Assert that the top level MUST_OCCUR is ignored ( old behavior )
+        assertEquals(luceneQuery.toString(), "name:foo id:foo-id");
+
+        luceneQuery = LuceneQueryConverter.convert(topLevelQuery, null);
+
+        // Assert that the top level MUST_OCCUR is not ignored
+        assertEquals(luceneQuery.toString(), "+(name:foo id:foo-id)");
+    }
+
+    @Test
+    public void testPaginatedSearcherLists() throws Throwable {
+        for (int i = 0; i < this.iterationCount; i++) {
+            tearDown();
+            setUpHost(false);
+            doPaginatedSearcherLists();
+        }
+    }
+
+    private void doPaginatedSearcherLists() throws Throwable {
+
+        this.host.doFactoryChildServiceStart(null, this.serviceCount, ExampleServiceState.class,
+                (o) -> {
+                    ExampleServiceState b = new ExampleServiceState();
+                    b.name = Utils.getNowMicrosUtc() + " before stop";
+                    o.setBody(b);
+                }, UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK));
+
+        // Assert that the paginated searcher lists in the index service have the same content
+        // at the start (an empty list).
+        Map<Long, List<PaginatedSearcherInfo>> paginatedSearchers =
+                this.indexService.verifyPaginatedSearcherListsEqual();
+        assertEquals(0, paginatedSearchers.size());
+
+        long queryExpirationTimeMicros = Utils.fromNowMicrosUtc(TimeUnit.MINUTES.toMicros(10));
+
+        // create a paginated query with an explicit expiration time
+        Query query = Query.Builder.create()
+                .addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK, ExampleService.FACTORY_LINK, QueryTask.QueryTerm.MatchType.PREFIX)
+                .build();
+        QueryTask queryTask = QueryTask.Builder.create()
+                .setQuery(query)
+                .setResultLimit(2)
+                .build();
+        queryTask.documentExpirationTimeMicros = queryExpirationTimeMicros;
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+
+        // create another paginated query with the same expiration time
+        queryTask = QueryTask.Builder.create()
+                .setQuery(query)
+                .setResultLimit(2)
+                .build();
+        queryTask.documentExpirationTimeMicros = queryExpirationTimeMicros;
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+
+        long expectedSearcherExpirationTime = queryExpirationTimeMicros + DEFAULT_PAGINATED_SEARCHER_EXPIRATION_DELAY;
+        // Assert that the paginated searcher lists in the index service have the same content.
+        paginatedSearchers = this.indexService.verifyPaginatedSearcherListsEqual();
+        assertEquals(1, paginatedSearchers.size());
+        for (Entry<Long, List<PaginatedSearcherInfo>> entry : paginatedSearchers.entrySet()) {
+            assertEquals(expectedSearcherExpirationTime, (long) entry.getKey());
+            List<PaginatedSearcherInfo> expirationList = entry.getValue();
+            assertEquals(2, expirationList.size());
+            for (PaginatedSearcherInfo info : expirationList) {
+                assertEquals(expectedSearcherExpirationTime, info.expirationTimeMicros);
+            }
+        }
+
+        // create a paginated query with DO_NOT_REFRESH and an extended expiration time.
+        long extendedQueryExpirationTimeMicros = queryExpirationTimeMicros
+                + TimeUnit.MINUTES.toMicros(5);
+        queryTask = QueryTask.Builder.create()
+                .setQuery(query)
+                .setResultLimit(2)
+                .addOption(QueryOption.DO_NOT_REFRESH)
+                .build();
+        queryTask.documentExpirationTimeMicros = extendedQueryExpirationTimeMicros;
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+
+        long expectedSearcherExpirationTimeForExtended = extendedQueryExpirationTimeMicros + DEFAULT_PAGINATED_SEARCHER_EXPIRATION_DELAY;
+
+        // Assert that the paginated searcher lists in the index service have the same content and
+        // that the expiration time of one searcher was updated.
+        paginatedSearchers = this.indexService.verifyPaginatedSearcherListsEqual();
+        assertEquals(2, paginatedSearchers.size());
+        for (Entry<Long, List<PaginatedSearcherInfo>> entry : paginatedSearchers.entrySet()) {
+            long expirationMicros = entry.getKey();
+            assertTrue(expirationMicros == expectedSearcherExpirationTime
+                    || expirationMicros == expectedSearcherExpirationTimeForExtended);
+            List<PaginatedSearcherInfo> expirationList = entry.getValue();
+            assertEquals(1, expirationList.size());
+            for (PaginatedSearcherInfo info : expirationList) {
+                assertEquals(expirationMicros, info.expirationTimeMicros);
+            }
+        }
+
+        // Create a new paginated searcher with a short expiration and wait for it to expire.
+        queryTask = QueryTask.Builder.create()
+                .setQuery(query)
+                .setResultLimit(2)
+                .build();
+        queryTask.documentExpirationTimeMicros = Utils.fromNowMicrosUtc(
+                this.host.getMaintenanceIntervalMicros());
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+
+        this.host.waitFor("Paginated query searcher failed to expire", () -> {
+            Map<Long, List<PaginatedSearcherInfo>> searcherInfo =
+                    this.indexService.verifyPaginatedSearcherListsEqual();
+            if (searcherInfo.size() > 2) {
+                return false;
+            }
+
+            assertEquals(2, searcherInfo.size());
+            for (Entry<Long, List<PaginatedSearcherInfo>> entry : searcherInfo.entrySet()) {
+                long expirationMicros = entry.getKey();
+                assertTrue(expirationMicros == expectedSearcherExpirationTime
+                        || expirationMicros == expectedSearcherExpirationTimeForExtended);
+                List<PaginatedSearcherInfo> expirationList = entry.getValue();
+                assertEquals(1, expirationList.size());
+                for (PaginatedSearcherInfo info : expirationList) {
+                    assertEquals(expirationMicros, info.expirationTimeMicros);
+                }
+            }
+
+            return true;
+        });
+
+        // verify that a new index searcher is picked up when DO_NOT_REFRESH is specified
+        // and the query is issued one maintenance interval after the index has been updated
+        LuceneDocumentIndexService.setSearcherRefreshIntervalMicros(
+                TimeUnit.HOURS.toMicros(1));
+        this.host.doFactoryChildServiceStart(null, this.serviceCount, ExampleServiceState.class,
+                (o) -> {
+                    ExampleServiceState b = new ExampleServiceState();
+                    b.name = UUID.randomUUID().toString();
+                    o.setBody(b);
+                }, UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK));
+        // Check to see we will use an existing searcher by default
+        queryTask = QueryTask.Builder.create()
+                .setQuery(query)
+                .setResultLimit(2)
+                .addOption(QueryOption.DO_NOT_REFRESH)
+                .build();
+        queryTask.documentExpirationTimeMicros = extendedQueryExpirationTimeMicros;
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+        assertEquals(2, this.indexService.paginatedSearchersByCreationTime.values().size());
+        // next, set the searcher refresh interval to the maintenance interval and ensure
+        // a new searcher is created
+        LuceneDocumentIndexService.setSearcherRefreshIntervalMicros(
+                ServiceHostState.DEFAULT_MAINTENANCE_INTERVAL_MICROS);
+        this.host.waitFor("New index searcher was not created", () -> {
+            QueryTask qTask = QueryTask.Builder.create()
+                    .setQuery(query)
+                    .setResultLimit(2)
+                    .addOption(QueryOption.DO_NOT_REFRESH)
+                    .build();
+            qTask.documentExpirationTimeMicros = extendedQueryExpirationTimeMicros;
+            this.host.createQueryTaskService(qTask, false, true, qTask, null);
+            // we should have 3 index searchers after the searcher refresh interval has elapsed
+            if (this.indexService.paginatedSearchersByCreationTime.values().size() >= 3) {
+                return true;
+            }
+            return false;
+        });
+        LuceneDocumentIndexService.setSearcherRefreshIntervalMicros(0);
+        // Create a new direct paginated searcher with a long expiration and the SINGLE_USE option,
+        // traverse all of the results pages, and verify that the pages and the index searcher were
+        // closed.
+        queryTask = QueryTask.Builder.create()
+                .setQuery(query)
+                .setResultLimit(2)
+                .addOption(SINGLE_USE)
+                .build();
+        queryTask.documentExpirationTimeMicros = extendedQueryExpirationTimeMicros;
+
+        this.host.log("Creating a query task with SINGLE_USE with expiration time %d",
+                queryTask.documentExpirationTimeMicros);
+
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+        assertNotNull(queryTask.results.nextPageLink);
+
+        ServiceStat forceDeletionStat = getLuceneStat(
+                LuceneDocumentIndexService.STAT_NAME_PAGINATED_SEARCHER_FORCE_DELETION_COUNT
+                        + ServiceStats.STAT_NAME_SUFFIX_PER_DAY);
+        assertEquals(0.0, forceDeletionStat.latestValue, 0.01);
+
+        paginatedSearchers = this.indexService.verifyPaginatedSearcherListsEqual();
+        assertEquals(2, paginatedSearchers.size());
+        for (Entry<Long, List<PaginatedSearcherInfo>> entry : paginatedSearchers.entrySet()) {
+            long expirationMicros = entry.getKey();
+            List<PaginatedSearcherInfo> expirationList = entry.getValue();
+            if (expirationMicros == expectedSearcherExpirationTime) {
+                assertEquals(1, expirationList.size());
+            } else if (expirationMicros == expectedSearcherExpirationTimeForExtended) {
+                assertEquals(3, expirationList.size());
+            } else {
+                throw new IllegalStateException("Unexpected expiration time: " + expirationMicros);
+            }
+        }
+
+        TestContext ctx = this.host.testCreate(1);
+        List<String> pageLinks = traversePageLinks(ctx, queryTask.results.nextPageLink);
+        this.host.testWait(ctx);
+
+        // Verify that the query page services have been stopped. Note this should happen
+        // synchronously during GET processing.
+        TestContext getCtx = this.host.testCreate(pageLinks.size());
+        AtomicInteger remaining = new AtomicInteger(pageLinks.size());
+        for (String pageLink : pageLinks) {
+            Operation get = Operation.createGet(this.host, pageLink).setCompletion((o, e) -> {
+                if (e != null && (e instanceof ServiceHost.ServiceNotFoundException)) {
+                    remaining.decrementAndGet();
+                }
+                getCtx.complete();
+            });
+
+            this.host.send(get);
+        }
+        this.host.testWait(getCtx);
+
+        assertEquals(0, remaining.get());
+
+        this.host.waitFor("Failed to delete index searcher (stat)", () -> {
+            ServiceStat deletionStat = getLuceneStat(
+                    LuceneDocumentIndexService.STAT_NAME_PAGINATED_SEARCHER_FORCE_DELETION_COUNT
+                            + ServiceStats.STAT_NAME_SUFFIX_PER_DAY);
+            return deletionStat.latestValue == 1.0;
+        });
+
+        this.host.waitFor("Failed to delete index searcher (list)", () -> {
+            Map<Long, List<PaginatedSearcherInfo>> searcherInfo =
+                    this.indexService.verifyPaginatedSearcherListsEqual();
+            assertEquals(2, searcherInfo.size());
+            for (Entry<Long, List<PaginatedSearcherInfo>> entry : searcherInfo.entrySet()) {
+                long expirationMicros = entry.getKey();
+                List<PaginatedSearcherInfo> expirationList = entry.getValue();
+                if (expirationMicros == expectedSearcherExpirationTime) {
+                    assertEquals(1, expirationList.size());
+                } else if (expirationMicros != expectedSearcherExpirationTimeForExtended) {
+                    throw new IllegalStateException("Unexpected expiration time: "
+                            + expirationMicros);
+                } else {
+                    return expirationList.size() == 2;
+                }
+            }
+
+            throw new IllegalStateException("Unreachable");
+        });
+    }
+
+    private List<String> traversePageLinks(TestContext ctx, String nextPageLink) {
+        List<String> nextPageLinks = new ArrayList<>();
+        traversePageLinks(ctx, nextPageLink, nextPageLinks);
+        return nextPageLinks;
+    }
+
+    private void traversePageLinks(TestContext ctx, String nextPageLink, List<String> nextPageLinks) {
+        nextPageLinks.add(nextPageLink);
+        Operation get = Operation.createGet(this.host, nextPageLink)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        ctx.fail(e);
+                        return;
+                    }
+
+                    QueryTask page = o.getBody(QueryTask.class);
+                    if (page.results.nextPageLink == null) {
+                        ctx.complete();
+                        return;
+                    }
+
+                    traversePageLinks(ctx, page.results.nextPageLink, nextPageLinks);
+                });
+
+        this.host.send(get);
     }
 
     private void updateServices(Map<URI, ExampleServiceState> exampleServices, boolean expectFailure)
@@ -490,9 +1059,112 @@ public class TestLuceneDocumentIndexService {
     }
 
     @Test
+    public void reusePaginatedSearcher() throws Throwable {
+        setUpHost(false);
+
+        this.host.startFactory(AnotherPersistentService.class, AnotherPersistentService::createFactory);
+        this.host.waitForServiceAvailable(AnotherPersistentService.FACTORY_LINK);
+
+
+        // populate ExampleServiceState data. This populates "indexService.documentKindUpdateInfo"
+        List<Operation> posts = new ArrayList<>();
+        for (int i = 0; i < this.serviceCount; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = UUID.randomUUID().toString();
+            posts.add(Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state));
+        }
+        this.host.getTestRequestSender().sendAndWait(posts);
+
+
+        int paginatedSearcherSize;
+        long expiration = Utils.fromNowMicrosUtc(TimeUnit.MINUTES.toMicros(10));
+
+        QueryTask queryTask;
+
+        Query query = Query.Builder.create()
+                .addFieldClause(ServiceDocument.FIELD_NAME_KIND, Utils.buildKind(ExampleServiceState.class))
+                .build();
+
+        // create a paginated query.
+        queryTask = QueryTask.Builder.create().setQuery(query).setResultLimit(2).build();
+        queryTask.documentExpirationTimeMicros = expiration;
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+
+        // verify paginated searcher is NOT reused for the first paginated query.
+        paginatedSearcherSize = this.indexService.getPaginatedSearchersByExpirationTime().size();
+        assertEquals("new searcher should be created", 1, paginatedSearcherSize);
+
+
+        // create a NON ExampleServiceState paginated searcher.
+        // Since document for this kind(String) has not created/updated, existing searcher should be reused.
+        queryTask = QueryTask.Builder.create()
+                .setQuery(Query.Builder.create()
+                        .addFieldClause(ServiceDocument.FIELD_NAME_KIND, Utils.buildKind(String.class))
+                        .build())
+                .setResultLimit(2)
+                .build();
+        queryTask.documentExpirationTimeMicros = expiration;
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+
+        // verify no searcher is reused so far
+        paginatedSearcherSize = this.indexService.getPaginatedSearchersByExpirationTime().size();
+        assertEquals("existing searcher should be reused", 1, paginatedSearcherSize);
+
+
+        // now create a query task with ExampleServiceState
+        queryTask = QueryTask.Builder.create().setQuery(query).setResultLimit(2).build();
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+
+        // a searcher should be reused
+        paginatedSearcherSize = this.indexService.getPaginatedSearchersByExpirationTime().size();
+        assertEquals("searcher should be re-used", 1, paginatedSearcherSize);
+
+        // Another query task, searcher should be reused
+        queryTask = QueryTask.Builder.create().setQuery(query).setResultLimit(2).build();
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+        paginatedSearcherSize = this.indexService.getPaginatedSearchersByExpirationTime().size();
+        assertEquals("searcher should be re-used", 1, paginatedSearcherSize);
+
+
+        // create another service that does NOT use ExampleServiceState kind.
+        this.host.getTestRequestSender().sendAndWait(
+                Operation.createPost(this.host, AnotherPersistentService.FACTORY_LINK)
+                        .setBody(new AnotherPersistentState()));
+
+        // Even AnotherPersistentState is updated, still searcher should be reused for ExampleServiceState
+        queryTask = QueryTask.Builder.create().setQuery(query).setResultLimit(2).build();
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+        paginatedSearcherSize = this.indexService.getPaginatedSearchersByExpirationTime().size();
+        assertEquals("searcher should be re-used", 1, paginatedSearcherSize);
+
+        // update a ExampleService
+        ExampleServiceState state = new ExampleServiceState();
+        state.name = UUID.randomUUID().toString();
+        Operation post = Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state);
+        this.host.getTestRequestSender().sendAndWait(post);
+
+        // if ExampleService is updated, new searcher should be used
+        queryTask = QueryTask.Builder.create().setQuery(query).setResultLimit(2).build();
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+        paginatedSearcherSize = this.indexService.getPaginatedSearchersByExpirationTime().size();
+        assertEquals("searcher should be re-used", 2, paginatedSearcherSize);
+    }
+
+    @Test
     public void immutableServiceQueryLongRunning() throws Throwable {
         setUpHost(false);
         URI factoryUri = createImmutableFactoryService(this.host);
+        doServiceQueryLongRunning(factoryUri, EnumSet.of(QueryOption.INCLUDE_ALL_VERSIONS));
+    }
+
+    @Test
+    public void indexedMetadataServiceQueryLongRunning() throws Throwable {
+        setUpHost(false);
+        URI factoryUri = createIndexedMetadataFactoryService(this.host);
+        doServiceQueryLongRunning(factoryUri, EnumSet.of(QueryOption.INDEXED_METADATA));
+    }
+
+    private void doServiceQueryLongRunning(URI factoryUri, EnumSet<QueryOption> queryOptions) {
 
         QueryTask.Query prefixQuery = QueryTask.Query.Builder.create()
                 .addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK, factoryUri.getPath(),
@@ -521,7 +1193,7 @@ public class TestLuceneDocumentIndexService {
                     .addOption(QueryOption.SORT)
                     .addOption(QueryOption.TOP_RESULTS)
                     .addOption(QueryOption.EXPAND_CONTENT)
-                    .addOption(QueryOption.INCLUDE_ALL_VERSIONS)
+                    .addOptions(queryOptions)
                     .orderDescending(ServiceDocument.FIELD_NAME_SELF_LINK,
                             ServiceDocumentDescription.TypeName.STRING)
                     .setResultLimit((int) this.serviceCount)
@@ -563,19 +1235,18 @@ public class TestLuceneDocumentIndexService {
         MinimalTestServiceState body = new MinimalTestServiceState();
         body.id = "id";
         Operation post = Operation.createPost(factoryService.getUri()).setBody(body);
-        // should fail, missing ON_DEMAND_LOAD
-        this.host.sendAndWaitExpectFailure(post);
+        this.host.sendAndWaitExpectSuccess(post);
 
         post = Operation.createPost(factoryService.getUri()).setBody(body);
         factoryService.setChildServiceCaps(
-                EnumSet.of(ServiceOption.PERSISTENCE, ServiceOption.ON_DEMAND_LOAD,
+                EnumSet.of(ServiceOption.PERSISTENCE,
                         ServiceOption.IMMUTABLE, ServiceOption.PERIODIC_MAINTENANCE));
         // should fail, has PERIODIC_MAINTENANCE
         this.host.sendAndWaitExpectFailure(post);
 
         post = Operation.createPost(factoryService.getUri()).setBody(body);
         factoryService.setChildServiceCaps(
-                EnumSet.of(ServiceOption.PERSISTENCE, ServiceOption.ON_DEMAND_LOAD,
+                EnumSet.of(ServiceOption.PERSISTENCE,
                         ServiceOption.IMMUTABLE, ServiceOption.INSTRUMENTATION));
         // should fail, has INSTRUMENTATION
         this.host.sendAndWaitExpectFailure(post);
@@ -601,6 +1272,7 @@ public class TestLuceneDocumentIndexService {
     @Test
     public void throughputSelfLinkQuery() throws Throwable {
         setUpHost(false);
+        this.indexService.toggleOption(ServiceOption.INSTRUMENTATION, true);
 
         // Immutable factory first:
         // we perform two passes per factory: first pass creates new services and
@@ -608,11 +1280,13 @@ public class TestLuceneDocumentIndexService {
         boolean doPostOrUpdates = true;
         boolean interleaveUpdate = false;
         URI immutableFactoryUri = createImmutableFactoryService(this.host);
-        doThroughputSelfLinkQuery(immutableFactoryUri, null, doPostOrUpdates, interleaveUpdate);
+        doThroughputSelfLinkQuery(immutableFactoryUri, null, doPostOrUpdates, interleaveUpdate,
+                null);
         // second pass does not create new services, but does do interleaving
         doPostOrUpdates = false;
         interleaveUpdate = true;
-        doThroughputSelfLinkQuery(immutableFactoryUri, null, doPostOrUpdates, interleaveUpdate);
+        doThroughputSelfLinkQuery(immutableFactoryUri, null, doPostOrUpdates, interleaveUpdate,
+                null);
 
         // repeat for example factory (mutable)
         doPostOrUpdates = true;
@@ -622,16 +1296,38 @@ public class TestLuceneDocumentIndexService {
         // better quantify query processing throughput when multiple versions per link are
         // present in the index results
         doThroughputSelfLinkQuery(exampleFactoryUri, this.updateCount, doPostOrUpdates,
-                interleaveUpdate);
+                interleaveUpdate, null);
         doPostOrUpdates = false;
         interleaveUpdate = true;
         doThroughputSelfLinkQuery(exampleFactoryUri, this.updateCount, doPostOrUpdates,
-                interleaveUpdate);
+                interleaveUpdate, null);
+
+        // repeat for example factory with indexted metadata
+        URI indexedMetadataFactoryUri = createIndexedMetadataFactoryService(this.host);
+        doThroughputSelfLinkQuery(indexedMetadataFactoryUri, this.updateCount, true, false,
+                this.serviceCount * this.updateCount);
+        doThroughputSelfLinkQuery(indexedMetadataFactoryUri, this.updateCount, false, true, null);
+
+        // now for the in memory index and the example services associated with it
+        doPostOrUpdates = true;
+        interleaveUpdate = false;
+        this.indexLink = ServiceUriPaths.CORE_IN_MEMORY_DOCUMENT_INDEX;
+        URI inMemExampleFactoryUri = UriUtils.buildUri(this.host,
+                InMemoryExampleService.FACTORY_LINK);
+        // notice that we also create K versions per link, for the mutable factory to
+        // better quantify query processing throughput when multiple versions per link are
+        // present in the index results
+        doThroughputSelfLinkQuery(inMemExampleFactoryUri, this.updateCount, doPostOrUpdates,
+                interleaveUpdate, null);
+        doPostOrUpdates = false;
+        interleaveUpdate = true;
+        doThroughputSelfLinkQuery(inMemExampleFactoryUri, this.updateCount, doPostOrUpdates,
+                interleaveUpdate, null);
     }
 
     private void doThroughputSelfLinkQuery(URI factoryUri, Integer updateCount,
-            boolean doPostOrUpdates,
-            boolean interleaveUpdates) throws Throwable {
+            boolean doPostOrUpdates, boolean interleaveUpdates, Long metadataUpdateCount)
+            throws Throwable {
         if (doPostOrUpdates) {
             doThroughputPostWithNoQueryResults(false, factoryUri);
         }
@@ -640,18 +1336,45 @@ public class TestLuceneDocumentIndexService {
             doUpdates(factoryUri, updateCount);
         }
 
+        if (metadataUpdateCount != null) {
+            this.host.waitFor("Metadata indexing failed to occur", () -> {
+                Map<String, ServiceStat> indexStats = this.host.getServiceStats(
+                        this.host.getDocumentIndexServiceUri());
+                ServiceStat stat = indexStats.get(
+                        LuceneDocumentIndexService.STAT_NAME_METADATA_INDEXING_UPDATE_COUNT
+                                + ServiceStats.STAT_NAME_SUFFIX_PER_DAY);
+                if (stat == null) {
+                    return false;
+                }
+                if (stat.accumulatedValue > metadataUpdateCount) {
+                    throw new IllegalStateException("Update count is " + stat.accumulatedValue);
+                }
+                return stat.accumulatedValue == metadataUpdateCount;
+            });
+        }
+
         double durationNanos = 0;
         long s = System.nanoTime();
         TestContext ctx = this.host.testCreate(this.iterationCount);
-        TestContext postCtx = this.host.testCreate(this.iterationCount % this.updatesPerQuery);
+        int postCount = this.iterationCount / this.updatesPerQuery;
+        if (postCount < 1) {
+            postCount = 1;
+        }
+
+        int posts = 0;
+        TestContext postCtx = this.host.testCreate(postCount);
         for (int i = 0; i < this.iterationCount; i++) {
             this.host.send(Operation.createGet(factoryUri).setCompletion(ctx.getCompletion()));
-            if (interleaveUpdates && i % this.updatesPerQuery == 0) {
+            if (posts < postCount && interleaveUpdates) {
+                if (postCount > 1 && i % this.updatesPerQuery != 0) {
+                    continue;
+                }
                 ExampleServiceState st = new ExampleServiceState();
                 st.name = "a-" + i;
                 this.host.send(Operation.createPost(factoryUri)
                         .setBody(st)
                         .setCompletion(postCtx.getCompletion()));
+                posts++;
             }
         }
         this.host.testWait(ctx);
@@ -751,9 +1474,8 @@ public class TestLuceneDocumentIndexService {
             String onDemandFactoryLink = OnDemandLoadFactoryService.create(h);
             createOnDemandLoadServices(h, onDemandFactoryLink);
 
-            List<URI> exampleURIs = new ArrayList<>();
-            Map<URI, ExampleServiceState> beforeState = verifyIdempotentServiceStartDeleteWithStats(
-                    h, exampleURIs);
+            Map<URI, ExampleServiceState> beforeState = verifyIdempotentServiceStartDeleteWithStats(h);
+            List<URI> exampleURIs = new ArrayList<>(beforeState.keySet());
 
             verifyInitialStatePost(h);
 
@@ -772,7 +1494,7 @@ public class TestLuceneDocumentIndexService {
                 h.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(250));
             }
 
-            if (!VerificationHost.restartStatefulHost(h)) {
+            if (!VerificationHost.restartStatefulHost(h, true)) {
                 this.host.log("Failed restart of host, aborting");
                 return;
             }
@@ -961,14 +1683,13 @@ public class TestLuceneDocumentIndexService {
         verifyFactoryStartedAndSynchronizedAfterNodeSynch(h, statName);
     }
 
-    private Map<URI, ExampleServiceState> verifyIdempotentServiceStartDeleteWithStats(
-            VerificationHost h, List<URI> exampleURIs) throws Throwable {
+    private Map<URI, ExampleServiceState> verifyIdempotentServiceStartDeleteWithStats(VerificationHost h) throws Throwable {
         int vc = 2;
         ExampleServiceState bodyBefore = new ExampleServiceState();
         bodyBefore.name = UUID.randomUUID().toString();
 
         // create example, IDEMPOTENT services
-        this.host.createExampleServices(h, this.serviceCount, exampleURIs, null);
+        List<URI> exampleURIs = this.host.createExampleServices(h, this.serviceCount, null);
 
         verifyCreateStatCount(exampleURIs, 1.0);
 
@@ -1098,25 +1819,15 @@ public class TestLuceneDocumentIndexService {
     private void verifyOnDemandLoad(ServiceHost h) throws Throwable {
         this.host.log("ODL verification starting");
         // make sure on demand load does not have INSTRUMENTATION enabled since that
-        // will prevent stop: services will be paused instead
+        // will prevent stop
         String onDemandFactoryLink = OnDemandLoadFactoryService.create(h);
         URI factoryUri = UriUtils.buildUri(h, onDemandFactoryLink);
         ServiceDocumentQueryResult rsp = this.host.getFactoryState(factoryUri);
-        // verify that for every factory child reported by the index, through the GET (query), the service is NOT
-        // started
+
         assertEquals(this.serviceCount, rsp.documentLinks.size());
         List<URI> childUris = new ArrayList<>();
         for (String childLink : rsp.documentLinks) {
-            assertTrue(h.getServiceStage(childLink) == null);
             childUris.add(UriUtils.buildUri(h, childLink));
-        }
-
-        // explicitly trigger synchronization and verify on demand load services did NOT start
-        this.host.log("Triggering synchronization to verify on demand load is not affected");
-        h.scheduleNodeGroupChangeMaintenance(ServiceUriPaths.DEFAULT_NODE_SELECTOR);
-        Thread.sleep(TimeUnit.MICROSECONDS.toMillis(h.getMaintenanceIntervalMicros()) * 2);
-        for (String childLink : rsp.documentLinks) {
-            assertTrue(h.getServiceStage(childLink) == null);
         }
 
         int startCount = MinimalTestService.HANDLE_START_COUNT.get();
@@ -1167,7 +1878,6 @@ public class TestLuceneDocumentIndexService {
 
         for (ExampleServiceState s : childStates.values()) {
             assertTrue(s.name != null);
-            assertTrue(s.name.startsWith(prefix));
         }
 
         // mark a service for expiration, a few seconds in the future
@@ -1264,34 +1974,7 @@ public class TestLuceneDocumentIndexService {
         }
     }
 
-    private void verifyOnDemandLoadDeleteOnUnknown(URI factoryUri) {
-        for (int i = 0; i < 10; i++) {
-            // do a DELETE for a completely unknown service, expect 200.
-            // The 200 status is to stay consistent with the behavior for
-            // non-ODL services.
-            String unknownServicePath = "unknown-" + this.host.nextUUID();
-            URI unknownServiceUri = UriUtils.extendUri(factoryUri, unknownServicePath);
-            Operation delete = Operation
-                    .createDelete(unknownServiceUri);
-            this.host.sendAndWaitExpectSuccess(delete);
-
-            ExampleServiceState body = new ExampleServiceState();
-            // now create the service, expect success
-            body.name = this.host.nextUUID();
-            body.documentSelfLink = unknownServicePath;
-            Operation post = Operation.createPost(factoryUri)
-                    .setBody(body);
-            this.host.sendAndWaitExpectSuccess(post);
-
-            // delete the "unknown" service
-            delete = Operation
-                    .createDelete(unknownServiceUri);
-            this.host.sendAndWaitExpectSuccess(delete);
-        }
-    }
-
-    void verifyOnDemandLoadWithPragmaQueueForService(URI factoryUri) throws Throwable {
-
+    private void verifyOnDemandLoadWithPragmaQueueForService(URI factoryUri) throws Throwable {
         Operation get;
         Operation post;
         ExampleServiceState body;
@@ -1339,6 +2022,32 @@ public class TestLuceneDocumentIndexService {
         this.host.testWait(ctx);
     }
 
+    private void verifyOnDemandLoadDeleteOnUnknown(URI factoryUri) {
+        for (int i = 0; i < 10; i++) {
+            // do a DELETE for a completely unknown service, expect 200.
+            // The 200 status is to stay consistent with the behavior for
+            // non-ODL services.
+            String unknownServicePath = "unknown-" + this.host.nextUUID();
+            URI unknownServiceUri = UriUtils.extendUri(factoryUri, unknownServicePath);
+            Operation delete = Operation
+                    .createDelete(unknownServiceUri);
+            this.host.sendAndWaitExpectSuccess(delete);
+
+            ExampleServiceState body = new ExampleServiceState();
+            // now create the service, expect success
+            body.name = this.host.nextUUID();
+            body.documentSelfLink = unknownServicePath;
+            Operation post = Operation.createPost(factoryUri)
+                    .setBody(body);
+            this.host.sendAndWaitExpectSuccess(post);
+
+            // delete the "unknown" service
+            delete = Operation
+                    .createDelete(unknownServiceUri);
+            this.host.sendAndWaitExpectSuccess(delete);
+        }
+    }
+
     private Map<URI, ExampleServiceState> updateUriMapWithNewPort(int port,
             Map<URI, ExampleServiceState> beforeState) {
         Map<URI, ExampleServiceState> updatedExampleMap = new HashMap<>();
@@ -1370,14 +2079,139 @@ public class TestLuceneDocumentIndexService {
                         }
                     }
                     if (count != beforeState.size()) {
-                        this.host.failIteration(new IllegalStateException("Unexpected result:"
-                                + Utils.toJsonHtml(r)));
+                        this.host.failIteration(new IllegalStateException(String.format(
+                                "Unexpected result: expected count: %d, actual count: %d",
+                                beforeState.size(), count)));
                     } else {
                         this.host.completeIteration();
                     }
                 });
         h.queryServiceUris(EnumSet.of(ServiceOption.FACTORY_ITEM), false, get);
         this.host.testWait();
+    }
+
+    @Test
+    public void accessODLAfterRemovedByMemoryPressure() throws Throwable {
+
+        LuceneDocumentIndexService indexService = new LuceneDocumentIndexService();
+        this.host = VerificationHost.create(0);
+        this.host.setDocumentIndexingService(indexService);
+        this.host.start();
+
+        this.host.startFactory(new ExampleODLService());
+        this.host.waitForServiceAvailable(ExampleODLService.FACTORY_LINK);
+
+        TestRequestSender sender = this.host.getTestRequestSender();
+
+        List<Operation> posts = new ArrayList<>();
+        for (int i = 0; i < 30; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = "foo-" + i;
+            state.documentSelfLink = state.name;
+
+            posts.add(Operation.createPost(this.host, ExampleODLService.FACTORY_LINK).setBody(state));
+        }
+        List<ExampleServiceState> states = sender.sendAndWait(posts, ExampleServiceState.class);
+
+        // perform deletes mimicking ODL stop
+        List<Operation> deletes = states.stream().map(state ->
+                Operation.createDelete(this.host, state.documentSelfLink)
+                        .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE)
+                        .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_FORWARDING)
+        ).collect(toList());
+        sender.sendAndWait(deletes);
+
+        // memory pressure to update document update info. set limit=1 so that all entries will be updated.
+        indexService.updateMapMemoryLimit = 1;
+        indexService.applyMemoryLimitToDocumentUpdateInfo();
+
+        // verify those removed ODL should be accessible
+        List<Operation> gets = states.stream()
+                .map(state -> Operation.createGet(this.host, state.documentSelfLink))
+                .collect(toList());
+        sender.sendAndWait(gets);
+
+    }
+
+    @Test
+    public void queryImmutableDocsAfterDeletion() throws Throwable {
+
+        LuceneDocumentIndexService indexService = new LuceneDocumentIndexService();
+        indexService.toggleOption(ServiceOption.INSTRUMENTATION, true);
+        this.host = VerificationHost.create(0);
+        this.host.setDocumentIndexingService(indexService);
+        this.host.start();
+
+        LuceneDocumentIndexService.setExpiredDocumentSearchThreshold(10);
+
+        this.host.startFactory(new ExampleImmutableService());
+        this.host.waitForServiceAvailable(ExampleImmutableService.FACTORY_LINK);
+
+        TestRequestSender sender = this.host.getTestRequestSender();
+
+        // create a set of immutable service documents
+        List<Operation> posts = new ArrayList<>();
+        for (int i = 0; i < this.serviceCount; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = "foo-" + i;
+            state.documentSelfLink = state.name;
+            state.documentExpirationTimeMicros = Utils.getNowMicrosUtc();
+
+            posts.add(Operation.createPost(this.host, ExampleImmutableService.FACTORY_LINK).setBody(state));
+        }
+        sender.sendAndWait(posts, ExampleServiceState.class);
+
+        // wait for the services to expire and removed from the index
+        this.host.waitFor("Timeout waiting for services to be deleted", () -> {
+            Map<String, ServiceStat> statMap = this.host.getServiceStats(
+                    this.host.getDocumentIndexServiceUri());
+            ServiceStat maintExpiredCount = statMap
+                    .get(LuceneDocumentIndexService.STAT_NAME_DOCUMENT_EXPIRATION_COUNT
+                            + ServiceStats.STAT_NAME_SUFFIX_PER_DAY);
+            if (maintExpiredCount != null && maintExpiredCount.latestValue >= this.serviceCount) {
+                return true;
+            }
+            return false;
+        });
+
+        QueryTask queryTask = QueryTask.Builder.createDirectTask()
+                .setQuery(QueryTask.Query.Builder.create()
+                        .addKindFieldClause(ExampleServiceState.class)
+                        .build())
+                .addOption(QueryOption.INCLUDE_ALL_VERSIONS)
+                .setResultLimit(10)
+                .build();
+
+        // invoke a new paginated query to create a searcher
+        this.host.waitFor("Timeout waiting for service to be deleted", () -> {
+            QueryTask returnTask = sender.sendPostAndWait(
+                    UriUtils.buildUri(this.host.getUri(), ServiceUriPaths.CORE_LOCAL_QUERY_TASKS),
+                    queryTask, QueryTask.class);
+            if (returnTask.results.nextPageLink == null) {
+                return true;
+            }
+            return false;
+        });
+
+        // create a set of new instances
+        posts = new ArrayList<>();
+        for (int i = 0; i < this.serviceCount; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = "new-foo-" + i;
+            state.documentSelfLink = state.name;
+            posts.add(Operation.createPost(this.host, ExampleImmutableService.FACTORY_LINK).setBody(state));
+        }
+        sender.sendAndWait(posts, ExampleServiceState.class);
+        // invoke another query; we should see the newly created documents
+        this.host.waitFor("Timeout waiting for service to be queried", () -> {
+            QueryTask returnTask = sender.sendPostAndWait(
+                    UriUtils.buildUri(this.host.getUri(), ServiceUriPaths.CORE_LOCAL_QUERY_TASKS),
+                    queryTask, QueryTask.class);
+            if (returnTask.results.nextPageLink != null) {
+                return true;
+            }
+            return false;
+        });
     }
 
     @Test
@@ -1542,16 +2376,37 @@ public class TestLuceneDocumentIndexService {
     @Test
     public void throughputPost() throws Throwable {
         if (this.serviceCacheClearIntervalSeconds == 0) {
-            // effectively disable ODL stop/start behavior while running throughput tests
+            // effectively disable stop/start behavior while running throughput tests
             this.serviceCacheClearIntervalSeconds = TimeUnit.MICROSECONDS.toSeconds(
                     ServiceHostState.DEFAULT_OPERATION_TIMEOUT_MICROS);
         }
         setUpHost(false);
+
+        // throughput test for immutable factory
         URI factoryUri = createImmutableFactoryService(this.host);
         prePopulateIndexWithServiceDocuments(factoryUri);
         verifyImmutableEagerServiceStop(factoryUri, this.documentCountAtStart);
-        doThroughputPost(true, factoryUri);
-        doThroughputPost(false, factoryUri);
+
+        boolean interleaveQueries = true;
+        long stVersion = doThroughputImmutablePost(0, interleaveQueries, factoryUri);
+        interleaveQueries = false;
+        doThroughputImmutablePost(stVersion, interleaveQueries, factoryUri);
+
+        // similar test but with regular, mutable, example factory
+        interleaveQueries = true;
+        factoryUri = UriUtils.buildFactoryUri(this.host, ExampleService.class);
+        doMultipleIterationsThroughputPost(interleaveQueries, this.iterationCount, factoryUri);
+
+        interleaveQueries = false;
+        doMultipleIterationsThroughputPost(interleaveQueries, this.iterationCount, factoryUri);
+
+        // similar test but with indexed metadata factory
+        factoryUri = createIndexedMetadataFactoryService(this.host);
+        interleaveQueries = true;
+        doMultipleIterationsThroughputPost(interleaveQueries, this.iterationCount, factoryUri);
+
+        interleaveQueries = false;
+        doMultipleIterationsThroughputPost(interleaveQueries, this.iterationCount, factoryUri);
     }
 
     @Test
@@ -1562,10 +2417,6 @@ public class TestLuceneDocumentIndexService {
                     ServiceHostState.DEFAULT_OPERATION_TIMEOUT_MICROS);
         }
 
-        // Set the document expiration limit to something high enough that we won't allow the index
-        // to grow in unbounded fashion.
-        LuceneDocumentIndexService.setExpiredDocumentSearchThreshold(100000);
-
         // This code path is designed to simulate POST and query throughput under heavy load,
         // processing queries which match many results.
         QueryTask queryTask = QueryTask.Builder.createDirectTask()
@@ -1575,6 +2426,11 @@ public class TestLuceneDocumentIndexService {
                 .build();
 
         setUpHost(false);
+
+        // Set the document expiration limit to something low enough that document expiration will
+        // be forced to run in batches.
+        LuceneDocumentIndexService.setExpiredDocumentSearchThreshold(10);
+
         URI factoryUri = createImmutableFactoryService(this.host);
         this.indexService.toggleOption(ServiceOption.INSTRUMENTATION, true);
         this.host.log("Starting throughout POST, expiration: %d", this.expirationSeconds);
@@ -1589,7 +2445,15 @@ public class TestLuceneDocumentIndexService {
         do {
             this.host.log("Starting POST test to %s, count:%d", factoryUri, this.serviceCount);
             doThroughputPost(true, factoryUri, expirationMicros, queryTask);
-            logQuerySingleStat();
+            Map<String, ServiceStat> stats = this.host.getServiceStats(
+                    this.host.getDocumentIndexServiceUri());
+            ServiceStat expiredDocumentStat = stats.get(
+                    LuceneDocumentIndexService.STAT_NAME_DOCUMENT_EXPIRATION_COUNT
+                            + ServiceStats.STAT_NAME_SUFFIX_PER_DAY);
+            if (expiredDocumentStat != null) {
+                this.host.log("Expired documents: %f", expiredDocumentStat.latestValue);
+            }
+
         } while (this.testDurationSeconds > 0 && Utils.getSystemNowMicrosUtc() < testExpiration);
 
         Map<String, ServiceStat> indexServiceStats = this.host.getServiceStats(
@@ -1626,15 +2490,41 @@ public class TestLuceneDocumentIndexService {
         this.host.log(stringBuilder.toString());
     }
 
-    private void doThroughputPost(boolean interleaveQueries, URI factoryUri) throws Throwable {
+    private long doThroughputImmutablePost(long statVersion, boolean interleaveQueries,
+            URI immutableFactoryUri)
+            throws Throwable {
         this.host.log("Starting throughput POST, query interleaving: %s", interleaveQueries);
 
-        double initialPauseCount = getHostPauseCount();
-        doMultipleIterationsThroughputPost(interleaveQueries, this.iterationCount, factoryUri);
-        factoryUri = UriUtils.buildFactoryUri(this.host, ExampleService.class);
-        doMultipleIterationsThroughputPost(interleaveQueries, this.iterationCount, factoryUri);
-        double finalPauseCount = getHostPauseCount();
-        assertTrue(initialPauseCount == finalPauseCount);
+        // the version cache stats are updated once per maintenance so we must make sure
+        // they are updated at least once initially, and then at least once after the
+        // test has run
+
+        this.host.waitFor("stat did not update", () -> {
+            ServiceStat st = getLuceneStat(
+                    LuceneDocumentIndexService.STAT_NAME_VERSION_CACHE_ENTRY_COUNT);
+            return st.version >= statVersion;
+        });
+        ServiceStat initialVersionStat = getLuceneStat(
+                LuceneDocumentIndexService.STAT_NAME_VERSION_CACHE_ENTRY_COUNT);
+
+        doMultipleIterationsThroughputPost(interleaveQueries, this.iterationCount,
+                immutableFactoryUri);
+        if (!this.enableInstrumentation && this.host.isStressTest()) {
+            return initialVersionStat.version;
+        }
+        this.host.waitFor("stat did not update", () -> {
+            ServiceStat st = getLuceneStat(
+                    LuceneDocumentIndexService.STAT_NAME_VERSION_CACHE_ENTRY_COUNT);
+            return st.version > initialVersionStat.version + 1;
+        });
+        ServiceStat afterVersionStat = getLuceneStat(
+                LuceneDocumentIndexService.STAT_NAME_VERSION_CACHE_ENTRY_COUNT);
+
+        if (afterVersionStat.latestValue > initialVersionStat.latestValue) {
+            throw new IllegalStateException("Immutable services caused version cache increase");
+        }
+
+        return afterVersionStat.version;
     }
 
     void prePopulateIndexWithServiceDocuments(URI factoryUri) throws Throwable {
@@ -1650,18 +2540,26 @@ public class TestLuceneDocumentIndexService {
     }
 
     void verifyImmutableEagerServiceStop(URI factoryUri, int expectedStopCount) {
-        double initialStopCount = getHostODLStopCount();
+        ServiceDocumentQueryResult res = this.host.getFactoryState(factoryUri);
         double initialMaintCount = getMaintCount();
-        this.host.waitFor("eager ODL stop not seen", () -> {
+
+        this.host.waitFor("eager Immutable stop not seen", () -> {
             double maintCount = getMaintCount();
             if (maintCount <= initialMaintCount + 1) {
                 return false;
             }
-            double stopCount = getHostODLStopCount();
-            this.host.log("Stop count: %f, initial: %f, maint count delta: %f",
+
+            int stopCount = 0;
+            for (String link : res.documentLinks) {
+                if (this.host.getServiceStage(link) == null) {
+                    stopCount++;
+                }
+            }
+
+            this.host.log("Stopped count: %d, maint count delta: %f",
                     stopCount,
-                    initialStopCount,
                     maintCount - initialMaintCount);
+
             boolean allStopped = stopCount >= expectedStopCount;
             if (!allStopped) {
                 return false;
@@ -1679,7 +2577,7 @@ public class TestLuceneDocumentIndexService {
     }
 
     URI createImmutableFactoryService(VerificationHost h) throws Throwable {
-        Service immutableFactory = ImmutableExampleService.createFactory();
+        Service immutableFactory = ExampleImmutableService.createFactory();
         immutableFactory = h.startServiceAndWait(immutableFactory,
                 "immutable-examples", null);
 
@@ -1687,12 +2585,20 @@ public class TestLuceneDocumentIndexService {
         return factoryUri;
     }
 
-    private double getHostPauseCount() {
-        return getMgmtStat(ServiceHostManagementService.STAT_NAME_PAUSE_COUNT);
+    URI createIndexedMetadataFactoryService(VerificationHost h) throws Throwable {
+        Service indexedMetadataFactory = IndexedMetadataExampleService.createFactory();
+        indexedMetadataFactory = h.startServiceAndWait(indexedMetadataFactory,
+                IndexedMetadataExampleService.FACTORY_LINK, null);
+        return indexedMetadataFactory.getUri();
     }
 
-    private double getHostODLStopCount() {
-        return getMgmtStat(ServiceHostManagementService.STAT_NAME_ODL_STOP_COUNT);
+    URI createInMemoryExampleServiceFactory(VerificationHost h) throws Throwable {
+        Service exampleFactory = InMemoryExampleService.createFactory();
+        exampleFactory = h.startServiceAndWait(exampleFactory,
+                InMemoryExampleService.FACTORY_LINK, null);
+
+        URI factoryUri = exampleFactory.getUri();
+        return factoryUri;
     }
 
     private double getMaintCount() {
@@ -1700,8 +2606,9 @@ public class TestLuceneDocumentIndexService {
     }
 
     private ServiceStat getLuceneStat(String name) {
+        URI indexUri = UriUtils.buildUri(this.host, this.indexLink);
         Map<String, ServiceStat> hostStats = this.host
-                .getServiceStats(this.host.getDocumentIndexServiceUri());
+                .getServiceStats(indexUri);
         ServiceStat st = hostStats.get(name);
         if (st == null) {
             return new ServiceStat();
@@ -1727,7 +2634,7 @@ public class TestLuceneDocumentIndexService {
                     ic, factoryUri, this.serviceCount);
 
             doThroughputPostWithNoQueryResults(interleaveQueries, factoryUri);
-            this.host.deleteOrStopAllChildServices(factoryUri, true);
+            this.host.deleteOrStopAllChildServices(factoryUri, true, true);
             logQuerySingleStat();
         }
     }
@@ -1845,7 +2752,7 @@ public class TestLuceneDocumentIndexService {
                         .addFieldClause(ExampleServiceState.FIELD_NAME_ID, "saffsdfs")
                         .build())
                 .build();
-
+        queryTask.indexLink = this.indexLink;
         doThroughputPost(interleaveQueries, factoryUri, null, queryTask);
     }
 
@@ -1951,7 +2858,7 @@ public class TestLuceneDocumentIndexService {
                                         "Request should have failed"));
                                 return;
                             }
-                            ServiceErrorResponse rsp = o.getBody(ServiceErrorResponse.class);
+                            ServiceErrorResponse rsp = o.getErrorResponseBody();
                             if (!rsp.message.contains("size limit")) {
                                 this.host.failIteration(new IllegalStateException(
                                         "Error message not expected"));
@@ -1974,6 +2881,79 @@ public class TestLuceneDocumentIndexService {
             }
         }
 
+    }
+
+    @Test
+    public void forcedIndexUpdateDuplicateVersionRemoval() throws Throwable {
+        setUpHost(false);
+        URI factoryUri = UriUtils.buildFactoryUri(this.host, ExampleService.class);
+        long originalExpMicros = Utils.getSystemNowMicrosUtc() + TimeUnit.MINUTES.toMicros(1);
+        Consumer<Operation> setBody = (o) -> {
+            ExampleServiceState body = new ExampleServiceState();
+            body.name = UUID.randomUUID().toString();
+            body.documentExpirationTimeMicros = originalExpMicros;
+            o.setBody(body);
+        };
+
+        long totalExpectedVersionCount = 3;
+        // create N documents with expiration set to future time
+        Map<URI, ExampleServiceState> services = this.host.doFactoryChildServiceStart(
+                null,
+                this.serviceCount, ExampleServiceState.class,
+                setBody, factoryUri);
+
+        // patch once, each service, to build up some version history
+        TestContext ctx = this.host.testCreate(services.size());
+        for (ExampleServiceState st : services.values()) {
+            st.counter = 1L;
+            Operation patch = Operation.createPatch(this.host, st.documentSelfLink)
+                    .setBody(st)
+                    .setCompletion(ctx.getCompletion());
+            this.host.send(patch);
+        }
+        this.host.testWait(ctx);
+
+        // now delete everything. We should now have 3 versions (0,1,2) per link
+        this.host.deleteAllChildServices(factoryUri);
+
+        // get all versions
+        Query kindQuery = Query.Builder.create()
+                .addKindFieldClause(ExampleServiceState.class)
+                .build();
+        QueryTask qt = QueryTask.Builder
+                .createDirectTask()
+                .addOption(QueryOption.INCLUDE_ALL_VERSIONS)
+                .addOption(QueryOption.EXPAND_CONTENT)
+                .setQuery(kindQuery)
+                .build();
+        this.host.createQueryTaskService(qt, false, true, qt, null);
+        this.host.log("Results before forced update: %s", Utils.toJsonHtml(qt.results));
+        assertEquals(services.size() * totalExpectedVersionCount, (long) qt.results.documentCount);
+
+        // now force a POST, which should create a new version history, per link,
+        // and a single new version per link, at zero
+        ctx = this.host.testCreate(services.size());
+        for (ExampleServiceState st : services.values()) {
+            st.counter = totalExpectedVersionCount + 1;
+            st.documentVersion = 0L;
+            Operation post = Operation.createPost(factoryUri)
+                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)
+                    .setBody(st)
+                    .setCompletion(ctx.getCompletion());
+            this.host.send(post);
+        }
+        this.host.testWait(ctx);
+
+        qt.results = null;
+
+        // query again, verify version history has been reset
+        this.host.createQueryTaskService(qt, false, true, qt, null);
+        this.host.log("Results after forced update: %s", Utils.toJsonHtml(qt.results));
+        assertEquals(services.size(), (long) qt.results.documentCount);
+
+        ServiceStat forcedDeleteCountSt = this.getLuceneStat(
+                LuceneDocumentIndexService.STAT_NAME_FORCED_UPDATE_DOCUMENT_DELETE_COUNT);
+        assertTrue(forcedDeleteCountSt.latestValue >= services.size());
     }
 
     /**
@@ -2060,19 +3040,38 @@ public class TestLuceneDocumentIndexService {
                 null,
                 this.serviceCount, ExampleServiceState.class,
                 setBodyReUseLinks, factoryUri);
-
-        this.host.waitFor("links versions did not expire", () -> {
-            QueryTask t = QueryTask.Builder
-                    .createDirectTask()
-                    .addOption(QueryOption.INCLUDE_ALL_VERSIONS)
-                    .addOption(QueryOption.INCLUDE_DELETED)
-                    .setQuery(
-                            Query.Builder.create().addKindFieldClause(ExampleServiceState.class)
-                                    .build()).build();
-            this.host.createQueryTaskService(t, false, true, t, null);
-            this.host.log("Results AFTER expiration: %s", Utils.toJsonHtml(t.results));
-            return 0 == t.results.documentLinks.size();
-        });
+        for (ExampleServiceState st : services.values()) {
+            this.host.waitFor("document not expired", () -> {
+                ProcessingStage stage = this.host.getServiceStage(st.documentSelfLink);
+                if (stage == null) {
+                    return true;
+                }
+                this.host.log("link: %s with stage: %s", st.documentSelfLink, stage.toString());
+                return false;
+            });
+        }
+        boolean forceIndexUpdate = false;
+        for (ExampleServiceState st : services.values()) {
+            st.documentExpirationTimeMicros = 0;
+            st.documentVersion = 0L;
+            Operation post = Operation.createPost(factoryUri)
+                    .setBody(st);
+            if (forceIndexUpdate) {
+                post.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE);
+            }
+            this.host.getTestRequestSender().sendAndWait(post);
+            //post or force index update in alternative
+            forceIndexUpdate = !forceIndexUpdate;
+        }
+        URI factoryExpandedUri = UriUtils.buildExpandLinksQueryUri(factoryUri);
+        Operation get = Operation.createGet(factoryExpandedUri);
+        ServiceDocumentQueryResult result =
+                this.host.getTestRequestSender().sendAndWait(get, ServiceDocumentQueryResult.class);
+        assertEquals(services.size(), (long) result.documentCount);
+        for (Object d : result.documents.values()) {
+            ExampleServiceState state = Utils.fromJson(d, ExampleServiceState.class);
+            assertEquals(0, state.documentVersion);
+        }
     }
 
     @Test
@@ -2214,8 +3213,7 @@ public class TestLuceneDocumentIndexService {
                             + ServiceStats.STAT_NAME_SUFFIX_PER_DAY);
 
             // in batch expiration mode, wait till at least first batch completes
-            if (servicesFinal.size() >
-                    LuceneDocumentIndexService.getExpiredDocumentSearchThreshold()) {
+            if (servicesFinal.size() > LuceneDocumentIndexService.getExpiredDocumentSearchThreshold()) {
                 if (expiredDocumentForcedMaintenanceCount == null) {
                     this.host.log("Forced maintenance count was null");
                     return false;
@@ -2518,12 +3516,12 @@ public class TestLuceneDocumentIndexService {
     @Test
     public void testBackupAndRestoreFromZipFile() throws Throwable {
         setUpHost(false);
+
         LuceneDocumentIndexService.BackupRequest b = new LuceneDocumentIndexService.BackupRequest();
         b.documentKind = LuceneDocumentIndexService.BackupRequest.KIND;
 
         int count = 1000;
-        URI factoryUri = UriUtils.buildUri(this.host,
-                ExampleService.FACTORY_LINK);
+        URI factoryUri = UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK);
 
         Map<URI, ExampleServiceState> exampleStates = this.host.doFactoryChildServiceStart(null,
                 count,
@@ -2534,48 +3532,25 @@ public class TestLuceneDocumentIndexService {
                     o.setBody(s);
                 }, factoryUri);
 
-        final URI[] backupFile = { null };
-        this.host.testStart(1);
-        this.host
-                .send(Operation
-                        .createPatch(
-                                UriUtils.buildUri(this.host, ServiceUriPaths.CORE_DOCUMENT_INDEX))
-                        .setBody(b)
-                        .setCompletion(
-                                (o, e) -> {
-                                    if (e != null) {
-                                        this.host.failIteration(e);
-                                        return;
-                                    }
+        Operation backupOp = Operation.createPatch(UriUtils.buildUri(this.host, ServiceUriPaths.CORE_DOCUMENT_INDEX))
+                .setBody(b);
 
-                                    LuceneDocumentIndexService.BackupResponse rsp = o
-                                            .getBody(LuceneDocumentIndexService.BackupResponse
-                                                    .class);
-                                    backupFile[0] = rsp.backupFile;
-                                    if (rsp.backupFile == null) {
-                                        this.host.failIteration(new IllegalStateException(
-                                                "no backup file"));
-                                    }
-                                    File f = new File(rsp.backupFile);
+        TestRequestSender sender = new TestRequestSender(this.host);
+        BackupResponse backupResponse = sender.sendAndWait(backupOp, BackupResponse.class);
 
-                                    if (!f.isFile()) {
-                                        this.host.failIteration(new IllegalArgumentException(
-                                                "not file"));
-                                    }
-                                    this.host.completeIteration();
-                                }));
-        this.host.testWait();
+        // destroy and spin up new host
+        this.host.tearDown();
+        this.host = null;
+        setUpHost(false);
+        sender = this.host.getTestRequestSender();
 
         LuceneDocumentIndexService.RestoreRequest r = new LuceneDocumentIndexService.RestoreRequest();
         r.documentKind = LuceneDocumentIndexService.RestoreRequest.KIND;
-        r.backupFile = backupFile[0];
+        r.backupFile = backupResponse.backupFile;
 
-        this.host.testStart(1);
-        this.host.send(Operation
-                .createPatch(UriUtils.buildUri(this.host, ServiceUriPaths.CORE_DOCUMENT_INDEX))
-                .setBody(r)
-                .setCompletion(this.host.getCompletion()));
-        this.host.testWait();
+        Operation restoreOp = Operation.createPatch(UriUtils.buildUri(this.host, ServiceUriPaths.CORE_DOCUMENT_INDEX))
+                .setBody(r);
+        sender.sendAndWait(restoreOp);
 
         // Check our documents are still there
         ServiceDocumentQueryResult queryResult = this.host
@@ -2753,30 +3728,67 @@ public class TestLuceneDocumentIndexService {
     }
 
     @Test
+    public void throughputPutSingleVersionRetention() throws Throwable {
+        long limit = this.retentionLimit;
+        long floor = this.retentionFloor;
+        try {
+            this.retentionFloor = 1L;
+            this.retentionLimit = 1L;
+            throughputPut();
+            this.host.waitFor("stat did not update", () -> {
+                ServiceStat indexDocSingleVersionCountSt = getLuceneStat(
+                        LuceneDocumentIndexService.STAT_NAME_VERSION_RETENTION_SERVICE_COUNT
+                                + ServiceStats.STAT_NAME_SUFFIX_PER_DAY);
+
+                return indexDocSingleVersionCountSt.latestValue >= this.serviceCount;
+            });
+        } finally {
+            this.retentionFloor = floor;
+            this.retentionLimit = limit;
+        }
+    }
+
+    public static class MinimalTestServiceWithIndexedMetadata extends MinimalTestService {
+
+        @Override
+        public ServiceDocument getDocumentTemplate() {
+            ServiceDocument template = super.getDocumentTemplate();
+            template.documentDescription.documentIndexingOptions =
+                    EnumSet.of(ServiceDocumentDescription.DocumentIndexingOption.INDEX_METADATA);
+            return template;
+        }
+    }
+
+    @Test
     public void throughputPut() throws Throwable {
+        int serviceThreshold = LuceneDocumentIndexService.getVersionRetentionServiceThreshold();
         long limit = MinimalTestService.getVersionRetentionLimit();
         long floor = MinimalTestService.getVersionRetentionFloor();
         try {
             setUpHost(false);
+            LuceneDocumentIndexService.setVersionRetentionServiceThreshold((int) this.serviceCount);
             MinimalTestService.setVersionRetentionLimit(this.retentionLimit);
             MinimalTestService.setVersionRetentionFloor(this.retentionFloor);
             if (this.host.isStressTest()) {
                 Utils.setTimeDriftThreshold(TimeUnit.HOURS.toMicros(1));
             }
-            doDurableServiceUpdate(Action.PUT, this.serviceCount, this.updateCount, null);
+            // Do throughput testing for basic, mutable services
+            doDurableServiceUpdate(Action.PUT, MinimalTestService.class,
+                    this.serviceCount, this.updateCount, null);
+            // Now do the same test for a similar service with indexed metadata
+            doDurableServiceUpdate(Action.PUT, MinimalTestServiceWithIndexedMetadata.class,
+                    this.serviceCount, this.updateCount, null);
         } finally {
             Utils.setTimeDriftThreshold(Utils.DEFAULT_TIME_DRIFT_THRESHOLD_MICROS);
             MinimalTestService.setVersionRetentionLimit(limit);
             MinimalTestService.setVersionRetentionFloor(floor);
+            LuceneDocumentIndexService.setVersionRetentionServiceThreshold(serviceThreshold);
         }
     }
 
-    private void doDurableServiceUpdate(Action action, long serviceCount,
-            Integer putCount,
-            EnumSet<ServiceOption> caps) throws Throwable {
+    private void doDurableServiceUpdate(Action action, Class<? extends Service> type,
+            long serviceCount, Integer putCount, EnumSet<ServiceOption> caps) throws Throwable {
         EnumSet<TestProperty> props = EnumSet.noneOf(TestProperty.class);
-
-        this.indexService.toggleOption(ServiceOption.INSTRUMENTATION, this.enableInstrumentation);
 
         if (caps == null) {
             caps = EnumSet.of(ServiceOption.PERSISTENCE);
@@ -2786,8 +3798,7 @@ public class TestLuceneDocumentIndexService {
             props.add(TestProperty.SINGLE_ITERATION);
         }
 
-        List<Service> services = this.host.doThroughputServiceStart(
-                serviceCount, MinimalTestService.class,
+        List<Service> services = this.host.doThroughputServiceStart(serviceCount, type,
                 this.host.buildMinimalTestState(), caps, null);
 
         long count = this.host.computeIterationsFromMemory(props, (int) serviceCount);
@@ -2811,8 +3822,7 @@ public class TestLuceneDocumentIndexService {
         }
         this.host.testWait();
 
-        int repeat = 5;
-        for (int i = 0; i < repeat; i++) {
+        for (int i = 0; i < this.iterationCount; i++) {
             double throughput = this.host.doServiceUpdates(action, count, props, services);
             this.testResults.getReport().all(TestResults.KEY_THROUGHPUT, throughput);
             logQuerySingleStat();
@@ -2826,13 +3836,80 @@ public class TestLuceneDocumentIndexService {
                 MinimalTestServiceState.class, services);
         int mismatchCount = 0;
         for (MinimalTestServiceState st : statesBeforeRestart.values()) {
-            if (st.documentVersion != count * repeat) {
+            if (st.documentVersion != count * this.iterationCount) {
                 this.host.log("Version mismatch for %s. Expected %d, got %d", st.documentSelfLink,
-                        count * repeat, st.documentVersion);
+                        count * this.iterationCount, st.documentVersion);
                 mismatchCount++;
             }
         }
         assertTrue(mismatchCount == 0);
+    }
+
+    @Test
+    public void testImplicitQueryPageSize() throws Throwable {
+        setUpHost(false);
+        this.indexService.toggleOption(ServiceOption.INSTRUMENTATION, true);
+        URI factoryUri = UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK);
+        Map<URI, ExampleServiceState> exampleStates = this.host.doFactoryChildServiceStart(
+                null, this.serviceCount, ExampleServiceState.class,
+                (o) -> {
+                    ExampleServiceState state = new ExampleServiceState();
+                    state.name = UUID.randomUUID().toString();
+                    o.setBody(state);
+                }, factoryUri);
+
+        Collection<URI> exampleUris = exampleStates.keySet();
+
+        this.host.testStart(this.serviceCount * this.updateCount);
+        for (int i = 0; i < this.updateCount; i++) {
+            for (URI u : exampleUris) {
+                ExampleServiceState state = new ExampleServiceState();
+                state.name = i + "";
+                this.host.send(Operation.createPut(u)
+                        .setBody(state)
+                        .setCompletion(this.host.getCompletion()));
+            }
+        }
+        this.host.testWait();
+
+        Query query = QueryTask.Query.Builder.create()
+                .addKindFieldClause(ExampleServiceState.class)
+                .build();
+
+        QueryTask.QuerySpecification querySpec = new QueryTask.QuerySpecification();
+        querySpec.query = query;
+        querySpec.options = EnumSet.of(QueryOption.TOP_RESULTS);
+        querySpec.resultLimit = (int) this.serviceCount;
+
+        // Sort by document version in order to ensure that the document index service sees all
+        // non-current document versions first.
+        querySpec.sortTerm = new QueryTask.QueryTerm();
+        querySpec.sortTerm.propertyName = "documentVersion";
+        querySpec.sortTerm.propertyType = ServiceDocumentDescription.TypeName.LONG;
+
+        int pageSize = LuceneDocumentIndexService.getImplicitQueryProcessingPageSize();
+        try {
+            // Without an implicit processing limit, we should see n passes per query
+            verifyImplicitQueryPageSize(querySpec, 1, (1 + this.updateCount));
+            // With an implicit processing limit, we should see one pass per query
+            int size = (int) (1 + this.serviceCount) * this.updateCount;
+            verifyImplicitQueryPageSize(querySpec, size, 1.0);
+        } finally {
+            LuceneDocumentIndexService.setImplicitQueryProcessingPageSize(pageSize);
+        }
+    }
+
+    private void verifyImplicitQueryPageSize(QueryTask.QuerySpecification querySpec, int pageSize,
+            double expectedIterationCount) {
+
+        LuceneDocumentIndexService.setImplicitQueryProcessingPageSize(pageSize);
+
+        QueryTask qt = QueryTask.create(querySpec).setDirect(true);
+        this.host.createQueryTaskService(qt, false, true, qt, null);
+        assertEquals(qt.results.documentLinks.size(), this.serviceCount);
+
+        ServiceStat st = getLuceneStat(LuceneDocumentIndexService.STAT_NAME_ITERATIONS_PER_QUERY);
+        assertEquals(st.latestValue, expectedIterationCount, 0.01);
     }
 
     /**
@@ -2879,6 +3956,223 @@ public class TestLuceneDocumentIndexService {
             assertEquals(r.counter, testState.counter);
         }
     }
+
+    @Test
+    public void offset() throws Throwable {
+        setUpHost(false);
+
+        TestRequestSender sender = this.host.getTestRequestSender();
+        List<Operation> ops = new ArrayList<>();
+        int count = 5;
+        for (int i = 0; i < count; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = "foo-" + i;
+            state.documentSelfLink = state.name;
+            ops.add(Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state));
+        }
+        sender.sendAndWait(ops);
+
+        QueryTask.Query query = QueryTask.Query.Builder.create()
+                .addKindFieldClause(ExampleServiceState.class)
+                .build();
+
+        QueryTask task = QueryTask.Builder.createDirectTask()
+                .setOffset(3)
+                .orderAscending(ExampleServiceState.FIELD_NAME_NAME, TypeName.STRING)
+                .setQuery(query)
+                .build();
+
+        Operation post = Operation.createPost(this.host, LocalQueryTaskFactoryService.SELF_LINK).setBody(task);
+        QueryTask result = sender.sendAndWait(post, QueryTask.class);
+
+        assertNotNull(result.results.documentLinks);
+        assertEquals(Long.valueOf(2), result.results.documentCount);
+        assertEquals(2, result.results.documentLinks.size());
+        assertEquals("/core/examples/foo-3", result.results.documentLinks.get(0));
+        assertEquals("/core/examples/foo-4", result.results.documentLinks.get(1));
+
+        // with offset=5 (same as number of documents)
+        task = QueryTask.Builder.createDirectTask()
+                .setOffset(5)
+                .orderAscending(ExampleServiceState.FIELD_NAME_NAME, TypeName.STRING)
+                .setQuery(query)
+                .build();
+
+        post = Operation.createPost(this.host, LocalQueryTaskFactoryService.SELF_LINK).setBody(task);
+        result = sender.sendAndWait(post, QueryTask.class);
+
+        assertEquals(Long.valueOf(0), result.results.documentCount);
+        assertNotNull(result.results.documentLinks);
+        assertEquals(result.results.documentLinks.size(), 0);
+
+        // with offset=7 (greater than actual document)
+        task = QueryTask.Builder.createDirectTask()
+                .setOffset(7)
+                .orderAscending(ExampleServiceState.FIELD_NAME_NAME, TypeName.STRING)
+                .setQuery(query)
+                .build();
+
+        post = Operation.createPost(this.host, LocalQueryTaskFactoryService.SELF_LINK).setBody(task);
+        result = sender.sendAndWait(post, QueryTask.class);
+
+        assertEquals(Long.valueOf(0), result.results.documentCount);
+        assertNotNull(result.results.documentLinks);
+        assertEquals(result.results.documentLinks.size(), 0);
+
+        // with TOP_RESULT
+        task = QueryTask.Builder.createDirectTask()
+                .setOffset(3)
+                .setResultLimit(10)
+                .addOption(QueryOption.TOP_RESULTS)
+                .orderAscending(ExampleServiceState.FIELD_NAME_NAME, TypeName.STRING)
+                .setQuery(query)
+                .build();
+
+        post = Operation.createPost(this.host, LocalQueryTaskFactoryService.SELF_LINK).setBody(task);
+        result = sender.sendAndWait(post, QueryTask.class);
+
+        assertEquals(Long.valueOf(2), result.results.documentCount);
+        assertEquals(2, result.results.documentLinks.size());
+        assertEquals("/core/examples/foo-3", result.results.documentLinks.get(0));
+        assertEquals("/core/examples/foo-4", result.results.documentLinks.get(1));
+
+
+        // with EXPAND_CONTENT
+        task = QueryTask.Builder.createDirectTask()
+                .setOffset(3)
+                .addOption(QueryOption.EXPAND_CONTENT)
+                .orderAscending(ExampleServiceState.FIELD_NAME_NAME, TypeName.STRING)
+                .setQuery(query)
+                .build();
+
+        post = Operation.createPost(this.host, LocalQueryTaskFactoryService.SELF_LINK).setBody(task);
+        result = sender.sendAndWait(post, QueryTask.class);
+
+        assertEquals(Long.valueOf(2), result.results.documentCount);
+        assertEquals(2, result.results.documentLinks.size());
+        assertEquals("/core/examples/foo-3", result.results.documentLinks.get(0));
+        assertEquals("/core/examples/foo-4", result.results.documentLinks.get(1));
+
+        assertNotNull(result.results.documents);
+        assertEquals(2, result.results.documents.size());
+        assertTrue(result.results.documents.containsKey("/core/examples/foo-3"));
+        assertTrue(result.results.documents.containsKey("/core/examples/foo-4"));
+    }
+
+    @Test
+    public void offsetWithResultLimit() throws Throwable {
+        setUpHost(false);
+
+        TestRequestSender sender = this.host.getTestRequestSender();
+        List<Operation> ops = new ArrayList<>();
+        int count = 5;
+        for (int i = 0; i < count; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = "foo-" + i;
+            state.documentSelfLink = state.name;
+            ops.add(Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state));
+        }
+        sender.sendAndWait(ops);
+
+        QueryTask.Query query = QueryTask.Query.Builder.create()
+                .addKindFieldClause(ExampleServiceState.class)
+                .build();
+
+        // with resultLimit
+        QueryTask task = QueryTask.Builder.createDirectTask()
+                .setOffset(1)
+                .setResultLimit(2)
+                .orderAscending(ExampleServiceState.FIELD_NAME_NAME, TypeName.STRING)
+                .setQuery(query)
+                .build();
+
+        Operation post = Operation.createPost(this.host, LocalQueryTaskFactoryService.SELF_LINK).setBody(task);
+        QueryTask result = sender.sendAndWait(post, QueryTask.class);
+
+        assertNotNull(result.results.nextPageLink);
+        QueryTask p1 = sender.sendAndWait(Operation.createGet(this.host, result.results.nextPageLink), QueryTask.class);
+
+        assertEquals(Long.valueOf(2), p1.results.documentCount);
+        assertEquals(2, p1.results.documentLinks.size());
+        assertEquals("/core/examples/foo-1", p1.results.documentLinks.get(0));
+        assertEquals("/core/examples/foo-2", p1.results.documentLinks.get(1));
+
+        assertNotNull(p1.results.nextPageLink);
+        QueryTask p2 = sender.sendAndWait(Operation.createGet(this.host, p1.results.nextPageLink), QueryTask.class);
+
+        assertEquals(Long.valueOf(2), p2.results.documentCount);
+        assertEquals(2, p2.results.documentLinks.size());
+        assertEquals("/core/examples/foo-3", p2.results.documentLinks.get(0));
+        assertEquals("/core/examples/foo-4", p2.results.documentLinks.get(1));
+
+        assertNull(p2.results.nextPageLink);
+
+        // offset is greater than the num of result
+        task = QueryTask.Builder.createDirectTask()
+                .setOffset(10)
+                .setResultLimit(2)
+                .orderAscending(ExampleServiceState.FIELD_NAME_NAME, TypeName.STRING)
+                .setQuery(query)
+                .build();
+
+        post = Operation.createPost(this.host, LocalQueryTaskFactoryService.SELF_LINK).setBody(task);
+        result = sender.sendAndWait(post, QueryTask.class);
+
+        assertNotNull(result.results.nextPageLink);
+        p1 = sender.sendAndWait(Operation.createGet(this.host, result.results.nextPageLink), QueryTask.class);
+
+        assertEquals(Long.valueOf(0), p1.results.documentCount);
+        assertNotNull(p1.results.documentLinks);
+        assertEquals(0, p1.results.documentLinks.size());
+
+        // first page docs are less than resultLimit
+        task = QueryTask.Builder.createDirectTask()
+                .setOffset(4)
+                .setResultLimit(2)
+                .orderAscending(ExampleServiceState.FIELD_NAME_NAME, TypeName.STRING)
+                .setQuery(query)
+                .build();
+
+        post = Operation.createPost(this.host, LocalQueryTaskFactoryService.SELF_LINK).setBody(task);
+        result = sender.sendAndWait(post, QueryTask.class);
+
+        assertNotNull(result.results.nextPageLink);
+        p1 = sender.sendAndWait(Operation.createGet(this.host, result.results.nextPageLink), QueryTask.class);
+
+        assertEquals(Long.valueOf(1), p1.results.documentCount);
+        assertEquals(1, p1.results.documentLinks.size());
+        assertEquals("/core/examples/foo-4", p1.results.documentLinks.get(0));
+        assertNull(p1.results.nextPageLink);
+
+        // second page docs are less than resultLimit
+        task = QueryTask.Builder.createDirectTask()
+                .setOffset(2)
+                .setResultLimit(2)
+                .orderAscending(ExampleServiceState.FIELD_NAME_NAME, TypeName.STRING)
+                .setQuery(query)
+                .build();
+
+        post = Operation.createPost(this.host, LocalQueryTaskFactoryService.SELF_LINK).setBody(task);
+        result = sender.sendAndWait(post, QueryTask.class);
+
+        assertNotNull(result.results.nextPageLink);
+        p1 = sender.sendAndWait(Operation.createGet(this.host, result.results.nextPageLink), QueryTask.class);
+
+        assertEquals(Long.valueOf(2), p1.results.documentCount);
+        assertEquals(2, p1.results.documentLinks.size());
+        assertEquals("/core/examples/foo-2", p1.results.documentLinks.get(0));
+        assertEquals("/core/examples/foo-3", p1.results.documentLinks.get(1));
+
+        assertNotNull(p1.results.nextPageLink);
+        p2 = sender.sendAndWait(Operation.createGet(this.host, p1.results.nextPageLink), QueryTask.class);
+
+        assertEquals(Long.valueOf(1), p2.results.documentCount);
+        assertEquals(1, p2.results.documentLinks.size());
+        assertEquals("/core/examples/foo-4", p2.results.documentLinks.get(0));
+
+        assertNull(p2.results.nextPageLink);
+    }
+
 
     private HashMap<String, ExampleServiceState> loadState(URL exampleBodies) throws Throwable {
         File exampleServiceBodiesFile = new File(exampleBodies.toURI());
@@ -2946,6 +4240,51 @@ public class TestLuceneDocumentIndexService {
         FileUtils.copyFiles(new File(pathToOldLuceneDir.toURI()), curLuceneIndexPath.toFile());
     }
 
+    @Test
+    public void commitNotification() throws Throwable {
+
+        // To test commit callback, first, start up the host. This will generate some initial data in index.
+        setUpHost(false);
+
+        // Then, restart the host with same port to reuse the sandbox.
+        // Since it reuses previous sandbox, there will be nothing to commit in lucene.
+        // Therefore, until test populates data, commit callback will NOT be called.
+        this.host.stop();
+        this.host.setPort(0);
+        this.host.start();
+        this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
+
+        AtomicBoolean isNotified = new AtomicBoolean(false);
+        AtomicLong sequenceNumber = new AtomicLong();
+
+        Operation subscribe = Operation.createPost(UriUtils.buildUri(this.host, ServiceUriPaths.CORE_DOCUMENT_INDEX))
+                .setReferer(this.host.getUri());
+
+        this.host.startSubscriptionService(subscribe, notifyOp -> {
+            isNotified.set(true);
+            sequenceNumber.set(notifyOp.getBody(CommitInfo.class).sequenceNumber);
+            notifyOp.complete();
+        });
+
+        assertFalse("callback should not be called before populating data.(nothing to commit)", isNotified.get());
+
+        // populate data
+        TestRequestSender sender = this.host.getTestRequestSender();
+        List<Operation> posts = new ArrayList<>();
+        for (int i = 0; i < 30; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = "foo-" + i;
+            posts.add(Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state));
+        }
+        sender.sendAndWait(posts, ExampleServiceState.class);
+
+
+        // verify commit has performed
+        this.host.waitFor("commit callback should be called", isNotified::get);
+        assertTrue("Something should be committed", sequenceNumber.get() > -1);
+    }
+
+
     private void logQuerySingleStat() {
         Map<String, ServiceStat> stats = this.host
                 .getServiceStats(this.host.getDocumentIndexServiceUri());
@@ -2965,4 +4304,601 @@ public class TestLuceneDocumentIndexService {
         }
         return state;
     }
+
+    @Test
+    public void testDocumentMetadataIndexing() throws Throwable {
+        LuceneDocumentIndexService.setMetadataUpdateMaxQueueDepth((int) this.serviceCount / 2);
+        try {
+            doDocumentMetadataIndexing();
+        } finally {
+            LuceneDocumentIndexService.setMetadataUpdateMaxQueueDepth(
+                    LuceneDocumentIndexService.DEFAULT_METADATA_UPDATE_MAX_QUEUE_DEPTH);
+        }
+    }
+
+    private void doDocumentMetadataIndexing() throws Throwable {
+        setUpHost(false);
+        URI indexedMetadataFactoryUri = createIndexedMetadataFactoryService(this.host);
+
+        ExampleServiceState serviceState = new ExampleServiceState();
+        serviceState.name = "name";
+
+        Map<URI, ExampleServiceState> services = this.host.doFactoryChildServiceStart(null,
+                this.serviceCount, ExampleServiceState.class,
+                (o) -> o.setBody(serviceState),
+                indexedMetadataFactoryUri);
+
+        for (int i = 0; i < this.updateCount; i++) {
+            serviceState.counter = (long) i;
+            for (URI serviceUri : services.keySet()) {
+                Operation patch = Operation.createPatch(serviceUri).setBody(serviceState);
+                this.host.send(patch);
+            }
+        }
+
+        this.host.waitFor("Metadata indexing failed to occur", () -> {
+            Map<String, ServiceStat> indexStats = this.host.getServiceStats(
+                    this.host.getDocumentIndexServiceUri());
+            ServiceStat stat = indexStats.get(
+                    LuceneDocumentIndexService.STAT_NAME_METADATA_INDEXING_UPDATE_COUNT
+                            + ServiceStats.STAT_NAME_SUFFIX_PER_DAY);
+            if (stat == null) {
+                return false;
+            }
+
+            return (stat.accumulatedValue == this.updateCount * this.serviceCount);
+        });
+
+        QueryTask queryTask = QueryTask.Builder.create()
+                .setQuery(QueryTask.Query.Builder.create()
+                        .addKindFieldClause(ExampleServiceState.class)
+                        .build())
+                .addOption(QueryOption.INDEXED_METADATA)
+                .setResultLimit((int) this.serviceCount)
+                .build();
+
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+        assertNotNull(queryTask.results.nextPageLink);
+
+        QueryTask result = this.host.getServiceState(null, QueryTask.class,
+                UriUtils.buildUri(this.host, queryTask.results.nextPageLink));
+        assertEquals(this.serviceCount, (long) result.results.documentCount);
+        assertNull(result.results.nextPageLink);
+
+        Map<String, ServiceStat> indexStats = this.host.getServiceStats(
+                this.host.getDocumentIndexServiceUri());
+        ServiceStat iterationCountStat = indexStats.get(
+                LuceneDocumentIndexService.STAT_NAME_ITERATIONS_PER_QUERY);
+        assertEquals(1.0, iterationCountStat.latestValue, 0.01);
+
+        for (URI serviceUri : services.keySet()) {
+            Operation delete = Operation.createDelete(serviceUri);
+            this.host.send(delete);
+        }
+
+        this.host.waitFor("Metadata deletion failed to occur", () -> {
+            Map<String, ServiceStat> stats = this.host.getServiceStats(
+                    this.host.getDocumentIndexServiceUri());
+            ServiceStat stat = stats.get(
+                    LuceneDocumentIndexService.STAT_NAME_METADATA_INDEXING_UPDATE_COUNT
+                            + ServiceStats.STAT_NAME_SUFFIX_PER_DAY);
+            if (stat == null) {
+                return false;
+            }
+
+            // Account for the initial POST and the final DELETE.
+            return (stat.accumulatedValue == (2 + this.updateCount) * this.serviceCount);
+        });
+    }
+
+    @Test
+    public void testMetadataIndexingWithForcedIndexUpdate() throws Throwable {
+        for (int i = 0; i < this.iterationCount; i++) {
+            tearDown();
+            doMetadataIndexingWithForcedIndexUpdate();
+        }
+    }
+
+    private void doMetadataIndexingWithForcedIndexUpdate() throws Throwable {
+        setUpHost(false);
+        URI indexedMetadataFactoryUri = createIndexedMetadataFactoryService(this.host);
+
+        ExampleServiceState serviceState = new ExampleServiceState();
+        serviceState.name = "name";
+
+        Map<URI, ExampleServiceState> services = this.host.doFactoryChildServiceStart(null,
+                this.serviceCount, ExampleServiceState.class,
+                (o) -> o.setBody(serviceState),
+                indexedMetadataFactoryUri);
+
+        TestContext ctx = this.host.testCreate(services.size() * this.updateCount);
+        for (int i = 0; i < this.updateCount; i++) {
+            serviceState.counter = (long) i;
+            for (URI serviceUri : services.keySet()) {
+                Operation patch = Operation.createPatch(serviceUri).setBody(serviceState)
+                        .setCompletion(ctx.getCompletion());
+                this.host.send(patch);
+            }
+        }
+        this.host.testWait(ctx);
+
+        ctx = this.host.testCreate(services.size());
+        for (URI serviceUri : services.keySet()) {
+            Operation delete = Operation.createDelete(serviceUri)
+                    .setCompletion(ctx.getCompletion());
+            this.host.send(delete);
+        }
+        this.host.testWait(ctx);
+
+        serviceState.name = "nameWithForcedIndexUpdate";
+
+        ctx = this.host.testCreate(services.size());
+        for (ExampleServiceState state : services.values()) {
+            serviceState.documentSelfLink = state.documentSelfLink;
+            Operation post = Operation.createPost(indexedMetadataFactoryUri)
+                    .setBody(serviceState)
+                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)
+                    .setCompletion(ctx.getCompletion());
+            this.host.send(post);
+        }
+        this.host.testWait(ctx);
+
+        QueryTask queryTask = QueryTask.Builder.createDirectTask()
+                .setQuery(Query.Builder.create()
+                        .addKindFieldClause(ExampleServiceState.class)
+                        .build())
+                .addOption(QueryOption.EXPAND_CONTENT)
+                .build();
+
+        this.host.createQueryTaskService(queryTask, false, true, queryTask, null);
+        assertEquals(services.size(), queryTask.results.documentLinks.size());
+
+        for (Entry<String, Object> entry : queryTask.results.documents.entrySet()) {
+            URI selfUri = UriUtils.buildUri(this.host, entry.getKey());
+            assertTrue(services.containsKey(selfUri));
+            ExampleServiceState state = Utils.fromJson(entry.getValue(),
+                    ExampleServiceState.class);
+            assertEquals("nameWithForcedIndexUpdate", state.name);
+        }
+    }
+
+    @Test
+    public void authVisibilityOnRemoteGetOperation() throws Throwable {
+        setUpHost(true);
+
+        // create following users with following authorizations:
+        //   foo:  /core/examples/doc-foo
+        //   bar:  /core/examples/doc-bar
+        //   baz:  ExampleServiceState kind
+
+        TestContext waitContext = new TestContext(3, Duration.ofSeconds(30));
+        String usernameFoo = "foo@vmware.com";
+        String usernameBar = "bar@vmware.com";
+        String usernameBaz = "baz@vmware.com";
+        String selfLinkDocFoo = "/doc-foo";
+        String selfLinkDocBar = "/doc-bar";
+        AuthorizationSetupHelper fooBuilder = AuthorizationSetupHelper.create()
+                .setHost(this.host)
+                .setUserSelfLink(usernameFoo)
+                .setUserEmail(usernameFoo)
+                .setUserPassword("password")
+                .setDocumentLink(ExampleService.FACTORY_LINK + selfLinkDocFoo)
+                .setCompletion(waitContext.getCompletion());
+        AuthorizationSetupHelper barBuilder = AuthorizationSetupHelper.create()
+                .setHost(this.host)
+                .setUserSelfLink(usernameBar)
+                .setUserEmail(usernameBar)
+                .setUserPassword("password")
+                .setDocumentLink(ExampleService.FACTORY_LINK + selfLinkDocBar)
+                .setCompletion(waitContext.getCompletion());
+        AuthorizationSetupHelper bazBuilder = AuthorizationSetupHelper.create()
+                .setHost(this.host)
+                .setUserSelfLink(usernameBaz)
+                .setUserEmail(usernameBaz)
+                .setUserPassword("password")
+                // since setDocumentKind() also checks the FIELD_NAME_AUTH_PRINCIPAL_LINK, here create a custom query
+                // that ONLY check the document kind.
+                .setResourceQuery(
+                        Query.Builder.create()
+                                .addFieldClause(ServiceDocument.FIELD_NAME_KIND, Utils.buildKind(ExampleServiceState.class))
+                                .build()
+                )
+                .setCompletion(waitContext.getCompletion());
+
+        AuthTestUtils.setSystemAuthorizationContext(this.host);
+        fooBuilder.start();
+        barBuilder.start();
+        bazBuilder.start();
+        AuthTestUtils.resetAuthorizationContext(this.host);
+
+        waitContext.await();
+
+        TestRequestSender sender = new TestRequestSender(this.host);
+
+        // login as foo@vmware.com
+        String fooAuthToken = AuthTestUtils.loginAndSetToken(this.host, usernameFoo, "password");
+
+        // create /core/examples/foo-doc
+        ExampleServiceState docFoo = new ExampleServiceState();
+        docFoo.name = "FOO";
+        docFoo.documentSelfLink = selfLinkDocFoo;
+        Operation post = Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(docFoo);
+        sender.sendAndWait(post);
+
+        // login as bar@vmware.com
+        String barAuthToken = AuthTestUtils.loginAndSetToken(this.host, usernameBar, "password");
+
+        // create /core/examples/bar-doc
+        ExampleServiceState docBar = new ExampleServiceState();
+        docBar.name = "BAR";
+        docBar.documentSelfLink = selfLinkDocBar;
+        post = Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(docBar);
+        sender.sendAndWait(post);
+
+        String pathToDocFoo = UriUtils.buildUriPath(ExampleService.FACTORY_LINK, selfLinkDocFoo);
+        String pathToDocBar = UriUtils.buildUriPath(ExampleService.FACTORY_LINK, selfLinkDocBar);
+        FailureResponse failureResponse;
+        ServiceDocumentQueryResult factoryResult;
+
+        //  behave as foo@vmware.com
+        TestRequestSender.setAuthToken(fooAuthToken);
+
+        // verify direct document get
+        sender.sendAndWait(Operation.createGet(this.host, pathToDocFoo).forceRemote());
+        failureResponse = sender.sendAndWaitFailure(Operation.createGet(this.host, pathToDocBar).forceRemote());
+        assertEquals(Operation.STATUS_CODE_FORBIDDEN, failureResponse.op.getStatusCode());
+
+        // verify factory get only returns authorized list of docs
+        Operation factoryGet = Operation.createGet(this.host, ExampleService.FACTORY_LINK);
+        factoryResult = sender.sendAndWait(factoryGet, ServiceDocumentQueryResult.class);
+        assertEquals(Long.valueOf(1), factoryResult.documentCount);
+        assertEquals(pathToDocFoo, factoryResult.documentLinks.get(0));
+
+
+        //  behave as bar@vmware.com
+        TestRequestSender.setAuthToken(barAuthToken);
+
+        // verify direct document get
+        failureResponse = sender.sendAndWaitFailure(Operation.createGet(this.host, pathToDocFoo).forceRemote());
+        assertEquals(Operation.STATUS_CODE_FORBIDDEN, failureResponse.op.getStatusCode());
+        sender.sendAndWait(Operation.createGet(this.host, pathToDocBar).forceRemote());
+
+        // verify factory get only returns authorized list of docs
+        factoryGet = Operation.createGet(this.host, ExampleService.FACTORY_LINK);
+        factoryResult = sender.sendAndWait(factoryGet, ServiceDocumentQueryResult.class);
+        assertEquals(Long.valueOf(1), factoryResult.documentCount);
+        assertEquals(pathToDocBar, factoryResult.documentLinks.get(0));
+
+
+        // login as baz@vmware.com
+        AuthTestUtils.loginAndSetToken(this.host, usernameBaz, "password");
+
+        // verify direct document get
+        sender.sendAndWait(Operation.createGet(this.host, pathToDocFoo).forceRemote());
+        sender.sendAndWait(Operation.createGet(this.host, pathToDocBar).forceRemote());
+
+        // verify factory get
+        factoryGet = Operation.createGet(this.host, ExampleService.FACTORY_LINK);
+        factoryResult = sender.sendAndWait(factoryGet, ServiceDocumentQueryResult.class);
+        assertEquals(Long.valueOf(2), factoryResult.documentCount);
+        assertTrue(pathToDocFoo + " should be visible", factoryResult.documentLinks.contains(pathToDocFoo));
+        assertTrue(pathToDocBar + " should be visible", factoryResult.documentLinks.contains(pathToDocBar));
+    }
+
+    @Test
+    public void authCheckWithFieldOnChildDocument() throws Throwable {
+        setUpHost(true);
+
+        int nodeCount = 2;
+
+        if (this.host.getInProcessHostMap().isEmpty()) {
+            this.host.setPeerSynchronizationEnabled(true);
+            this.host.setUpPeerHosts(nodeCount);
+            this.host.joinNodesAndVerifyConvergence(nodeCount, true);
+            this.host.setNodeGroupQuorum(nodeCount);
+        }
+
+        List<VerificationHost> hosts = new ArrayList<>(this.host.getInProcessHostMap().values());
+        Map<String, VerificationHost> hostById = hosts.stream().collect(toMap(ServiceHost::getId, identity()));
+        VerificationHost host = this.host.getPeerHost();
+
+        TestContext waitContext = new TestContext(1, Duration.ofSeconds(30));
+        String usernameFoo = "foo@vmware.com";
+
+        // create a user that uses document field that is NOT a part of ServiceDocument itself for auth
+        AuthorizationSetupHelper fooBuilder = AuthorizationSetupHelper.create()
+                .setHost(host)
+                .setUserSelfLink(usernameFoo)
+                .setUserEmail(usernameFoo)
+                .setUserPassword("password")
+                .setResourceQuery(
+                        // check document field in ExampleServiceState
+                        Query.Builder.create()
+                                .addFieldClause(ExampleServiceState.FIELD_NAME_NAME, "foo")
+                                .build()
+                )
+                .setCompletion(waitContext.getCompletion());
+
+        AuthTestUtils.setSystemAuthorizationContext(host);
+        fooBuilder.start();
+        AuthTestUtils.resetAuthorizationContext(host);
+
+        waitContext.await();
+
+        TestRequestSender sender = new TestRequestSender(host);
+
+        // login as foo@vmware.com
+        AuthTestUtils.loginAndSetToken(host, usernameFoo, "password");
+
+        String fooPath = UriUtils.buildUriPath(ExampleService.FACTORY_LINK, "foo");
+        ExampleServiceState docFoo = new ExampleServiceState();
+        docFoo.name = "foo";
+        docFoo.documentSelfLink = fooPath;
+
+        Operation post = Operation.createPost(host, ExampleService.FACTORY_LINK).setBody(docFoo);
+        sender.sendAndWait(post);
+
+
+        // verify direct document get
+        ExampleServiceState getResult = sender.sendAndWait(Operation.createGet(host, fooPath), ExampleServiceState.class);
+        hostById.remove(getResult.documentOwner);
+        VerificationHost nonOwnerHost = hostById.values().stream().findFirst().get();
+
+        Operation result = sender.sendAndWait(Operation.createDelete(nonOwnerHost, fooPath).forceRemote());
+        assertEquals(Operation.STATUS_CODE_OK, result.getStatusCode());
+
+        FailureResponse failure = sender.sendAndWaitFailure(Operation.createGet(nonOwnerHost, fooPath).forceRemote());
+        assertEquals(Operation.STATUS_CODE_NOT_FOUND, failure.op.getStatusCode());
+    }
+
+
+    @Test
+    public void paginatedSearcherSharingMixedWithNormalAndSingleUse() throws Throwable {
+        setUpHost(false);
+        this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
+
+        TestRequestSender sender = this.host.getTestRequestSender();
+
+
+        // create example services
+        List<Operation> posts = new ArrayList<>();
+        for (int i = 0; i < 30; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = "foo-" + i;
+            posts.add(Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state));
+        }
+        sender.sendAndWait(posts, ExampleServiceState.class);
+
+        // create normal paginated query
+        QueryTask task = QueryTask.Builder.createDirectTask()
+                .setQuery(Query.Builder.create().addKindFieldClause(ExampleServiceState.class).build())
+                .setResultLimit(2)
+                .build();
+        Operation post = Operation.createPost(this.host, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS).setBody(task);
+        sender.sendAndWait(post, QueryTask.class);
+
+        List<PaginatedSearcherInfo> infoList = this.indexService.getPaginatedSearcherInfos();
+        assertEquals(1, infoList.size());
+        assertEquals(1, infoList.get(0).refCount);
+        assertEquals(1, getPaginatedSearcherUpdateCountStat());
+
+
+        int numOfSingleUseQueries = 10;
+
+        // perform multiple SINGLE_USE queries
+        List<QueryTask> pages = new ArrayList<>();
+        for (int i = 0; i < numOfSingleUseQueries; i++) {
+            task = QueryTask.Builder.createDirectTask()
+                    .setQuery(Query.Builder.create().addKindFieldClause(ExampleServiceState.class).build())
+                    .addOption(SINGLE_USE)
+                    .setResultLimit(2)
+                    .build();
+            post = Operation.createPost(this.host, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS).setBody(task);
+            QueryTask result = sender.sendAndWait(post, QueryTask.class);
+            pages.add(result);
+        }
+
+        infoList = this.indexService.getPaginatedSearcherInfos();
+        assertEquals("existing searcher should be reused", 1, infoList.size());
+        assertEquals("shared by all queries", 1 + numOfSingleUseQueries, infoList.get(0).refCount);
+        assertEquals(1, getPaginatedSearcherUpdateCountStat());
+
+        // Go through single use query page results
+        for (QueryTask page : pages) {
+            String nextPageLink = page.results.nextPageLink;
+            while (nextPageLink != null) {
+                page = sender.sendAndWait(Operation.createGet(this.host, nextPageLink), QueryTask.class);
+                nextPageLink = page.results.nextPageLink;
+            }
+        }
+
+        this.host.waitFor("Wait for single-use queries decrement ref count", () -> {
+            List<PaginatedSearcherInfo> list = this.indexService.getPaginatedSearcherInfos();
+            assertEquals(1, list.size());
+            return list.get(0).refCount == 1;
+        });
+
+
+        // Update a document
+        ExampleServiceState state = new ExampleServiceState();
+        state.name = "foo-update";
+        sender.sendAndWait(Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state));
+
+
+        pages.clear();
+        // Perform multiple SINGLE_USE search again
+        for (int i = 0; i < numOfSingleUseQueries; i++) {
+            task = QueryTask.Builder.createDirectTask()
+                    .setQuery(Query.Builder.create().addKindFieldClause(ExampleServiceState.class).build())
+                    .addOption(SINGLE_USE)
+                    .setResultLimit(2)
+                    .build();
+            post = Operation.createPost(this.host, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS).setBody(task);
+            QueryTask result = sender.sendAndWait(post, QueryTask.class);
+            pages.add(result);
+        }
+
+        infoList = this.indexService.getPaginatedSearcherInfos();
+        assertEquals("new searcher should be created",2, infoList.size());
+        assertThat(infoList).extracting(info -> info.refCount).contains(1, numOfSingleUseQueries);
+        assertEquals(2, getPaginatedSearcherUpdateCountStat());
+
+        int searcherDeleteCount = getPaginatedSearcherForceDeletionCountStat();
+
+        // Go through single use query page results
+        for (QueryTask page : pages) {
+            String nextPageLink = page.results.nextPageLink;
+            while (nextPageLink != null) {
+                page = sender.sendAndWait(Operation.createGet(this.host, nextPageLink), QueryTask.class);
+                nextPageLink = page.results.nextPageLink;
+            }
+        }
+
+        this.host.waitFor("Wait searcher get closed", () -> {
+            return searcherDeleteCount < getPaginatedSearcherForceDeletionCountStat();
+        });
+        infoList = this.indexService.getPaginatedSearcherInfos();
+        assertEquals(1, infoList.size());
+
+    }
+
+    @Test
+    public void paginatedSearcherSharingExpiration() throws Throwable {
+        setUpHost(false);
+        this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
+
+        TestRequestSender sender = this.host.getTestRequestSender();
+
+        // create example services
+        List<Operation> posts = new ArrayList<>();
+        for (int i = 0; i < 30; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = "foo-" + i;
+            posts.add(Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state));
+        }
+        sender.sendAndWait(posts, ExampleServiceState.class);
+
+
+        long now = Utils.getNowMicrosUtc();
+        long nowToOneHour = now + TimeUnit.HOURS.toMicros(1);
+        long nowToTwoHour = now + TimeUnit.HOURS.toMicros(2);
+        long nowToThreeHour = now + TimeUnit.HOURS.toMicros(3);
+
+        // create paginated query with 2-hour expiration
+        QueryTask task = QueryTask.Builder.createDirectTask()
+                .setQuery(Query.Builder.create().addKindFieldClause(ExampleServiceState.class).build())
+                .setResultLimit(2)
+                .build();
+        task.documentExpirationTimeMicros = nowToTwoHour;
+        Operation post = Operation.createPost(this.host, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS).setBody(task);
+        sender.sendAndWait(post, QueryTask.class);
+
+        List<PaginatedSearcherInfo> infoList = this.indexService.getPaginatedSearcherInfos();
+        assertEquals(1, infoList.size());
+        assertEquals(1, infoList.get(0).refCount);
+        assertEquals(nowToTwoHour, infoList.get(0).expirationTimeMicros - DEFAULT_PAGINATED_SEARCHER_EXPIRATION_DELAY);
+        assertEquals(1, getPaginatedSearcherUpdateCountStat());
+
+
+        // create paginated query with 1-hour(shorter) expiration
+        task = QueryTask.Builder.createDirectTask()
+                .setQuery(Query.Builder.create().addKindFieldClause(ExampleServiceState.class).build())
+                .setResultLimit(2)
+                .build();
+        task.documentExpirationTimeMicros = nowToOneHour;
+        post = Operation.createPost(this.host, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS).setBody(task);
+        sender.sendAndWait(post, QueryTask.class);
+
+        infoList = this.indexService.getPaginatedSearcherInfos();
+        assertEquals(1, infoList.size());
+        assertEquals(2, infoList.get(0).refCount);
+        assertEquals("expiration should still be 2-hours",
+                nowToTwoHour, infoList.get(0).expirationTimeMicros - DEFAULT_PAGINATED_SEARCHER_EXPIRATION_DELAY);
+
+        assertEquals(1, getPaginatedSearcherUpdateCountStat());
+
+        // create paginated query with 3-hour(longer) expiration
+        task = QueryTask.Builder.createDirectTask()
+                .setQuery(Query.Builder.create().addKindFieldClause(ExampleServiceState.class).build())
+                .setResultLimit(2)
+                .build();
+        task.documentExpirationTimeMicros = nowToThreeHour;
+        post = Operation.createPost(this.host, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS).setBody(task);
+        sender.sendAndWait(post, QueryTask.class);
+
+        infoList = this.indexService.getPaginatedSearcherInfos();
+        assertEquals(1, infoList.size());
+        assertEquals(3, infoList.get(0).refCount);
+        assertEquals("expiration should be changed to 3-hours",
+                nowToThreeHour, infoList.get(0).expirationTimeMicros - DEFAULT_PAGINATED_SEARCHER_EXPIRATION_DELAY);
+
+        assertEquals(1, getPaginatedSearcherUpdateCountStat());
+
+    }
+
+    private int getPaginatedSearcherUpdateCountStat() {
+        String key = LuceneDocumentIndexService.STAT_NAME_PAGINATED_SEARCHER_UPDATE_COUNT + ServiceStats.STAT_NAME_SUFFIX_PER_DAY;
+        return (int) getLuceneStat(key).latestValue;
+    }
+
+    private int getPaginatedSearcherForceDeletionCountStat() {
+        String key = LuceneDocumentIndexService.STAT_NAME_PAGINATED_SEARCHER_FORCE_DELETION_COUNT + ServiceStats.STAT_NAME_SUFFIX_PER_DAY;
+        return (int) getLuceneStat(key).latestValue;
+    }
+
+    @Test
+    public void paginatedSearcherSharingForSingleUseQueries() throws Throwable {
+        setUpHost(false);
+        this.host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
+
+        TestRequestSender sender = this.host.getTestRequestSender();
+
+        // create example services
+        List<Operation> posts = new ArrayList<>();
+        for (int i = 0; i < 30; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = "foo-" + i;
+            posts.add(Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state));
+        }
+        sender.sendAndWait(posts, ExampleServiceState.class);
+
+        int numOfQueries = 10;
+        List<QueryTask> results = new ArrayList<>();
+
+        // perform multiple SINGLE_USE queries
+        for (int i = 0; i < numOfQueries; i++) {
+            QueryTask task = QueryTask.Builder.createDirectTask()
+                    .setQuery(Query.Builder.create().addKindFieldClause(ExampleServiceState.class).build())
+                    .addOption(SINGLE_USE)
+                    .setResultLimit(5)
+                    .build();
+            Operation post = Operation.createPost(this.host, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS).setBody(task);
+            QueryTask result = sender.sendAndWait(post, QueryTask.class);
+            results.add(result);
+        }
+
+        List<PaginatedSearcherInfo> infoList = this.indexService.getPaginatedSearcherInfos();
+        assertEquals(1, infoList.size());
+        assertEquals(numOfQueries, infoList.get(0).refCount);
+        assertEquals(1, getPaginatedSearcherUpdateCountStat());
+
+
+        int statCountBefore = getPaginatedSearcherForceDeletionCountStat();
+
+        // Go through single use query page results, once it reaches to the last page, it will close the searcher
+        for (QueryTask page : results) {
+            String nextPageLink = page.results.nextPageLink;
+            while (nextPageLink != null) {
+                page = sender.sendAndWait(Operation.createGet(this.host, nextPageLink), QueryTask.class);
+                nextPageLink = page.results.nextPageLink;
+            }
+        }
+
+        this.host.waitFor("Wait for single-use query closes searcher", () -> {
+            return statCountBefore < getPaginatedSearcherForceDeletionCountStat();
+        });
+
+        assertEquals(0, this.indexService.getPaginatedSearcherInfos().size());
+    }
+
 }

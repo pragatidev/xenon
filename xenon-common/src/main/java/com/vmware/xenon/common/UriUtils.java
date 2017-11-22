@@ -23,18 +23,26 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import com.vmware.xenon.common.Service.ServiceOption;
+import com.vmware.xenon.common.config.XenonConfiguration;
 import com.vmware.xenon.services.common.ServiceUriPaths;
 
 /**
  * URI utility functions
  */
 public final class UriUtils {
+
+    private static final boolean DISABLE_QUERY_PAGE_FORWARDING = XenonConfiguration.bool(
+            UriUtils.class,
+            "DISABLE_QUERY_PAGE_FORWARDING",
+            false
+    );
 
     public enum ForwardingTarget {
         PEER_ID, KEY_HASH, ALL
@@ -60,8 +68,10 @@ public final class UriUtils {
     public static final String URI_PARAM_ODATA_SKIP_TO = "$skipto";
     public static final String URI_PARAM_ODATA_NODE = "$nodeid";
     public static final String URI_PARAM_ODATA_TENANTLINKS = "$tenantLinks";
+    public static final String URI_PARAM_ODATA_SELECT = "$select";
     public static final String HTTP_SCHEME = "http";
     public static final String HTTPS_SCHEME = "https";
+    public static final String FILE_SCHEME = "file";
     public static final int HTTP_DEFAULT_PORT = 80;
     public static final int HTTPS_DEFAULT_PORT = 443;
     public static final String URI_PATH_CHAR = "/";
@@ -82,6 +92,8 @@ public final class UriUtils {
     private static final char URI_QUERY_CHAR_CONST = '?';
     private static final char URI_QUERY_PARAM_LINK_CHAR_CONST = '&';
     private static final char URI_QUERY_PARAM_KV_CHAR_CONST = '=';
+
+    static final String URI_LEGAL_CHARS = "-_.~?#[]@!$&'()*+,;=:";
 
     private UriUtils() {
     }
@@ -387,7 +399,7 @@ public final class UriUtils {
             return new URI(baseUri.getScheme(), baseUri.getUserInfo(), baseUri.getHost(),
                     baseUri.getPort(), buildPath == null ? null : buildPath.toString(), query, null)
                             .normalize();
-        } catch (Throwable e) {
+        } catch (Exception e) {
             Utils.log(Utils.class, Utils.class.getSimpleName(), Level.SEVERE,
                     "Failure building uri %s, %s: %s", baseUri, path,
                     Utils.toString(e));
@@ -401,7 +413,7 @@ public final class UriUtils {
     public static URI buildUri(String uri) {
         try {
             return new URI(uri);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             Utils.log(Utils.class, Utils.class.getSimpleName(), Level.SEVERE,
                     "Failure building uri %s: %s", uri, Utils.toString(e));
         }
@@ -431,13 +443,23 @@ public final class UriUtils {
             boolean doExpand,
             boolean includeDeleted,
             EnumSet<ServiceOption> serviceCaps) {
+        String indexServicePath = host.getDocumentIndexServiceUri().getPath();
+        return buildDocumentQueryUri(host, indexServicePath, selfLink, doExpand, includeDeleted, serviceCaps);
+    }
+
+    public static URI buildDocumentQueryUri(ServiceHost host,
+            String indexServicePath,
+            String selfLink,
+            boolean doExpand,
+            boolean includeDeleted,
+            EnumSet<ServiceOption> serviceCaps) {
         ServiceOption queryCap = ServiceOption.NONE;
         if (serviceCaps.contains(ServiceOption.IMMUTABLE)) {
             queryCap = ServiceOption.IMMUTABLE;
         } else if (serviceCaps.contains(ServiceOption.PERSISTENCE)) {
             queryCap = ServiceOption.PERSISTENCE;
         }
-        return buildDocumentQueryUri(host, selfLink, doExpand, includeDeleted, queryCap);
+        return buildDocumentQueryUri(host, indexServicePath, selfLink, doExpand, includeDeleted, queryCap);
     }
 
     public static URI buildDocumentQueryUri(ServiceHost host,
@@ -446,9 +468,19 @@ public final class UriUtils {
             boolean includeDeleted,
             ServiceOption cap) {
 
-        URI indexUri = host.getDocumentIndexServiceUri();
-        return buildIndexQueryUri(indexUri,
-                selfLink, doExpand, includeDeleted, cap);
+        String indexServicePath = host.getDocumentIndexServiceUri().getPath();
+        return buildDocumentQueryUri(host, indexServicePath, selfLink, doExpand, includeDeleted, cap);
+    }
+
+    public static URI buildDocumentQueryUri(ServiceHost host,
+            String indexServicePath,
+            String selfLink,
+            boolean doExpand,
+            boolean includeDeleted,
+            ServiceOption cap) {
+
+        URI indexServiceUri = buildUri(host, indexServicePath);
+        return buildIndexQueryUri(indexServiceUri, selfLink, doExpand, includeDeleted, cap);
     }
 
     public static URI buildDefaultDocumentQueryUri(URI hostUri,
@@ -571,6 +603,12 @@ public final class UriUtils {
                 ServiceDocumentQueryResult.FIELD_NAME_DOCUMENT_LINKS);
     }
 
+    public static URI buildSelectFieldsQueryUri(URI factoryServiceUri, List<String> fields) {
+        // we assume field names are legal in csv and query params
+        String value = String.join(",", fields);
+        return extendUriWithQuery(factoryServiceUri, UriUtils.URI_PARAM_ODATA_SELECT, value);
+    }
+
     /**
      * Returns true if the host name and port in the URI are the same as in the host instance
      */
@@ -592,7 +630,7 @@ public final class UriUtils {
         try {
             return new URI(baseUri.getScheme(), baseUri.getUserInfo(), baseUri.getHost(),
                     baseUri.getPort(), path, query, null);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             Utils.log(Utils.class, Utils.class.getSimpleName(), Level.SEVERE,
                     "Failure building uri %s, %s, %s: %s", baseUri, path, query,
                     Utils.toString(e));
@@ -636,6 +674,23 @@ public final class UriUtils {
                 query,
                 FORWARDING_URI_PARAM_NAME_TARGET,
                 ForwardingTarget.PEER_ID.toString());
+    }
+
+    public static URI buildForwardToQueryPageUri(URI targetService, String peerId) {
+
+        // Feature flag: if query page forwarding links are disabled, then maintain the old
+        // behavior of providing links which reference the forwarding service directly.
+        if (DISABLE_QUERY_PAGE_FORWARDING) {
+            return buildForwardToPeerUri(targetService, peerId,
+                    ServiceUriPaths.DEFAULT_NODE_SELECTOR, null);
+        }
+
+        return UriUtils.extendUriWithQuery(
+                UriUtils.buildUri(targetService, ServiceUriPaths.CORE_QUERY_PAGE_FORWARDING),
+                FORWARDING_URI_PARAM_NAME_PEER,
+                peerId,
+                FORWARDING_URI_PARAM_NAME_PATH,
+                getLastPathSegment(targetService.getPath()));
     }
 
     /**
@@ -692,15 +747,28 @@ public final class UriUtils {
         return getODataParamValueAsString(uri, FORWARDING_URI_PARAM_NAME_PEER);
     }
 
+    public static boolean hasNavigationQueryParams(URI uri) {
+        if (uri.getQuery() == null) {
+            return false;
+        }
+
+        Set<String> q = UriUtils.parseUriQueryParams(uri).keySet();
+        return q.contains(FORWARDING_URI_PARAM_NAME_PATH)
+                || q.contains(FORWARDING_URI_PARAM_NAME_PEER);
+    }
+
     public static boolean hasODataQueryParams(URI uri) {
         if (uri.getQuery() == null) {
             return false;
         }
-        String q = uri.getQuery();
+
+        Set<String> q = UriUtils.parseUriQueryParams(uri).keySet();
         return q.contains(URI_PARAM_ODATA_TOP)
                 || q.contains(URI_PARAM_ODATA_COUNT)
                 || q.contains(URI_PARAM_ODATA_LIMIT)
                 || q.contains(URI_PARAM_ODATA_SKIP)
+                || q.contains(URI_PARAM_ODATA_SELECT)
+                || q.contains(URI_PARAM_ODATA_ORDER_BY)
                 || q.contains(URI_PARAM_ODATA_FILTER);
     }
 
@@ -779,6 +847,10 @@ public final class UriUtils {
 
     public static String getODataTenantLinksParamValue(URI uri) {
         return getODataParamValueAsString(uri, URI_PARAM_ODATA_TENANTLINKS);
+    }
+
+    public static String getODataSelectFieldsParamValue(URI uri) {
+        return getODataParamValueAsString(uri, URI_PARAM_ODATA_SELECT);
     }
 
     public static Integer getODataParamValue(final URI uri, final String uriParamOdataType) {
@@ -914,6 +986,46 @@ public final class UriUtils {
         return link.substring(link.lastIndexOf(UriUtils.URI_PATH_CHAR) + 1);
     }
 
+    static boolean isValidDocumentId(String suffix, String factoryLink) {
+        // Skip validation for core services
+        if (suffix.startsWith(ServiceUriPaths.CORE + UriUtils.URI_PATH_CHAR)) {
+            return true;
+        }
+
+        int index = 0;
+        if (UriUtils.isChildPath(suffix, factoryLink)) {
+            index = factoryLink.length() + 1;
+        }
+
+        final int len = suffix.length();
+        if (index < len && suffix.charAt(index) == UriUtils.URI_PATH_CHAR.charAt(0)) {
+            index = index + 1;
+        }
+
+        if (index >= len) {
+            return false;
+        }
+
+        for (int i = index; i < len; i++) {
+            char ch = suffix.charAt(i);
+            if (ch >= '0' && ch <= '9') {
+                continue;
+            }
+            if (ch >= 'a' && ch <= 'z') {
+                continue;
+            }
+            if (ch >= 'A' && ch <= 'Z') {
+                continue;
+            }
+            if (URI_LEGAL_CHARS.indexOf(ch) >= 0) {
+                continue;
+            }
+            return false;
+        }
+
+        return true;
+    }
+
     /**
      * Requests a random server socket port to be created, closes it, and returns the port picked
      * as a potentially available port. Note, that this is not an atomic probe and acquire, so the port
@@ -927,7 +1039,7 @@ public final class UriUtils {
             socket.setReuseAddress(true);
             port = socket.getLocalPort();
             Logger.getAnonymousLogger().info("port candidate:" + port);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             Logger.getAnonymousLogger().severe(e.toString());
         } finally {
             try {

@@ -13,15 +13,16 @@
 
 package com.vmware.xenon.common;
 
+import static com.vmware.xenon.common.ServiceDocument.FIELD_NAME_EXPIRATION_TIME_MICROS;
+import static com.vmware.xenon.common.serialization.GsonSerializers.getJsonMapperFor;
 
 import java.io.ByteArrayOutputStream;
-import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Field;
-import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Method;
 import java.lang.reflect.Type;
 import java.net.Inet6Address;
 import java.net.InetAddress;
@@ -30,31 +31,32 @@ import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
 import java.nio.charset.CharsetDecoder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Collection;
-import java.util.Comparator;
 import java.util.EnumSet;
-import java.util.Locale;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.logging.Level;
+import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.io.Output;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.google.gson.reflect.TypeToken;
 
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.Service.ServiceOption;
@@ -64,7 +66,7 @@ import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.TypeName;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState;
 import com.vmware.xenon.common.SystemHostInfo.OsFamily;
-import com.vmware.xenon.common.logging.StackAwareLogRecord;
+import com.vmware.xenon.common.serialization.GsonSerializers;
 import com.vmware.xenon.common.serialization.JsonMapper;
 import com.vmware.xenon.common.serialization.KryoSerializers;
 import com.vmware.xenon.services.common.ServiceUriPaths;
@@ -73,14 +75,12 @@ import com.vmware.xenon.services.common.ServiceUriPaths;
  * Runtime utility functions
  */
 public final class Utils {
-    private static final String CHARSET_UTF_8 = "UTF-8";
+
     public static final String PROPERTY_NAME_PREFIX = "xenon.";
-    public static final String CHARSET = CHARSET_UTF_8;
-    public static final Charset CHARSET_OBJECT = Charset.forName(CHARSET);
+    public static final Charset CHARSET_OBJECT = StandardCharsets.UTF_8;
+    public static final String CHARSET = "UTF-8";
     public static final String UI_DIRECTORY_NAME = "ui";
     public static final String PROPERTY_NAME_TIME_COMPARISON = "timeComparisonEpsilonMicros";
-
-    private static final char[] HEX_CHARS = "0123456789abcdef".toCharArray();
 
     /**
      * Number of IO threads is used for the HTTP selector event processing. Most of the
@@ -111,20 +111,13 @@ public final class Utils {
      */
     private static final long PING_LAUNCH_TOLERANCE_MS = 50;
 
-    private static final ThreadLocal<CharsetDecoder> decodersPerThread = new ThreadLocal<CharsetDecoder>() {
-        @Override
-        public CharsetDecoder initialValue() {
-            return CHARSET_OBJECT.newDecoder();
-        }
-    };
+    private static final ThreadLocal<CharsetDecoder> decodersPerThread = ThreadLocal
+            .withInitial(CHARSET_OBJECT::newDecoder);
 
     private static final AtomicLong previousTimeValue = new AtomicLong();
     private static long timeComparisonEpsilon = initializeTimeEpsilon();
     private static long timeDriftThresholdMicros = DEFAULT_TIME_DRIFT_THRESHOLD_MICROS;
 
-    private static final JsonMapper JSON = new JsonMapper();
-    private static final ConcurrentMap<Class<?>, JsonMapper> CUSTOM_JSON = new ConcurrentSkipListMap<>(
-            Comparator.comparingInt((Class<?> c) -> c.hashCode()).<String>thenComparing(Class::getName));
 
     private static final ConcurrentMap<String, String> KINDS = new ConcurrentSkipListMap<>();
     private static final ConcurrentMap<String, Class<?>> KIND_TO_TYPE = new ConcurrentSkipListMap<>();
@@ -133,31 +126,6 @@ public final class Utils {
     private static final StringBuilderThreadLocal builderPerThread = new StringBuilderThreadLocal();
 
     private Utils() {
-    }
-
-    private static JsonMapper getJsonMapperFor(Type type) {
-        if (type instanceof Class) {
-            return getJsonMapperFor((Class<?>) type);
-        } else if (type instanceof ParameterizedType) {
-            Type rawType = ((ParameterizedType) type).getRawType();
-            return getJsonMapperFor(rawType);
-        } else {
-            return JSON;
-        }
-    }
-
-    private static JsonMapper getJsonMapperFor(Object instance) {
-        if (instance == null) {
-            return JSON;
-        }
-        return getJsonMapperFor(instance.getClass());
-    }
-
-    private static JsonMapper getJsonMapperFor(Class<?> type) {
-        if (type.isArray() && type != byte[].class) {
-            type = type.getComponentType();
-        }
-        return CUSTOM_JSON.getOrDefault(type, JSON);
     }
 
     /**
@@ -176,7 +144,7 @@ public final class Utils {
      */
     public static void registerCustomJsonMapper(Class<?> clazz,
             JsonMapper mapper) {
-        CUSTOM_JSON.putIfAbsent(clazz, mapper);
+        GsonSerializers.registerCustomJsonMapper(clazz, mapper);
     }
 
     /**
@@ -210,7 +178,6 @@ public final class Utils {
             throw new IllegalArgumentException("description is required");
         }
 
-        byte[] buffer = getBuffer(description.serializedStateSizeLimit);
         long hash = FNVHash.FNV_OFFSET_MINUS_MSB;
 
         for (PropertyDescription pd : description.propertyDescriptions.values()) {
@@ -229,40 +196,17 @@ public final class Utils {
             }
 
             switch (pd.typeName) {
-            case STRING:
-                hash = FNVHash.compute((String) fieldValue, hash);
-                break;
-            case COLLECTION:
-            case MAP:
-            case PODO:
-                hash = Utils.hashJson(fieldValue, hash);
+            case BYTES:
+                // special case for bytes to avoid base64 encoding
+                byte[] bytes = (byte[]) fieldValue;
+                hash = FNVHash.compute(bytes, 0, bytes.length, hash);
                 break;
             default:
-                int position = Utils.toBytes(fieldValue, buffer, 0);
-                hash = FNVHash.compute(buffer, 0, position, hash);
+                hash = GsonSerializers.hashJson(fieldValue, hash);
             }
         }
 
         return Long.toHexString(hash);
-    }
-
-    /**
-     * converts object to json representation and computes a hash of it.
-     * @param body a possibly null object
-     * @return
-     */
-    public static long hashJson(Object body) {
-        return hashJson(body, FNVHash.FNV_OFFSET_MINUS_MSB);
-    }
-
-    private static long hashJson(Object body, long hash) {
-        if (body instanceof String) {
-            return FNVHash.compute((String) body, hash);
-        }
-        StringBuilder content = getBuilder();
-        JsonMapper mapper = getJsonMapperFor(body);
-        mapper.toJson(body, content);
-        return FNVHash.compute(content, hash);
     }
 
     /**
@@ -294,16 +238,28 @@ public final class Utils {
         return KryoSerializers.deserializeObject(bytes, position, length);
     }
 
+    /**
+     * Deserializes bytes into ServiceDocument.
+     * See {@link KryoSerializers#deserializeDocument(byte[], int, int)}
+     */
+    public static ServiceDocument fromQueryBinaryDocument(String link, Object binaryData) {
+        ServiceDocument serviceDocument = (ServiceDocument) KryoSerializers
+                .deserializeDocument((ByteBuffer) binaryData);
+        if (serviceDocument.documentSelfLink == null) {
+            serviceDocument.documentSelfLink = link;
+        }
+        if (serviceDocument.documentKind == null) {
+            serviceDocument.documentKind = Utils.buildKind(serviceDocument.getClass());
+        }
+        return serviceDocument;
+    }
+
     public static void performMaintenance() {
 
     }
 
     public static String computeHash(CharSequence content) {
         return Long.toHexString(FNVHash.compute(content));
-    }
-
-    public static String computeHash(byte[] content, int offset, int length) {
-        return Long.toHexString(FNVHash.compute(content, offset, length));
     }
 
     public static String toJson(Object body) {
@@ -332,11 +288,34 @@ public final class Utils {
      * with the annotation {@link PropertyUsageOption#SENSITIVE}.
      * If hideSensitiveFields is set and the Object is a string with JSON, sensitive fields cannot be discovered will
      * throw an Exception.
+     *
+     * @deprecated Use {@link #toJson(Set, Object)} instead
      */
+    @Deprecated
     public static String toJson(boolean hideSensitiveFields, boolean useHtmlFormatting, Object body)
             throws IllegalArgumentException {
+        Set<JsonMapper.JsonOptions> options = new HashSet<>();
+        if (hideSensitiveFields) {
+            options.add(JsonMapper.JsonOptions.EXCLUDE_SENSITIVE);
+        }
+        if (!useHtmlFormatting) {
+            options.add(JsonMapper.JsonOptions.COMPACT);
+        }
+
+        return toJson(options, body);
+    }
+
+    /**
+     * Outputs {@code body} to a JSON String format based on the provided JSON {@code options}
+     *
+     * @param options See {@link com.vmware.xenon.common.serialization.JsonMapper.JsonOptions} for
+     *                supported JSON output options. This cannot be null.
+     * @param body the object to serialize to JSON
+     * @return the JSON String
+     */
+    public static String toJson(Set<JsonMapper.JsonOptions> options, Object body) {
         if (body instanceof String) {
-            if (hideSensitiveFields) {
+            if (options.contains(JsonMapper.JsonOptions.EXCLUDE_SENSITIVE)) {
                 throw new IllegalArgumentException(
                         "Body is already a string, sensitive fields cannot be discovered");
             }
@@ -344,7 +323,8 @@ public final class Utils {
         }
         StringBuilder content = getBuilder();
         JsonMapper mapper = getJsonMapperFor(body);
-        mapper.toJson(hideSensitiveFields, useHtmlFormatting, body, content);
+
+        mapper.toJson(options, body, content);
         return content.toString();
     }
 
@@ -361,17 +341,21 @@ public final class Utils {
     }
 
     public static <T> T getJsonMapValue(Object json, String key, Class<T> valueClazz) {
-        Map<String, JsonElement> runtimeMap = Utils.fromJson(json,
-                new TypeToken<Map<String, JsonElement>>() {
-                }.getType());
-        return Utils.fromJson(runtimeMap.get(key), valueClazz);
+        JsonElement je = Utils.fromJson(json, JsonElement.class);
+        je = je.getAsJsonObject().get(key);
+        if (je == null) {
+            return null;
+        }
+        return Utils.fromJson(je, valueClazz);
     }
 
     public static <T> T getJsonMapValue(Object json, String key, Type valueType) {
-        Map<String, JsonElement> runtimeMap = Utils.fromJson(json,
-                new TypeToken<Map<String, JsonElement>>() {
-                }.getType());
-        return Utils.fromJson(runtimeMap.get(key), valueType);
+        JsonElement je = Utils.fromJson(json, JsonElement.class);
+        je = je.getAsJsonObject().get(key);
+        if (je == null) {
+            return null;
+        }
+        return Utils.fromJson(je, valueType);
     }
 
     public static String toString(Throwable t) {
@@ -392,15 +376,6 @@ public final class Utils {
         }
 
         return writer.toString();
-    }
-
-    public static String getCurrentFileDirectory() {
-        try {
-            return new File(".").getCanonicalPath();
-        } catch (IOException e) {
-            Logger.getAnonymousLogger().warning(Utils.toString(e));
-            return null;
-        }
     }
 
     public static void log(Class<?> type, String classOrUri, Level level, String fmt,
@@ -430,16 +405,16 @@ public final class Utils {
         }
 
         String message = messageSupplier.get();
-        StackAwareLogRecord lr = new StackAwareLogRecord(level, message);
-        Exception e = new Exception();
-        StackTraceElement[] stacks = e.getStackTrace();
-        if (stacks.length > nestingLevel) {
-            StackTraceElement stack = stacks[nestingLevel];
-            lr.setStackElement(stack);
-            lr.setSourceMethodName(stack.getMethodName());
+        LogRecord lr = new LogRecord(level, message);
+
+        StackTraceElement frame = StackFrameExtractor.getStackFrameAt(nestingLevel);
+        if (frame != null) {
+            lr.setSourceMethodName(frame.getMethodName());
         }
+
         lr.setSourceClassName(classOrUri);
         lr.setLoggerName(lg.getName());
+
         lg.log(lr);
     }
 
@@ -484,47 +459,24 @@ public final class Utils {
     }
 
     public static ServiceErrorResponse toServiceErrorResponse(Throwable e) {
-        return toServiceErrorResponse(e, null);
+        return ServiceErrorResponse.create(e, Operation.STATUS_CODE_BAD_REQUEST);
     }
 
-    public static ServiceErrorResponse toServiceErrorResponse(Throwable e, Operation op) {
-        ServiceErrorResponse serviceErrorResponse = ServiceErrorResponse.create(e, Operation.STATUS_CODE_BAD_REQUEST);
-        if (e instanceof LocalizableValidationException) {
-            String localizedMessage = LocalizationUtil.resolveMessage((LocalizableValidationException) e, op);
-            serviceErrorResponse.message = localizedMessage;
-        }
-
-        return serviceErrorResponse;
-    }
-
-    public static String toServiceErrorResponseJson(Throwable e) {
-        return toServiceErrorResponseJson(e, null);
-    }
-
-    public static String toServiceErrorResponseJson(Throwable e, Operation op) {
-        return Utils.toJson(toServiceErrorResponse(e, op));
-    }
-
-    public static ServiceErrorResponse toValidationErrorResponse(Throwable t) {
+    public static ServiceErrorResponse toValidationErrorResponse(Throwable t, Operation op) {
         ServiceErrorResponse rsp = new ServiceErrorResponse();
-        rsp.message = t.getLocalizedMessage();
+
+        if (t instanceof LocalizableValidationException) {
+            String localizedMessage = LocalizationUtil.resolveMessage((LocalizableValidationException) t, op);
+            rsp.message = localizedMessage;
+        } else {
+            rsp.message = t.getLocalizedMessage();
+        }
         return rsp;
     }
 
     public static boolean isValidationError(Throwable e) {
-        return e instanceof IllegalArgumentException;
-    }
-
-    public static String toHexString(byte[] data) {
-        //http://stackoverflow.com/a/9855338
-        char[] sb = new char[data.length * 2];
-        for (int i = 0; i < data.length; i++) {
-            int v = data[i] & 0xFF;
-            sb[2 * i] = HEX_CHARS[v >>> 4];
-            sb[2 * i + 1] = HEX_CHARS[v & 0x0F];
-        }
-
-        return new String(sb);
+        return (e instanceof IllegalArgumentException)
+                || (e instanceof LocalizableValidationException);
     }
 
     /**
@@ -611,7 +563,7 @@ public final class Utils {
             antiReqs = EnumSet.of(ServiceOption.PERSISTENCE, ServiceOption.REPLICATION);
             break;
         case PERIODIC_MAINTENANCE:
-            antiReqs = EnumSet.of(ServiceOption.ON_DEMAND_LOAD, ServiceOption.IMMUTABLE);
+            antiReqs = EnumSet.of(ServiceOption.IMMUTABLE);
             break;
         case PERSISTENCE:
             break;
@@ -620,6 +572,8 @@ public final class Utils {
         case DOCUMENT_OWNER:
             break;
         case IDEMPOTENT_POST:
+            break;
+        case CORE:
             break;
         case FACTORY:
             break;
@@ -636,14 +590,8 @@ public final class Utils {
             break;
         case UTILITY:
             break;
-        case ON_DEMAND_LOAD:
-            if (!options.contains(ServiceOption.FACTORY)) {
-                reqs = EnumSet.of(ServiceOption.PERSISTENCE);
-            }
-            antiReqs = EnumSet.of(ServiceOption.PERIODIC_MAINTENANCE);
-            break;
         case IMMUTABLE:
-            reqs = EnumSet.of(ServiceOption.ON_DEMAND_LOAD, ServiceOption.PERSISTENCE);
+            reqs = EnumSet.of(ServiceOption.PERSISTENCE);
             antiReqs = EnumSet.of(ServiceOption.PERIODIC_MAINTENANCE,
                     ServiceOption.INSTRUMENTATION);
             break;
@@ -705,31 +653,10 @@ public final class Utils {
         }
 
         if (service.getMaintenanceIntervalMicros() > 0 &&
-                service.getMaintenanceIntervalMicros() < host.getMaintenanceIntervalMicros()) {
-            host.log(
-                    Level.WARNING,
-                    "Service maintenance interval %d is less than host interval %d, reducing host interval",
-                    service.getMaintenanceIntervalMicros(), host.getMaintenanceIntervalMicros());
-            host.setMaintenanceIntervalMicros(service.getMaintenanceIntervalMicros());
+                service.getMaintenanceIntervalMicros() < host.getMaintenanceCheckIntervalMicros()) {
+            host.setMaintenanceCheckIntervalMicros(service.getMaintenanceIntervalMicros());
         }
         return true;
-    }
-
-    public static String getOsName(SystemHostInfo systemInfo) {
-        return systemInfo.properties.get(SystemHostInfo.PROPERTY_NAME_OS_NAME);
-    }
-
-    public static OsFamily determineOsFamily(String osName) {
-        osName = osName == null ? "" : osName.toLowerCase(Locale.ENGLISH);
-        if (osName.contains("mac")) {
-            return OsFamily.MACOS;
-        } else if (osName.contains("win")) {
-            return OsFamily.WINDOWS;
-        } else if (osName.contains("nux")) {
-            return OsFamily.LINUX;
-        } else {
-            return OsFamily.OTHER;
-        }
     }
 
     /**
@@ -774,7 +701,8 @@ public final class Utils {
      * Specifically, Java formats link-local IPv6 addresses in Linux-friendly manner:
      * {@code <address>%<interface_name>} e.g. {@code fe80:0:0:0:5971:14f6:c8ac:9e8f%eth0}. However,
      * Windows requires a different format for such addresses: {@code <address>%<numeric_scope_id>}
-     * e.g. {@code fe80:0:0:0:5971:14f6:c8ac:9e8f%34}. This method {@link #determineOsFamily detects if
+     * e.g. {@code fe80:0:0:0:5971:14f6:c8ac:9e8f%34}. The method
+     * {@link SystemHostInfo#determineOsFamily(String)}  detects if
      * the OS on the host} and will adjust the host address accordingly.
      *
      * Otherwise, this will delegate to the original method.
@@ -806,9 +734,9 @@ public final class Utils {
         if (useBinary && source.getAction() != Action.POST) {
             try {
                 byte[] encodedBody = Utils.encodeBody(source, source.getLinkedState(),
-                        Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM);
+                        Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM, true);
                 source.linkSerializedState(encodedBody);
-            } catch (Throwable e2) {
+            } catch (Exception e2) {
                 Utils.logWarning("Failure binary serializing, will fallback to JSON: %s",
                         Utils.toString(e2));
             }
@@ -823,12 +751,12 @@ public final class Utils {
         }
     }
 
-    public static byte[] encodeBody(Operation op) throws Throwable {
-        return encodeBody(op, op.getBodyRaw(), op.getContentType());
+    public static byte[] encodeBody(Operation op, boolean isRequest) throws Exception {
+        return encodeBody(op, op.getBodyRaw(), op.getContentType(), isRequest);
     }
 
-    public static byte[] encodeBody(Operation op, Object body, String contentType)
-            throws Throwable {
+    public static byte[] encodeBody(Operation op, Object body, String contentType, boolean isRequest)
+            throws Exception {
         if (body == null) {
             op.setContentLength(0);
             return null;
@@ -858,19 +786,58 @@ public final class Utils {
 
         if (data == null) {
             String encodedBody;
-            if (op.getAction() == Action.GET) {
-                encodedBody = Utils.toJsonHtml(body);
-            } else {
-                encodedBody = Utils.toJson(body);
-                if (contentType == null) {
-                    op.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
-                }
+            encodedBody = Utils.toJson(body);
+            if (op.getAction() != Action.GET && contentType == null) {
+                op.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
             }
             data = encodedBody.getBytes(Utils.CHARSET);
             op.setContentLength(data.length);
         }
 
+        // For requests, if encoding is specified as gzip, then compress body
+        // For responses, if request accepts gzip body, then compress body and add response header
+        boolean gzip = false;
+        if (isRequest) {
+            String encoding = op.getRequestHeader(Operation.CONTENT_ENCODING_HEADER);
+            gzip = Operation.CONTENT_ENCODING_GZIP.equals(encoding);
+        } else {
+            String encoding = op.getRequestHeader(Operation.ACCEPT_ENCODING_HEADER);
+            // encoding can be of form br;q=1.0, gzip;q=0.8, *;q=0.1
+            // see https://tools.ietf.org/html/rfc7231#section-5.3.4
+            if (encoding != null) {
+                String[] encodings = encoding.split(",");
+                for (String enc : encodings) {
+                    int idx = enc.indexOf(';');
+                    if (idx > 0) {
+                        enc = enc.substring(0, idx);
+                    }
+                    if (Operation.CONTENT_ENCODING_GZIP.equals(enc.trim())) {
+                        gzip = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (gzip) {
+            data = compressGZip(data);
+            op.setContentLength(data.length);
+            if (!isRequest) {
+                op.addResponseHeader(Operation.CONTENT_ENCODING_HEADER, Operation.CONTENT_ENCODING_GZIP);
+            }
+        }
+
         return data;
+    }
+
+   /**
+     * Compresses byte[] to gzip byte[]
+     */
+    private static byte[] compressGZip(byte[] input) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (GZIPOutputStream zos = new GZIPOutputStream(out)) {
+            zos.write(input, 0, input.length);
+        }
+        return out.toByteArray();
     }
 
     /**
@@ -906,6 +873,9 @@ public final class Utils {
         }
         if (compressed) {
             buffer = decompressGZip(buffer);
+            // Since newly created buffer is not yet read, calling "remaining()" returns the size of the buffer.
+            op.setContentLength(buffer.remaining());
+
             if (isRequest) {
                 op.getRequestHeaders().remove(Operation.CONTENT_ENCODING_HEADER);
             } else {
@@ -980,6 +950,19 @@ public final class Utils {
         return ByteBuffer.wrap(out.toByteArray());
     }
 
+    /**
+     * Compresses text to gzip byte buffer.
+     */
+    public static ByteBuffer compressGZip(String text) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (GZIPOutputStream zos = new GZIPOutputStream(out)) {
+            byte[] bytes = text.getBytes(CHARSET);
+            zos.write(bytes, 0, bytes.length);
+        }
+
+        return ByteBuffer.wrap(out.toByteArray());
+    }
+
     public static boolean isContentTypeKryoBinary(String contentType) {
         return contentType.length() == Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM.length()
                 && contentType.charAt(12) == 'k'
@@ -1031,32 +1014,19 @@ public final class Utils {
     }
 
     /**
-     * Atomically returns a map element for the specifying key. A new instance of value is created if it is
-     * missing. This may be efficiently used for creating map of maps/sets.
-     * <p/>
-     * This method is thread-safe.
-     *
-     * @param map  Map to take value from.
-     * @param key  Key to use.
-     * @param ctor Value constructor. This constructor may be invoked multiple times for the same value, but
-     *             only one value is returned.
-     * @param <K>  Map key type.
-     * @param <V>  Map value type.
-     * @return new or existing element value.
-     */
-    public static <K, V> V atomicGetOrCreate(ConcurrentMap<K, V> map, K key, Callable<V> ctor) {
-        return map.computeIfAbsent(key, k -> {
-            try {
-                return ctor.call();
-            } catch (Exception e) {
-                throw new RuntimeException("Element constructor should now throw an exception", e);
-            }
-        });
-    }
-
-    /**
      * Merges {@code patch} object into the {@code source} object by replacing or updating all {@code source}
      *  fields with non-null {@code patch} fields. Only fields with specified merge policy are merged.
+     *
+     * NOTE:
+     * When {@code patch.documentExpirationTimeMicros} is 0, {@code source.documentExpirationTimeMicros}
+     * will NOT be updated.
+     * If you need to always update the source, you need explicitly set it.
+     * <pre>
+     * {@code
+     *   Utils.mergeWithState(getStateDescription(), source, patchState);
+     *   source.documentExpirationTimeMicros = patchState.documentExpirationTimeMicros;
+     * }
+     * </pre>
      *
      * @param desc Service document description.
      * @param source Source object.
@@ -1080,6 +1050,13 @@ public final class Utils {
                     prop.usageOptions.contains(PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)) {
                 Object o = ReflectionUtils.getPropertyValue(prop, patch);
                 if (o != null) {
+
+                    // when patch.documentExpirationTimeMicros is 0, do not override source.documentExpirationTimeMicros
+                    if (FIELD_NAME_EXPIRATION_TIME_MICROS.equals(prop.accessor.getName())
+                            && Long.valueOf(0).equals(o)) {
+                        continue;
+                    }
+
                     if ((prop.typeName == TypeName.COLLECTION && !o.getClass().isArray())
                             || prop.typeName == TypeName.MAP) {
                         modified |= ReflectionUtils.setOrUpdatePropertyValue(prop, source, o);
@@ -1130,6 +1107,45 @@ public final class Utils {
         SPECIAL_MERGE,   // whether the patch body represented a special update request
                          // (if not set, the patch body is assumed to be a service state)
         STATE_CHANGED    // whether the current state was changed as a result of the merge
+    }
+
+    private static final class StackFrameExtractor {
+        private static final Method getStackTraceElement;
+
+        static {
+            Method m = null;
+            try {
+                m = Throwable.class.getDeclaredMethod("getStackTraceElement", int.class);
+                m.setAccessible(true);
+            } catch (Exception ignore) {
+
+            }
+
+            getStackTraceElement = m;
+        }
+
+        static StackTraceElement getStackFrameAt(int i) {
+            Exception exception = new Exception();
+            if (getStackTraceElement == null) {
+                StackTraceElement[] stackTrace = exception.getStackTrace();
+                if (stackTrace.length > i + 1) {
+                    return exception.getStackTrace()[i + 1];
+                } else {
+                    return null;
+                }
+            }
+
+            try {
+                return (StackTraceElement) getStackTraceElement.invoke(exception, i + 1);
+            } catch (Exception e) {
+                StackTraceElement[] stackTrace = exception.getStackTrace();
+                if (stackTrace.length > i + 1) {
+                    return exception.getStackTrace()[i + 1];
+                } else {
+                    return null;
+                }
+            }
+        }
     }
 
     /**
@@ -1203,7 +1219,7 @@ public final class Utils {
                         ReflectionUtils.setPropertyValue(prop, state, UUID.randomUUID().toString());
                     } else {
                         throw new IllegalArgumentException(
-                                prop.accessor.getName() + " is required.");
+                                prop.accessor.getName() + " is a required field.");
                     }
                 }
             }
@@ -1311,9 +1327,10 @@ public final class Utils {
 
     /**
      * Return a non-null, zero-length thread-local instance.
+     * Infrastructure use only.
      * @return
      */
-    static StringBuilder getBuilder() {
+    public static StringBuilder getBuilder() {
         return builderPerThread.get();
     }
 
@@ -1396,8 +1413,8 @@ public final class Utils {
                 switch (operation) {
                 case ADD:
                     if (collObj == null) {
-                        field.set(currentState, inputCollection);
-                        hasChanged = true;
+                        hasChanged = ReflectionUtils.setOrInstantiateCollectionField(currentState,
+                                field, inputCollection);
                     } else {
                         hasChanged = collObj.addAll(inputCollection);
                     }
@@ -1469,12 +1486,28 @@ public final class Utils {
      * location (in space), and the value from {@link Utils#getNowMicrosUtc()} as the
      * point in time. As long as the location id (for example, the local host ID) is
      * unique within the node group, the UUID should be unique within the node group as
-     * well
+     * well.
      */
     public static String buildUUID(String id) {
         return Utils.getBuilder()
                 .append(id)
                 .append(Long.toHexString(Utils.getNowMicrosUtc()))
                 .toString();
+    }
+
+    /**
+     * Construct common data in {@link ServiceConfiguration}.
+     */
+    public static <T extends ServiceConfiguration> T buildServiceConfig(T config, Service service) {
+        ServiceDocumentDescription desc = service.getHost().buildDocumentDescription(service);
+
+        config.options = service.getOptions();
+        config.maintenanceIntervalMicros = service.getMaintenanceIntervalMicros();
+        config.versionRetentionLimit = desc.versionRetentionLimit;
+        config.versionRetentionFloor = desc.versionRetentionFloor;
+        config.peerNodeSelectorPath = service.getPeerNodeSelectorPath();
+        config.documentIndexPath = service.getDocumentIndexPath();
+
+        return config;
     }
 }

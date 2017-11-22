@@ -18,7 +18,6 @@ import java.util.Collection;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 
 import com.vmware.xenon.common.NodeSelectorService;
 import com.vmware.xenon.common.NodeSelectorService.SelectAndForwardRequest;
@@ -26,28 +25,25 @@ import com.vmware.xenon.common.NodeSelectorService.SelectOwnerResponse;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceClient;
-import com.vmware.xenon.common.ServiceErrorResponse;
 import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.StatelessService;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.config.XenonConfiguration;
 import com.vmware.xenon.services.common.NodeGroupService.NodeGroupState;
 import com.vmware.xenon.services.common.NodeState.NodeOption;
 
 public class NodeSelectorReplicationService extends StatelessService {
 
-    public static final String PROPERTY_NAME_REPLICA_NOT_FOUND_TIMEOUT_MICROS = Utils.PROPERTY_NAME_PREFIX
-            + "NodeSelectorReplicationService.replicaTimeoutMicros";
-
-    public static final int BINARY_SERIALIZATION = Integer.getInteger(
-            Utils.PROPERTY_NAME_PREFIX
-                    + "NodeSelectorReplicationService.BINARY_SERIALIZATION",
-            1);
+    public static final int BINARY_SERIALIZATION = XenonConfiguration.integer(
+            NodeSelectorReplicationService.class,
+            "BINARY_SERIALIZATION",
+            1
+    );
 
     private Service parent;
     private Map<String, Integer> nodeCountPerLocation;
     private Map<URI, String> locationPerNodeURI;
-    private long peerTimeoutMicros;
 
     private String nodeGroupLink;
 
@@ -60,9 +56,6 @@ public class NodeSelectorReplicationService extends StatelessService {
             this.nodeCountPerLocation = new ConcurrentHashMap<>();
             this.locationPerNodeURI = new ConcurrentHashMap<>();
         }
-        this.peerTimeoutMicros = Long.getLong(
-                PROPERTY_NAME_REPLICA_NOT_FOUND_TIMEOUT_MICROS,
-                NodeGroupService.PEER_REQUEST_TIMEOUT_MICROS);
         super.setProcessingStage(ProcessingStage.AVAILABLE);
     }
 
@@ -70,7 +63,7 @@ public class NodeSelectorReplicationService extends StatelessService {
      * Issues updates to peer nodes, after a local update has been accepted
      */
     void replicateUpdate(NodeGroupState localState,
-            Operation outboundOp, SelectAndForwardRequest req, SelectOwnerResponse rsp) {
+            Operation outboundOp, SelectAndForwardRequest req, SelectOwnerResponse rsp, int replicationQuorum) {
 
         int memberCount = localState.nodes.size();
         NodeState selfNode = localState.nodes.get(getHost().getId());
@@ -101,7 +94,8 @@ public class NodeSelectorReplicationService extends StatelessService {
         // success threshold is determined based on the following precedence:
         // 1. request replication quorum header (if exists)
         // 2. group membership quorum (in case of OWNER_SELECTION)
-        // 3. at least one remote node (in case one exists)
+        // 3. node selector replication quorum (if set)
+        // 4. at least one remote node (in case one exists)
         String rplQuorumValue = outboundOp
                 .getRequestHeaderAsIs(Operation.REPLICATION_QUORUM_HEADER);
         if (rplQuorumValue != null) {
@@ -118,7 +112,7 @@ public class NodeSelectorReplicationService extends StatelessService {
                             context.successThreshold, eligibleMemberCount);
                     throw new IllegalArgumentException(errorMsg);
                 }
-            } catch (Throwable e) {
+            } catch (Exception e) {
                 outboundOp.setRetryCount(0).fail(e);
                 return;
             }
@@ -129,9 +123,13 @@ public class NodeSelectorReplicationService extends StatelessService {
         }
 
         if (req.serviceOptions.contains(ServiceOption.OWNER_SELECTION)) {
-            // replicate using group membership quorum
+            // replicate using node selector replication quorum or group membership quorum
             if (location == null) {
-                context.successThreshold = Math.min(eligibleMemberCount, selfNode.membershipQuorum);
+                // membership quorum used if
+                // 1. no valid replication quorum provided, for previous compatibility
+                // 2. it is a DELETE operation which requires propagation to peers
+                context.successThreshold = replicationQuorum > 0 && outboundOp.getAction() != Action.DELETE ?
+                        replicationQuorum : Math.min(eligibleMemberCount, selfNode.membershipQuorum);
                 context.failureThreshold = (eligibleMemberCount - context.successThreshold) + 1;
             } else {
                 int localNodeCount = getNodeCountInLocation(location, selectedNodes);
@@ -160,17 +158,17 @@ public class NodeSelectorReplicationService extends StatelessService {
         // try cached value first
         Integer count = this.nodeCountPerLocation.get(location);
         if (count != null) {
-            return count.intValue();
+            return count;
         }
 
         // fill cache maps
-        int intCount = (int) nodes.stream()
+        count = (int) nodes.stream()
                 .filter(ns -> Objects.equals(location,
                         ns.customProperties.get(NodeState.PROPERTY_NAME_LOCATION)))
                 .peek(ns -> this.locationPerNodeURI.put(ns.groupReference, location))
                 .count();
-        this.nodeCountPerLocation.put(location, Integer.valueOf(intCount));
-        return intCount;
+        this.nodeCountPerLocation.put(location, count);
+        return count;
     }
 
     private void updateLocation(NodeState node) {
@@ -290,55 +288,7 @@ public class NodeSelectorReplicationService extends StatelessService {
             e = new IllegalStateException("Request failed: " + o.toString());
         }
 
-        if (e != null && handleServiceNotFoundOnReplica(context, o)) {
-            return;
-        }
-
         context.checkAndCompleteOperation(getHost(), e, o, remoteLocation);
-    }
-
-    private boolean handleServiceNotFoundOnReplica(NodeSelectorReplicationContext context, Operation o) {
-        Operation op = context.parentOp;
-
-        // A replica would report a service-not-found error only for
-        // update requests.
-        if (!op.isUpdate()) {
-            return false;
-        }
-
-        // We expect a body with ServiceErrorResponse when the failure is because
-        // of service-not-found error.
-        if (o == null || !o.hasBody() || !o.getContentType().equals(Operation.MEDIA_TYPE_APPLICATION_JSON)) {
-            return false;
-        }
-
-        ServiceErrorResponse rsp = o.getBody(ServiceErrorResponse.class);
-        if (rsp == null ||
-                rsp.getErrorCode() != ServiceErrorResponse.ERROR_CODE_SERVICE_NOT_FOUND_ON_REPLICA) {
-            return false;
-        }
-
-        // We avoid retrying if the service is not started on the replica even after
-        // retrying a few times.
-        if (Utils.beforeNow(context.startTimeMicros + this.peerTimeoutMicros)) {
-            return false;
-        }
-
-        // The remote replica does not have the service in AVAILABLE stage. This could be
-        // because of out-of-order replication requests of a POST and PUT/PATCH.
-        // We will just retry for that specific replica.
-        URI remoteUri = createReplicaUri(o.getUri(), op);
-        Operation update = createReplicationRequest(op, remoteUri);
-        update.setCompletion((innerOp, innerEx) ->
-                this.handleReplicationCompletion(context, innerOp, innerEx));
-
-        this.getHost().schedule(() -> {
-            logWarning("Service %s not found on replica. Retrying replication request ...",
-                    o.getUri().getPath());
-            this.getHost().getClient().send(update);
-        }, this.getHost().getMaintenanceIntervalMicros(), TimeUnit.MICROSECONDS);
-
-        return true;
     }
 
     @Override

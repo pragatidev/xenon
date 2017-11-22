@@ -32,6 +32,7 @@ public final class ServiceUriPaths {
 
     public static final String MANAGEMENT = "/management";
     public static final String CORE_MANAGEMENT = CORE + MANAGEMENT;
+    public static final String CORE_SYNCHRONIZATION_MANAGEMENT = CORE_MANAGEMENT + "/synch";
     public static final String CORE_CALLBACKS = CORE + "/callbacks";
     public static final String PROCESS_LOG = CORE_MANAGEMENT + "/process-log";
     public static final String GO_PROCESS_LOG = CORE_MANAGEMENT + "/go-dcp-process-log";
@@ -60,17 +61,24 @@ public final class ServiceUriPaths {
     public static final String CORE_CREDENTIALS = CORE_AUTH + "/credentials";
 
     public static final String CORE_DOCUMENT_INDEX = ServiceUriPaths.CORE + "/document-index";
+    public static final String CORE_IN_MEMORY_DOCUMENT_INDEX = ServiceUriPaths.CORE
+            + "/in-memory-document-index";
+    public static final String CORE_DOCUMENT_INDEX_BACKUP = ServiceUriPaths.CORE + "/document-index-backup";
     public static final String CORE_OPERATION_INDEX = ServiceUriPaths.CORE + "/operation-index";
     public static final String CORE_SERVICE_CONTEXT_INDEX = ServiceUriPaths.CORE
             + "/service-context-index";
-    public static final String CORE_BLOB_INDEX = UriUtils.buildUriPath(ServiceUriPaths.CORE,
-            "blob-index");
 
     public static final String CORE_QUERY_TASKS = UriUtils.buildUriPath(ServiceUriPaths.CORE,
             "query-tasks");
 
     public static final String CORE_QUERY_PAGE = UriUtils.buildUriPath(ServiceUriPaths.CORE,
             "query-page");
+
+    public static final String CORE_QUERY_PAGE_FORWARDING = UriUtils.buildUriPath(
+            ServiceUriPaths.CORE, "query-page-forwarding");
+
+    public static final String CORE_QUERY_BROADCAST_PAGE = UriUtils.buildUriPath(ServiceUriPaths.CORE,
+            BroadcastQueryPageService.SELF_LINK_PREFIX);
 
     public static final String CORE_GRAPH_QUERIES = UriUtils.buildUriPath(ServiceUriPaths.CORE,
             "graph-queries");

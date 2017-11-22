@@ -88,11 +88,11 @@ public class TenantService extends StatefulService {
         TenantState currentState = getState(op);
         ServiceDocumentDescription documentDescription = getStateDescription();
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
-            op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
-        } else {
-            setState(op, newState);
+            // do not update state
+            op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED);
         }
 
+        setState(op, newState);
         op.complete();
     }
 

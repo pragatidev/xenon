@@ -17,6 +17,8 @@ import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 
+import com.vmware.xenon.common.config.XenonConfiguration;
+
 /**
  * Common service error response body set by the framework when an operation fails.
  * If the service author call {@code Operation.fail} and specifies a error response body,
@@ -25,12 +27,22 @@ import java.util.List;
  */
 public class ServiceErrorResponse {
 
+
+    public static final boolean DISABLE_STACK_TRACE_COLLECTION = XenonConfiguration.bool(
+            ServiceErrorResponse.class,
+            "disableStackTraceCollection",
+            false
+    );
+
     public static final int ERROR_CODE_INTERNAL_MASK = 0x80000000;
     public static final int ERROR_CODE_OUTDATED_SYNCH_REQUEST = 0x80000001;
     public static final int ERROR_CODE_STATE_MARKED_DELETED = 0x80000002;
     public static final int ERROR_CODE_SERVICE_ALREADY_EXISTS = 0x80000003;
-    public static final int ERROR_CODE_SERVICE_NOT_FOUND_ON_REPLICA = 0x80000004;
     public static final int ERROR_CODE_OWNER_MISMATCH = 0x80000005;
+    public static final int ERROR_CODE_SERVICE_QUEUE_LIMIT_EXCEEDED = 0x80000007;
+    public static final int ERROR_CODE_HOST_RATE_LIMIT_EXCEEDED = 0x80000008;
+    public static final int ERROR_CODE_CLIENT_QUEUE_LIMIT_EXCEEDED = 0x80000009;
+    public static final int ERROR_CODE_EXTERNAL_AUTH_FAILED = 0x80000010;
 
     public enum ErrorDetail {
         SHOULD_RETRY
@@ -49,9 +61,12 @@ public class ServiceErrorResponse {
             EnumSet<ErrorDetail> details) {
         ServiceErrorResponse rsp = new ServiceErrorResponse();
         rsp.message = e.getLocalizedMessage();
-        rsp.stackTrace = new ArrayList<>();
-        for (StackTraceElement se : e.getStackTrace()) {
-            rsp.stackTrace.add(se.toString());
+
+        if (!DISABLE_STACK_TRACE_COLLECTION) {
+            rsp.stackTrace = new ArrayList<>();
+            for (StackTraceElement se : e.getStackTrace()) {
+                rsp.stackTrace.add(se.toString());
+            }
         }
 
         rsp.details = details;

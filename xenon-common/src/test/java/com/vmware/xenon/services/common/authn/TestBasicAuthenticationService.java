@@ -14,32 +14,45 @@
 package com.vmware.xenon.services.common.authn;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 
 import static com.vmware.xenon.services.common.authn.BasicAuthenticationUtils.constructBasicAuth;
 
 import java.net.URI;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+import io.netty.handler.codec.http.cookie.ClientCookieDecoder;
+import io.netty.handler.codec.http.cookie.Cookie;
+import org.junit.AfterClass;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import com.vmware.xenon.common.AuthorizationSetupHelper;
 import com.vmware.xenon.common.BasicTestCase;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.AuthorizationContext;
+import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceStateCollectionUpdateRequest;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
-import com.vmware.xenon.common.http.netty.CookieJar;
+import com.vmware.xenon.common.config.TestXenonConfiguration;
+import com.vmware.xenon.common.test.TestRequestSender;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.AuthCredentialsService;
 import com.vmware.xenon.services.common.AuthCredentialsService.AuthCredentialsServiceState;
+import com.vmware.xenon.services.common.ExampleService;
+import com.vmware.xenon.services.common.ServiceUriPaths;
 import com.vmware.xenon.services.common.UserService;
 import com.vmware.xenon.services.common.UserService.UserState;
 import com.vmware.xenon.services.common.authn.AuthenticationRequest.AuthenticationRequestType;
@@ -52,12 +65,34 @@ public class TestBasicAuthenticationService extends BasicTestCase {
     private static final String BASIC_AUTH_PREFIX = "Basic ";
     private static final String BASIC_AUTH_USER_SEPARATOR = ":";
     private static final String SET_COOKIE_HEADER = "Set-Cookie";
+    private static final String ROLE = "guest-role";
+    private static final String USER_GROUP = "guest-user-group";
+    private static final String RESOURCE_GROUP = "guest-resource-group";
+    private static final Long UPPER_SESSION_LIMIT = 28800L;
 
-    private String credentialsServiceStateSelfLink;
+    private static String ORIGINAL_UPPER_SESSION_LIMIT;
 
     @Override
     public void beforeHostStart(VerificationHost h) {
         h.setAuthorizationEnabled(true);
+    }
+
+    @BeforeClass
+    public static void setUpSystemProperties() throws Exception {
+        ORIGINAL_UPPER_SESSION_LIMIT = TestXenonConfiguration.override(
+                BasicAuthenticationService.class,
+                "UPPER_SESSION_LIMIT_SECONDS",
+                UPPER_SESSION_LIMIT.toString()
+        );
+    }
+
+    @AfterClass
+    public static void clearSystemProperties() throws Exception {
+        TestXenonConfiguration.restore(
+                BasicAuthenticationService.class,
+                "UPPER_SESSION_LIMIT_SECONDS",
+                ORIGINAL_UPPER_SESSION_LIMIT
+        );
     }
 
     @Before
@@ -75,32 +110,36 @@ public class TestBasicAuthenticationService extends BasicTestCase {
             AuthCredentialsServiceState authServiceState = new AuthCredentialsServiceState();
             authServiceState.userEmail = USER;
             authServiceState.privateKey = PASSWORD;
+            EnumSet<Service.Action> verbs = EnumSet.of(Service.Action.GET, Service.Action.POST);
 
-            URI userUri = UriUtils.buildUri(this.host, UserService.FACTORY_LINK);
-            Operation userOp = Operation.createPost(userUri)
-                    .setBody(state)
-                    .setCompletion((o, e) -> {
-                        if (e != null) {
-                            this.host.failIteration(e);
-                            return;
-                        }
-                        this.host.completeIteration();
-                    });
-            URI authUri = UriUtils.buildUri(this.host, AuthCredentialsService.FACTORY_LINK);
-            Operation authOp = Operation.createPost(authUri)
-                    .setBody(authServiceState)
-                    .setCompletion((o, e) -> {
-                        if (e != null) {
-                            this.host.failIteration(e);
-                            return;
-                        }
-                        this.credentialsServiceStateSelfLink = o.getBody(AuthCredentialsServiceState.class).documentSelfLink;
-                        this.host.completeIteration();
-                    });
-            this.host.testStart(2);
-            this.host.send(userOp);
-            this.host.send(authOp);
+            this.host.testStart(1);
+            AuthorizationSetupHelper.create()
+                    .setHost(this.host)
+                    .setUserEmail(USER)
+                    .setUserPassword(PASSWORD)
+                    .setUserSelfLink(UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHZ_USERS, USER))
+                    .setDocumentKind(Utils.buildKind(ExampleService.ExampleServiceState.class))
+                    .setCredentialsSelfLink(UriUtils.buildUriPath(ServiceUriPaths.CORE_CREDENTIALS, USER))
+                    .setIsAdmin(false)
+                    .setDocumentLink(ExampleService.FACTORY_LINK)
+                    .setCompletion(this.host.getCompletion())
+                    .start();
             this.host.testWait();
+
+            this.host.testStart(1);
+            AuthorizationSetupHelper.create()
+                    .setHost(this.host)
+                    .setUserSelfLink(UriUtils.buildUriPath(ServiceUriPaths.CORE_AUTHZ_USERS, USER))
+                    .setDocumentLink(ExampleService.FACTORY_LINK)
+                    .setDocumentKind(Utils.buildKind(ExampleService.ExampleServiceState.class))
+                    .setUserGroupName(USER_GROUP)
+                    .setResourceGroupName(RESOURCE_GROUP)
+                    .setRoleName(ROLE)
+                    .setVerbs(verbs)
+                    .setCompletion(this.host.getCompletion())
+                    .setupRole();
+            this.host.testWait();
+
         } catch (Throwable e) {
             throw new Exception(e);
         }
@@ -133,7 +172,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
                                                     BasicAuthenticationUtils.WWW_AUTHENTICATE_HEADER_NAME);
                                     if (authHeader == null
                                             || !authHeader
-                                                    .equals(BasicAuthenticationUtils.WWW_AUTHENTICATE_HEADER_VALUE)) {
+                                            .equals(BasicAuthenticationUtils.WWW_AUTHENTICATE_HEADER_VALUE)) {
                                         this.host.failIteration(new IllegalStateException(
                                                 "Invalid status code returned"));
                                         return;
@@ -148,7 +187,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         this.host.send(Operation
                 .createPost(authServiceUri)
                 .setBody(new Object())
-                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal)
                 .setCompletion(
                         (o, e) -> {
                             if (e == null) {
@@ -173,7 +212,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         this.host.send(Operation
                 .createPost(authServiceUri)
                 .setBody(new Object())
-                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal)
                 .setCompletion(
                         (o, e) -> {
                             if (e == null) {
@@ -196,7 +235,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         this.host.send(Operation
                 .createPost(authServiceUri)
                 .setBody(new Object())
-                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal)
                 .setCompletion(
                         (o, e) -> {
                             if (e == null) {
@@ -219,7 +258,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         this.host.send(Operation
                 .createPost(authServiceUri)
                 .setBody(new Object())
-                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal)
                 .setCompletion(
                         (o, e) -> {
                             if (e != null) {
@@ -237,39 +276,41 @@ public class TestBasicAuthenticationService extends BasicTestCase {
                                 return;
                             }
                             // now issue a logout
-                        AuthenticationRequest request = new AuthenticationRequest();
-                        request.requestType = AuthenticationRequestType.LOGOUT;
-                        Operation logoutOp = Operation
-                                .createPost(authServiceUri)
-                                .setBody(request)
-                                .forceRemote()
-                                .setCompletion(
-                                        (oo, ee) -> {
-                                            if (ee != null) {
-                                                this.host.failIteration(ee);
-                                                return;
-                                            }
-                                            if (oo.getStatusCode() != Operation.STATUS_CODE_OK) {
-                                                this.host.failIteration(new IllegalStateException(
-                                                        "Invalid status code returned"));
-                                                return;
-                                            }
-                                            String cookieHeader = oo.getResponseHeader(SET_COOKIE_HEADER);
-                                            if (cookieHeader == null) {
-                                                this.host.failIteration(new IllegalStateException(
-                                                        "Cookie is null"));
-                                            }
-                                            Map<String, String> cookieElements = CookieJar.decodeCookies(cookieHeader);
-                                            if (!cookieElements.get("Max-Age").equals("0")) {
-                                                this.host.failIteration(new IllegalStateException(
-                                                        "Max-Age for cookie is not zero"));
-                                            }
-                                            this.host.resetAuthorizationContext();
-                                            this.host.completeIteration();
-                                        });
-                        this.host.setAuthorizationContext(o.getAuthorizationContext());
-                        this.host.send(logoutOp);
-                    }));
+                            AuthenticationRequest request = new AuthenticationRequest();
+                            request.requestType = AuthenticationRequestType.LOGOUT;
+                            Operation logoutOp = Operation
+                                    .createPost(authServiceUri)
+                                    .setBody(request)
+                                    .forceRemote()
+                                    .setCompletion(
+                                            (oo, ee) -> {
+                                                if (ee != null) {
+                                                    this.host.failIteration(ee);
+                                                    return;
+                                                }
+                                                if (oo.getStatusCode() != Operation.STATUS_CODE_OK) {
+                                                    this.host.failIteration(new IllegalStateException(
+                                                            "Invalid status code returned"));
+                                                    return;
+                                                }
+                                                String cookieHeader = oo.getResponseHeader(SET_COOKIE_HEADER);
+                                                if (cookieHeader == null) {
+                                                    this.host.failIteration(new IllegalStateException(
+                                                            "Cookie is null"));
+                                                    return;
+                                                }
+                                                Cookie cookie = ClientCookieDecoder.LAX.decode(cookieHeader);
+                                                if (cookie.maxAge() != 0) {
+                                                    this.host.failIteration(new IllegalStateException(
+                                                            "Max-Age for cookie is not zero"));
+                                                    return;
+                                                }
+                                                this.host.resetAuthorizationContext();
+                                                this.host.completeIteration();
+                                            });
+                            this.host.setAuthorizationContext(o.getAuthorizationContext());
+                            this.host.send(logoutOp);
+                        }));
         this.host.testWait();
 
         // Finally, send a valid remote request, and validate the cookie & auth token
@@ -278,7 +319,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
                 .createPost(authServiceUri)
                 .setBody(new Object())
                 .forceRemote()
-                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal)
                 .setCompletion(
                         (o, e) -> {
                             if (e != null) {
@@ -303,19 +344,19 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         this.host.sendAndWait(
                 Operation.createDelete(UriUtils.buildUri(this.host,
                         UriUtils.buildUriPath(UserService.FACTORY_LINK, USER)))
-                .setCompletion((o, e) -> {
-                    if (e != null) {
-                        this.host.failIteration(e);
-                        return;
-                    }
-                    this.host.completeIteration();
-                }));
+                        .setCompletion((o, e) -> {
+                            if (e != null) {
+                                this.host.failIteration(e);
+                                return;
+                            }
+                            this.host.completeIteration();
+                        }));
         this.host.resetSystemAuthorizationContext();
         this.host.assumeIdentity(UriUtils.buildUriPath(UserService.FACTORY_LINK, USER));
         this.host.testStart(1);
         this.host.send(Operation
                 .createGet(UriUtils.buildUri(this.host, UserService.FACTORY_LINK))
-                 .forceRemote()
+                .forceRemote()
                 .setCompletion(
                         (o, e) -> {
                             if (e != null) {
@@ -333,116 +374,235 @@ public class TestBasicAuthenticationService extends BasicTestCase {
     }
 
     @Test
+    public void verifyLoginLogoutLoginWithTokenInHeader() {
+        verifyLoginLogoutLogin(false);
+    }
+
+    @Test
+    public void verifyLoginLogoutLoginWithTokenInCookie() {
+        verifyLoginLogoutLogin(true);
+    }
+
+    public void verifyLoginLogoutLogin(boolean withCookie) {
+        String[] authToken = new String[1];
+        String[] oldAuthToken = new String[1];
+        this.host.resetAuthorizationContext();
+        URI authServiceUri = UriUtils.buildUri(this.host, BasicAuthenticationService.SELF_LINK);
+
+        String headerVal;
+        ExampleService.ExampleServiceState state = new ExampleService.ExampleServiceState();
+        state.name = "Test";
+
+        // First Login
+        headerVal = constructBasicAuth(USER, PASSWORD);
+
+        // Verify token works if token not expired
+        this.host.waitFor("Token expired", () -> {
+            login(authServiceUri, headerVal, authToken, 1L);
+            oldAuthToken[0] = authToken[0];
+            Operation op = Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state);
+            addToken(op, authToken[0], withCookie);
+            op = this.host.waitForResponse(op);
+            return  op.getStatusCode() == Operation.STATUS_CODE_OK;
+        });
+
+        // Verify that without valid token user operation fails.
+        Operation op2 = Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state);
+        this.host.sendAndWaitExpectFailure(op2);
+
+        // Logout and wait for token to expire
+        logout(authServiceUri, authToken);
+        this.host.waitFor("Token not expired", () -> {
+            Operation o = Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state);
+            addToken(o, authToken[0], withCookie);
+            Operation result = this.host.waitForResponse(o);
+            return result.getStatusCode() == Operation.STATUS_CODE_FORBIDDEN;
+        });
+
+        // Login again and get new token
+        login(authServiceUri, headerVal, authToken, 60L);
+        assertNotEquals(authToken[0], oldAuthToken[0]);
+
+        // Verify new token works
+        Operation op1 = Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state);
+        addToken(op1, authToken[0], withCookie);
+        this.host.sendAndWaitExpectSuccess(op1);
+
+        // Verify user operation fails with old expired auth token
+        op1 = Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state);
+        addToken(op1, oldAuthToken[0], withCookie);
+        this.host.sendAndWaitExpectFailure(op1);
+
+        // Verify that without valid token user operation fails.
+        op2 = Operation.createPost(this.host, ExampleService.FACTORY_LINK).setBody(state);
+        this.host.sendAndWaitExpectFailure(op2);
+    }
+
+    void addToken(Operation op, String token, boolean withCookie) {
+        if (withCookie) {
+            op.setCookies(Collections.singletonMap(AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE, token));
+        } else {
+            op.addRequestHeader(Operation.REQUEST_AUTH_TOKEN_HEADER, token);
+        }
+    }
+
+    private void logout(URI authServiceUri, String[] authToken) {
+        this.host.testStart(1);
+        AuthenticationRequest request = new AuthenticationRequest();
+        request.requestType = AuthenticationRequestType.LOGOUT;
+        this.host.send(Operation
+                .createPost(authServiceUri)
+                .setBody(request)
+                .forceRemote()
+                .addRequestHeader(Operation.REQUEST_AUTH_TOKEN_HEADER, authToken[0])
+                .setCompletion(
+                        (oo, ee) -> {
+                            if (ee != null) {
+                                this.host.failIteration(ee);
+                                return;
+                            }
+                            if (oo.getStatusCode() != Operation.STATUS_CODE_OK) {
+                                this.host.failIteration(new IllegalStateException(
+                                        "Invalid status code returned"));
+                                return;
+                            }
+                            String cookieHeader = oo.getResponseHeader(SET_COOKIE_HEADER);
+                            if (cookieHeader == null) {
+                                this.host.failIteration(new IllegalStateException(
+                                        "Cookie is null"));
+                                return;
+                            }
+                            Cookie cookie = ClientCookieDecoder.LAX.decode(cookieHeader);
+                            if (cookie.maxAge() != 0) {
+                                this.host.failIteration(new IllegalStateException(
+                                        "Max-Age for cookie is not zero"));
+                                return;
+                            }
+
+                            this.host.completeIteration();
+                        }));
+        this.host.testWait();
+    }
+
+    private void login(URI authServiceUri, String headerVal, String[] authToken, Long tokenExpiration) {
+        AuthenticationRequest authReq = new AuthenticationRequest();
+        authReq.sessionExpirationSeconds = tokenExpiration;
+        this.host.testStart(1);
+        this.host.send(Operation
+                .createPost(authServiceUri)
+                .setBody(authReq)
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal)
+                .setCompletion(
+                        (o, e) -> {
+                            if (e != null) {
+                                this.host.failIteration(e);
+                                return;
+                            }
+                            if (o.getStatusCode() != Operation.STATUS_CODE_OK) {
+                                this.host.failIteration(new IllegalStateException(
+                                        "Invalid status code returned"));
+                                return;
+                            }
+                            if (o.getAuthorizationContext() == null) {
+                                this.host.failIteration(new IllegalStateException(
+                                        "Authorization context not set"));
+                                return;
+                            }
+                            authToken[0] = o.getAuthorizationContext().getToken();
+                            this.host.completeIteration();
+                        }));
+        this.host.testWait();
+    }
+
+    @Test
     public void testAuthExpiration() throws Throwable {
+        TestRequestSender sender = this.host.getTestRequestSender();
+
         this.host.resetAuthorizationContext();
         URI authServiceUri = UriUtils.buildUri(this.host, BasicAuthenticationService.SELF_LINK);
 
         // Next send a valid request
         String headerVal = constructBasicAuth(USER, PASSWORD);
 
-        long oneHourFromNowBeforeAuth = Utils.getSystemNowMicrosUtc() + TimeUnit.HOURS.toMicros(1);
+        long exp = Utils.fromNowMicrosUtc(TimeUnit.HOURS.toMicros(1));
+        // round micros to the nearest second
+        long oneHourFromNowBeforeAuth = TimeUnit.SECONDS.toMicros(TimeUnit.MICROSECONDS.toSeconds(exp));
 
         // do not specify expiration
         AuthenticationRequest authReq = new AuthenticationRequest();
 
-        this.host.testStart(1);
-        this.host.send(Operation
+        Operation response = sender.sendAndWait(Operation
                 .createPost(authServiceUri)
                 .setBody(authReq)
-                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
-                .setCompletion(
-                        (o, e) -> {
-                            if (e != null) {
-                                this.host.failIteration(e);
-                                return;
-                            }
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal));
+        assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
 
-                            long oneHourFromNowAfterAuth =
-                                    Utils.getSystemNowMicrosUtc() + TimeUnit.HOURS.toMicros(1);
+        long oneHourFromNowAfterAuth =
+                Utils.getSystemNowMicrosUtc() + TimeUnit.HOURS.toMicros(1);
 
-                            // default expiration(1hour) must be used
-                            validateExpirationTimeRange(o.getAuthorizationContext(),
-                                    oneHourFromNowBeforeAuth, oneHourFromNowAfterAuth);
-
-                            this.host.completeIteration();
-                        }));
-        this.host.testWait();
+        // default expiration (1 hour) must be used
+        validateExpirationTimeRange(response.getAuthorizationContext(), oneHourFromNowBeforeAuth,
+                oneHourFromNowAfterAuth);
 
         // set expiration 1min
         authReq = new AuthenticationRequest();
         authReq.sessionExpirationSeconds = 60L;
 
-        this.host.testStart(1);
-        this.host.send(Operation
+        response = sender.sendAndWait(Operation
                 .createPost(authServiceUri)
                 .setBody(authReq)
-                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
-                .setCompletion(
-                        (o, e) -> {
-                            if (e != null) {
-                                this.host.failIteration(e);
-                                return;
-                            }
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal));
+        assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
 
-                            long tenMinAfterNowInMicro =
-                                    Utils.getSystemNowMicrosUtc() + TimeUnit.MINUTES.toMicros(10);
+        long tenMinAfterNowInMicro =
+                Utils.getSystemNowMicrosUtc() + TimeUnit.MINUTES.toMicros(10);
 
-                            // expiration has set to 1min, so it must be before now + 10min
-                            validateExpirationTimeRange(o.getAuthorizationContext(),
-                                    null, tenMinAfterNowInMicro);
-
-                            this.host.completeIteration();
-                        }));
-        this.host.testWait();
+        // expiration has set to 1min, so it must be before now + 10min
+        validateExpirationTimeRange(response.getAuthorizationContext(), null,
+                tenMinAfterNowInMicro);
 
         // with negative sec
         authReq = new AuthenticationRequest();
         authReq.sessionExpirationSeconds = -1L;
 
-        this.host.testStart(1);
-        this.host.send(Operation
+        response = sender.sendAndWait(Operation
                 .createPost(authServiceUri)
                 .setBody(authReq)
-                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
-                .setCompletion(
-                        (o, e) -> {
-                            if (e != null) {
-                                this.host.failIteration(e);
-                                return;
-                            }
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal));
+        assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
 
-                            // must be before now
-                            validateExpirationTimeRange(o.getAuthorizationContext(),
-                                    null, Utils.getSystemNowMicrosUtc());
-
-                            this.host.completeIteration();
-                        }));
-        this.host.testWait();
+        validateExpirationTimeRange(response.getAuthorizationContext(), null,
+                Utils.getSystemNowMicrosUtc());
 
         // with 0
         authReq = new AuthenticationRequest();
         authReq.sessionExpirationSeconds = 0L;
 
-        this.host.testStart(1);
-        this.host.send(Operation
+        response = sender.sendAndWait(Operation
                 .createPost(authServiceUri)
                 .setBody(authReq)
-                .addRequestHeader(BasicAuthenticationUtils.AUTHORIZATION_HEADER_NAME, headerVal)
-                .setCompletion(
-                        (o, e) -> {
-                            if (e != null) {
-                                this.host.failIteration(e);
-                                return;
-                            }
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal));
+        assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
 
-                            // must be before now
-                            validateExpirationTimeRange(o.getAuthorizationContext(),
-                                    null, Utils.getSystemNowMicrosUtc());
+        // must be before now
+        validateExpirationTimeRange(response.getAuthorizationContext(), null,
+                Utils.getSystemNowMicrosUtc());
 
-                            this.host.completeIteration();
-                        }));
-        this.host.testWait();
+        // Post upper limit
+        authReq = new AuthenticationRequest();
+        authReq.sessionExpirationSeconds = TimeUnit.HOURS.toSeconds(9);
 
+        response = sender.sendAndWait(Operation
+                .createPost(authServiceUri)
+                .setBody(authReq)
+                .addRequestHeader(Operation.AUTHORIZATION_HEADER, headerVal));
+        assertEquals(Operation.STATUS_CODE_OK, response.getStatusCode());
+
+        // expiration has set to 9 hours but should be prevented from going
+        // past 8 hours, so it must be about 8 hours from now.
+        validateExpirationTimeRange(response.getAuthorizationContext(),
+                Utils.getSystemNowMicrosUtc() + TimeUnit.MINUTES.toMicros(479),
+                Utils.getSystemNowMicrosUtc() + TimeUnit.HOURS.toMicros(8));
     }
 
     private void validateExpirationTimeRange(AuthorizationContext authContext, Long fromInMicro,
@@ -450,7 +610,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         assertNotNull(authContext);
         assertNotNull(authContext.getClaims());
         assertNotNull(authContext.getClaims().getExpirationTime());
-        long expirationInMicro = authContext.getClaims().getExpirationTime();
+        long expirationInMicro = TimeUnit.SECONDS.toMicros(authContext.getClaims().getExpirationTime());
 
         if (fromInMicro != null && expirationInMicro < fromInMicro) {
             String msg = String.format("expiration must be greater than %d but was %d", fromInMicro,
@@ -475,9 +635,9 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         String updatedValue = "UpdatedValue";
 
         // add custom property
-        URI authUri = UriUtils.buildUri(this.host, this.credentialsServiceStateSelfLink);
+        URI authUri = UriUtils.buildUri(this.host, UriUtils.buildUriPath(ServiceUriPaths.CORE_CREDENTIALS, USER));
         AuthCredentialsServiceState authServiceState = new AuthCredentialsServiceState();
-        Map<String, String> customProperties = new HashMap<String, String>();
+        Map<String, String> customProperties = new HashMap<>();
         customProperties.put(firstProperty, firstValue);
         authServiceState.customProperties = customProperties;
         Operation addProperty = Operation.createPatch(authUri)
@@ -523,7 +683,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         tenantLinks.add("foo");
         Map<String, Collection<Object>> itemsToAdd = new HashMap<>();
         itemsToAdd.put("tenantLinks", new ArrayList<>(tenantLinks));
-        ServiceStateCollectionUpdateRequest patchRequest = ServiceStateCollectionUpdateRequest.create(itemsToAdd, null) ;
+        ServiceStateCollectionUpdateRequest patchRequest = ServiceStateCollectionUpdateRequest.create(itemsToAdd, null);
         updateProperies = Operation.createPatch(authUri)
                 .setBody(patchRequest)
                 .setCompletion((o, e) -> {
@@ -542,7 +702,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         // remove the tenantLink
         Map<String, Collection<Object>> itemsToRemove = new HashMap<>();
         itemsToRemove.put("tenantLinks", new ArrayList<>(tenantLinks));
-        patchRequest = ServiceStateCollectionUpdateRequest.create(null, itemsToRemove) ;
+        patchRequest = ServiceStateCollectionUpdateRequest.create(null, itemsToRemove);
         updateProperies = Operation.createPatch(authUri)
                 .setBody(patchRequest)
                 .setCompletion((o, e) -> {
@@ -575,54 +735,61 @@ public class TestBasicAuthenticationService extends BasicTestCase {
         Operation post = Operation.createPost(authServiceUri)
                 .setBody(new Object())
                 .setCompletion(
-                    (o, e) -> {
-                        if (e != null) {
-                            this.host.failIteration(e);
-                            return;
-                        }
-                        if (o.getStatusCode() != Operation.STATUS_CODE_OK) {
-                            this.host.failIteration(new IllegalStateException(
-                                    "Invalid status code returned"));
-                            return;
-                        }
-                        if (!o.isRemote() && o.getAuthorizationContext() == null) {
-                            this.host.failIteration(new IllegalStateException(
-                                    "Authorization context not set"));
-                            return;
-                        }
-                        // now issue a logout
-                        AuthenticationRequest request = new AuthenticationRequest();
-                        request.requestType = AuthenticationRequestType.LOGOUT;
-                        Operation logoutOp = Operation
-                                .createPost(authServiceUri)
-                                .setBody(request)
-                                .forceRemote()
-                                .setCompletion(
-                                        (oo, ee) -> {
-                                            if (ee != null) {
-                                                this.host.failIteration(ee);
-                                                return;
-                                            }
-                                            if (oo.getStatusCode() != Operation.STATUS_CODE_OK) {
-                                                this.host.failIteration(new IllegalStateException(
-                                                        "Invalid status code returned"));
-                                                return;
-                                            }
-                                            String cookieHeader = oo.getResponseHeader(SET_COOKIE_HEADER);
-                                            if (cookieHeader == null) {
-                                                this.host.failIteration(new IllegalStateException(
-                                                        "Cookie is null"));
-                                            }
-                                            Map<String, String> cookieElements = CookieJar.decodeCookies(cookieHeader);
-                                            if (!cookieElements.get("Max-Age").equals("0")) {
-                                                this.host.failIteration(new IllegalStateException(
-                                                        "Max-Age for cookie is not zero"));
-                                            }
-                                            this.host.resetAuthorizationContext();
-                                            this.host.completeIteration();
-                                        });
-                        this.host.setAuthorizationContext(o.getAuthorizationContext());
-                        this.host.send(logoutOp);
+                        (o, e) -> {
+                            if (e != null) {
+                                this.host.failIteration(e);
+                                return;
+                            }
+                            if (o.getStatusCode() != Operation.STATUS_CODE_OK) {
+                                this.host.failIteration(new IllegalStateException(
+                                        "Invalid status code returned"));
+                                return;
+                            }
+                            if (!o.isRemote() && o.getAuthorizationContext() == null) {
+                                this.host.failIteration(new IllegalStateException(
+                                        "Authorization context not set"));
+                                return;
+                            }
+                            // now issue a logout
+                            AuthenticationRequest request = new AuthenticationRequest();
+                            request.requestType = AuthenticationRequestType.LOGOUT;
+                            Operation logoutOp = Operation
+                                    .createPost(authServiceUri)
+                                    .setBody(request)
+                                    .forceRemote()
+                                    .setCompletion(
+                                            (oo, ee) -> {
+                                                if (ee != null) {
+                                                    this.host.failIteration(ee);
+                                                    return;
+                                                }
+                                                if (oo.getStatusCode() != Operation.STATUS_CODE_OK) {
+                                                    this.host.failIteration(new IllegalStateException(
+                                                            "Invalid status code returned"));
+                                                    return;
+                                                }
+                                                String cookieHeader = oo.getResponseHeader(SET_COOKIE_HEADER);
+                                                if (cookieHeader == null) {
+                                                    this.host.failIteration(new IllegalStateException(
+                                                            "Cookie is null"));
+                                                    return;
+                                                }
+                                                Cookie cookie = ClientCookieDecoder.LAX.decode(cookieHeader);
+                                                if (cookie.maxAge() != 0) {
+                                                    this.host.failIteration(new IllegalStateException(
+                                                            "Max-Age for cookie is not zero"));
+                                                    return;
+                                                }
+                                                if (!cookie.isHttpOnly()) {
+                                                    this.host.failIteration(new IllegalStateException(
+                                                            "Cookie is not HTTP-only"));
+                                                    return;
+                                                }
+                                                this.host.resetAuthorizationContext();
+                                                this.host.completeIteration();
+                                            });
+                            this.host.setAuthorizationContext(o.getAuthorizationContext());
+                            this.host.send(logoutOp);
                         });
 
         if (remote) {
@@ -640,8 +807,8 @@ public class TestBasicAuthenticationService extends BasicTestCase {
             return false;
         }
 
-        Map<String, String> cookieElements = CookieJar.decodeCookies(cookieHeader);
-        if (!cookieElements.containsKey(AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE)) {
+        Cookie tokenCookie = ClientCookieDecoder.LAX.decode(cookieHeader);
+        if (!AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE.equals(tokenCookie.name())) {
             this.host.failIteration(new IllegalStateException("Missing auth cookie"));
             return false;
         }
@@ -651,7 +818,7 @@ public class TestBasicAuthenticationService extends BasicTestCase {
             return false;
         }
 
-        String authCookie = cookieElements.get(AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE);
+        String authCookie = tokenCookie.value();
         String authToken = op.getResponseHeader(Operation.REQUEST_AUTH_TOKEN_HEADER);
 
         if (!authCookie.equals(authToken)) {
@@ -659,5 +826,42 @@ public class TestBasicAuthenticationService extends BasicTestCase {
             return false;
         }
         return true;
+    }
+
+    @Test
+    public void testGetExpirationTime() throws Throwable {
+        BasicAuthenticationService basicAuthenticationService = new BasicAuthenticationService();
+        AuthenticationRequest authRequest = new AuthenticationRequest();
+
+        authRequest.sessionExpirationSeconds = null;
+
+        long expectedSec = Instant.now().getEpochSecond() + BasicAuthenticationService.AUTH_TOKEN_EXPIRATION_SECONDS;
+        long result = basicAuthenticationService.getExpirationTime(authRequest);
+        assertEquals(expectedSec, TimeUnit.MICROSECONDS.toSeconds(result));
+
+        authRequest.sessionExpirationSeconds = (long) 0;
+        result = basicAuthenticationService.getExpirationTime(authRequest);
+        expectedSec = Instant.now().getEpochSecond();
+        assertEquals(expectedSec, TimeUnit.MICROSECONDS.toSeconds(result));
+
+        authRequest.sessionExpirationSeconds = (long) -1;
+        result = basicAuthenticationService.getExpirationTime(authRequest);
+        expectedSec = Instant.now().getEpochSecond() - 1;
+        assertEquals(expectedSec, TimeUnit.MICROSECONDS.toSeconds(result));
+
+        authRequest.sessionExpirationSeconds = UPPER_SESSION_LIMIT - 1;
+        result = basicAuthenticationService.getExpirationTime(authRequest);
+        expectedSec = Instant.now().getEpochSecond() + UPPER_SESSION_LIMIT - 1;
+        assertEquals(expectedSec, TimeUnit.MICROSECONDS.toSeconds(result));
+
+        authRequest.sessionExpirationSeconds = UPPER_SESSION_LIMIT;
+        result = basicAuthenticationService.getExpirationTime(authRequest);
+        expectedSec = Instant.now().getEpochSecond() + UPPER_SESSION_LIMIT;
+        assertEquals(expectedSec, TimeUnit.MICROSECONDS.toSeconds(result));
+
+        authRequest.sessionExpirationSeconds = UPPER_SESSION_LIMIT + 1;
+        result = basicAuthenticationService.getExpirationTime(authRequest);
+        expectedSec = Instant.now().getEpochSecond() + UPPER_SESSION_LIMIT;
+        assertEquals(expectedSec, TimeUnit.MICROSECONDS.toSeconds(result));
     }
 }

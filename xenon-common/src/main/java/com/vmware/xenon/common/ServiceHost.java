@@ -26,11 +26,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Calendar;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.Enumeration;
@@ -51,12 +49,15 @@ import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.logging.ConsoleHandler;
 import java.util.logging.FileHandler;
@@ -66,66 +67,78 @@ import java.util.logging.Logger;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
+import io.opentracing.ActiveSpan;
+import io.opentracing.ActiveSpan.Continuation;
+import io.opentracing.SpanContext;
+import io.opentracing.Tracer;
+import io.opentracing.propagation.Format;
+import io.opentracing.propagation.TextMapExtractAdapter;
+import io.opentracing.propagation.TextMapInjectAdapter;
+import io.opentracing.tag.Tags;
+
 import com.vmware.xenon.common.FileUtils.ResourceEntry;
 import com.vmware.xenon.common.NodeSelectorService.SelectAndForwardRequest;
 import com.vmware.xenon.common.NodeSelectorService.SelectAndForwardRequest.ForwardingOption;
-import com.vmware.xenon.common.NodeSelectorService.SelectOwnerResponse;
 import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Operation.OperationOption;
+import com.vmware.xenon.common.OperationProcessingChain.OperationProcessingContext;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.Service.ProcessingStage;
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.Builder;
-import com.vmware.xenon.common.ServiceErrorResponse.ErrorDetail;
 import com.vmware.xenon.common.ServiceHost.RequestRateInfo.Option;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState.MemoryLimitType;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState.SslClientAuthMode;
 import com.vmware.xenon.common.ServiceMaintenanceRequest.MaintenanceReason;
+import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.common.ServiceStats.TimeSeriesStats;
 import com.vmware.xenon.common.ServiceStats.TimeSeriesStats.AggregationType;
-import com.vmware.xenon.common.ServiceStats.TimeSeriesStats.TimeBin;
 import com.vmware.xenon.common.ServiceSubscriptionState.ServiceSubscriber;
+import com.vmware.xenon.common.config.XenonConfiguration;
 import com.vmware.xenon.common.http.netty.NettyHttpListener;
 import com.vmware.xenon.common.http.netty.NettyHttpServiceClient;
 import com.vmware.xenon.common.jwt.JWTUtils;
 import com.vmware.xenon.common.jwt.Signer;
 import com.vmware.xenon.common.jwt.Verifier;
+import com.vmware.xenon.common.opentracing.TracerFactory;
+import com.vmware.xenon.common.opentracing.TracingExecutor;
+import com.vmware.xenon.common.opentracing.TracingScheduledExecutor;
+import com.vmware.xenon.common.opentracing.TracingUtils;
 import com.vmware.xenon.services.common.AuthCredentialsService;
 import com.vmware.xenon.services.common.AuthorizationContextService;
 import com.vmware.xenon.services.common.AuthorizationTokenCacheService;
 import com.vmware.xenon.services.common.ConsistentHashingNodeSelectorService;
-import com.vmware.xenon.services.common.FileContentService;
+import com.vmware.xenon.services.common.DirectoryContentService;
 import com.vmware.xenon.services.common.GraphQueryTaskService;
 import com.vmware.xenon.services.common.GuestUserService;
 import com.vmware.xenon.services.common.LocalQueryTaskFactoryService;
-import com.vmware.xenon.services.common.LuceneBlobIndexService;
+import com.vmware.xenon.services.common.LuceneDocumentIndexBackupService;
 import com.vmware.xenon.services.common.LuceneDocumentIndexService;
 import com.vmware.xenon.services.common.NodeGroupFactoryService;
 import com.vmware.xenon.services.common.NodeGroupService.JoinPeerRequest;
 import com.vmware.xenon.services.common.NodeGroupUtils;
 import com.vmware.xenon.services.common.ODataQueryService;
 import com.vmware.xenon.services.common.OperationIndexService;
-import com.vmware.xenon.services.common.ProcessFactoryService;
 import com.vmware.xenon.services.common.QueryFilter;
+import com.vmware.xenon.services.common.QueryPageForwardingService;
 import com.vmware.xenon.services.common.QueryTaskFactoryService;
 import com.vmware.xenon.services.common.ReliableSubscriptionService;
 import com.vmware.xenon.services.common.ResourceGroupService;
 import com.vmware.xenon.services.common.RoleService;
-import com.vmware.xenon.services.common.ServiceContextIndexService;
 import com.vmware.xenon.services.common.ServiceHostLogService;
 import com.vmware.xenon.services.common.ServiceHostManagementService;
 import com.vmware.xenon.services.common.ServiceUriPaths;
+import com.vmware.xenon.services.common.SynchronizationManagementService;
 import com.vmware.xenon.services.common.SystemUserService;
 import com.vmware.xenon.services.common.TaskFactoryService;
 import com.vmware.xenon.services.common.TenantService;
 import com.vmware.xenon.services.common.TransactionFactoryService;
+import com.vmware.xenon.services.common.TransactionService;
 import com.vmware.xenon.services.common.UpdateIndexRequest;
 import com.vmware.xenon.services.common.UserGroupService;
 import com.vmware.xenon.services.common.UserService;
-import com.vmware.xenon.services.common.authn.AuthenticationConstants;
 import com.vmware.xenon.services.common.authn.BasicAuthenticationService;
-import com.vmware.xenon.services.common.authn.BasicAuthenticationUtils;
 
 /**
  * Service host manages service life cycle, delivery of operations (remote and local) and performing
@@ -139,21 +152,20 @@ import com.vmware.xenon.services.common.authn.BasicAuthenticationUtils;
  */
 public class ServiceHost implements ServiceRequestSender {
 
+
     public static class ServiceAlreadyStartedException extends IllegalStateException {
         private static final long serialVersionUID = -1444810129515584386L;
 
-        /**
-         * Constructs an instance of this class.
-         */
         public ServiceAlreadyStartedException(String servicePath) {
             super("Service already started: " + servicePath);
         }
 
-        /**
-         * Constructs an instance of this class.
-         */
         public ServiceAlreadyStartedException(String servicePath, ProcessingStage stage) {
             super("Service already started: " + servicePath + " stage: " + stage);
+        }
+
+        public ServiceAlreadyStartedException(String servicePath, String customErrorMessage) {
+            super("Service already started: " + servicePath + ". " + customErrorMessage);
         }
     }
 
@@ -166,6 +178,10 @@ public class ServiceHost implements ServiceRequestSender {
 
         public ServiceNotFoundException(String servicePath) {
             super("Service not found: " + servicePath);
+        }
+
+        public ServiceNotFoundException(String servicePath, String customErrorMessage) {
+            super("Service not found: " + servicePath + ". " + customErrorMessage);
         }
     }
 
@@ -223,7 +239,9 @@ public class ServiceHost implements ServiceRequestSender {
         public String[] peerNodes;
 
         /**
-         * A stable identity associated with this host
+         * Optional stable identity associated with this host. If not specified and a host configuration
+         * file is not present in the current sandbox, a random unique identifier will be assigned to this
+         * host and persisted in the serviceHostConfig.json file so its used on restart
          */
         public String id;
 
@@ -240,13 +258,12 @@ public class ServiceHost implements ServiceRequestSender {
          * complete synchronization in time. The availability indicator on /available is a hint, it does
          * not prevent the factory from functioning.
          *
-         * The default value of 10 minutes allows for 1.8M services to synchronize, given an estimate of
-         * 3,000 service synchronizations per second, on a three node cluster, on a local network.
+         * The default value of 1 hour would roughly allows for 1.8M services to synchronize.
          *
          * Synchronization starts automatically if {@link Arguments#isPeerSynchronizationEnabled} is true,
          * and the node group has observed a node joining or leaving (becoming unavailable)
          */
-        public int perFactoryPeerSynchronizationLimitSeconds = (int) TimeUnit.MINUTES.toSeconds(10);
+        public int perFactoryPeerSynchronizationLimitSeconds = (int) TimeUnit.HOURS.toSeconds(1);
 
         /**
          * Value indicating whether node group changes will automatically
@@ -262,19 +279,31 @@ public class ServiceHost implements ServiceRequestSender {
         public boolean isAuthorizationEnabled = false;
 
         /**
-         * Base URI of the xenon instance that acts as the auth source for this service host
+         * Optional base URI of the xenon node that acts as the auth source for this service host
          */
         public String authProviderHostUri;
+
         /**
-         * File directory path to resource files. If specified resources will loaded from here instead of
+         * Optional file directory path to resource files. If specified, resources will be loaded from here instead of
          * the JAR file of the host
          */
         public Path resourceSandbox;
 
         /**
-         * The logical location of this host, if any
+         * Optional tag specifying the logical or geographic location of this host
          */
         public String location;
+
+        /**
+         * Optional local directory path to store auto backup files.
+         * If not specified, default directory is "[sandbox]/[port]/auto-backup".
+         */
+        public Path autoBackupDirectory;
+
+        /**
+         * When enabled, perform incremental backup whenever document-index service performed commits.
+         */
+        public boolean isAutoBackupEnabled = false;
 
     }
 
@@ -285,7 +314,6 @@ public class ServiceHost implements ServiceRequestSender {
 
     public static final Double DEFAULT_PCT_MEMORY_LIMIT = 0.49;
     public static final Double DEFAULT_PCT_MEMORY_LIMIT_DOCUMENT_INDEX = 0.45;
-    public static final Double DEFAULT_PCT_MEMORY_LIMIT_BLOB_INDEX = 0.01;
     public static final Double DEFAULT_PCT_MEMORY_LIMIT_SERVICE_CONTEXT_INDEX = 0.01;
 
     public static final String LOOPBACK_ADDRESS = "127.0.0.1";
@@ -308,6 +336,7 @@ public class ServiceHost implements ServiceRequestSender {
     public static final String SERVICE_URI_SUFFIX_STATS = "/stats";
     public static final String SERVICE_URI_SUFFIX_SUBSCRIPTIONS = "/subscriptions";
 
+    public static final String SERVICE_URI_SUFFIX_SYNCHRONIZATION = "/synchronization";
     public static final String SERVICE_URI_SUFFIX_AVAILABLE = "/available";
     public static final String SERVICE_URI_SUFFIX_CONFIG = "/config";
     public static final String SERVICE_URI_SUFFIX_TEMPLATE = "/template";
@@ -325,6 +354,7 @@ public class ServiceHost implements ServiceRequestSender {
 
     public static final String[] RESERVED_SERVICE_URI_PATHS = {
             SERVICE_URI_SUFFIX_AVAILABLE,
+            SERVICE_URI_SUFFIX_SYNCHRONIZATION,
             SERVICE_URI_SUFFIX_REPLICATION,
             SERVICE_URI_SUFFIX_STATS,
             SERVICE_URI_SUFFIX_SUBSCRIPTIONS,
@@ -335,6 +365,7 @@ public class ServiceHost implements ServiceRequestSender {
     static final Path DEFAULT_TMPDIR = Paths.get(System.getProperty("java.io.tmpdir"));
     static final Path DEFAULT_SANDBOX = DEFAULT_TMPDIR.resolve("xenon");
     static final Path DEFAULT_RESOURCE_SANDBOX_DIR = Paths.get("resources");
+    private static final String DEFAULT_AUTO_BACKUP_DIR = "auto-backup";
 
     /**
      * Estimate for average service state memory cost, in bytes. This can be computed per
@@ -354,21 +385,17 @@ public class ServiceHost implements ServiceRequestSender {
      */
     public static final int DEFAULT_SERVICE_INSTANCE_COST_BYTES = 4096;
 
-    private static final String PROPERTY_NAME_APPEND_PORT_TO_SANDBOX = Utils.PROPERTY_NAME_PREFIX
-            + "ServiceHost.APPEND_PORT_TO_SANDBOX";
-
     /**
      * Control creating a directory using port number under sandbox directory.
      *
      * VM argument: "-Dxenon.ServiceHost.APPEND_PORT_TO_SANDBOX=[true|false]"
      * Default is set to true.
      */
-    public static final boolean APPEND_PORT_TO_SANDBOX = System
-            .getProperty(PROPERTY_NAME_APPEND_PORT_TO_SANDBOX) == null
-            || Boolean.getBoolean(PROPERTY_NAME_APPEND_PORT_TO_SANDBOX);
-
-
-
+    private static final boolean APPEND_PORT_TO_SANDBOX = XenonConfiguration.bool(
+            ServiceHost.class,
+            "APPEND_PORT_TO_SANDBOX",
+            true
+    );
 
     /**
      * Request rate limiting configuration and real time statistics
@@ -404,6 +431,17 @@ public class ServiceHost implements ServiceRequestSender {
         public TimeSeriesStats timeSeries;
     }
 
+    /**
+     * Enables Logging for all inbound requests.
+     */
+    public static class RequestLoggingInfo {
+        public Boolean enabled = false;
+
+        public Boolean skipGossipRequests = true;
+        public Boolean skipSynchronizationRequests = true;
+        public Boolean skipForwardingRequests = true;
+    }
+
     public static class ServiceHostState extends ServiceDocument {
         public enum MemoryLimitType {
             LOW_WATERMARK, HIGH_WATERMARK, EXACT
@@ -413,9 +451,9 @@ public class ServiceHost implements ServiceRequestSender {
             NONE, WANT, NEED
         }
 
-        public static final long DEFAULT_MAINTENANCE_INTERVAL_MICROS = TimeUnit.SECONDS
-                .toMicros(1);
+        public static final long DEFAULT_MAINTENANCE_INTERVAL_MICROS = TimeUnit.SECONDS.toMicros(1);
         public static final long DEFAULT_OPERATION_TIMEOUT_MICROS = TimeUnit.SECONDS.toMicros(60);
+        public static final long DEFAULT_SERVICE_CACHE_CLEAR_DELAY_MICROS = TimeUnit.SECONDS.toMicros(60);
 
         public String bindAddress;
         public int httpPort;
@@ -423,14 +461,16 @@ public class ServiceHost implements ServiceRequestSender {
         public URI publicUri;
         public long maintenanceIntervalMicros = DEFAULT_MAINTENANCE_INTERVAL_MICROS;
         public long operationTimeoutMicros = DEFAULT_OPERATION_TIMEOUT_MICROS;
-        public long serviceCacheClearDelayMicros = DEFAULT_OPERATION_TIMEOUT_MICROS;
+        public long serviceCacheClearDelayMicros = DEFAULT_SERVICE_CACHE_CLEAR_DELAY_MICROS;
         public String operationTracingLevel;
         public SslClientAuthMode sslClientAuthMode;
         public int responsePayloadSizeLimit;
         public int requestPayloadSizeLimit;
+        public RequestLoggingInfo requestLoggingInfo;
 
         public URI storageSandboxFileReference;
         public URI resourceSandboxFileReference;
+        public URI autoBackupDirectoryReference;
         public URI privateKeyFileReference;
         public String privateKeyPassphrase;
         public URI certificateFileReference;
@@ -444,6 +484,7 @@ public class ServiceHost implements ServiceRequestSender {
         public boolean isAuthorizationEnabled;
         public transient boolean isStarted;
         public transient boolean isStopping;
+        public transient boolean isTracingEnabled;
         public SystemHostInfo systemInfo;
         public long lastMaintenanceTimeUtcMicros;
         public boolean isProcessOwner;
@@ -452,6 +493,7 @@ public class ServiceHost implements ServiceRequestSender {
         public long serviceCount;
         public String location;
         public URI authProviderHostURI;
+        public boolean isAutoBackupEnabled;
 
         /**
          * Relative memory limit per service path. The limit is expressed as
@@ -489,24 +531,67 @@ public class ServiceHost implements ServiceRequestSender {
                         ServiceUriPaths.CORE_LOCAL_QUERY_TASKS,
                         ServiceUriPaths.CORE_QUERY_TASKS }));
         public String[] initialPeerNodes;
+
+        /**
+         * Infrastructure use only. Minimum interval required for checking service periodic
+         * maintenance
+         */
+        public Long maintenanceCheckIntervalMicros;
     }
 
     public enum HttpScheme {
         HTTP_ONLY, HTTPS_ONLY, HTTP_AND_HTTPS, NONE
     }
 
+    /**
+     * Simple way of creating ServiceHost.
+     *
+     * This method performs initialization phase of service host - initialize by argument and register shutdown hook.
+     * If more detailed configuration is required, create a dedicated host class extending ServiceHost.
+     *
+     * NOTE:
+     * {@link #startDefaultCoreServicesSynchronously()} requires {@link #start()} to be called beforehand.
+     *
+     * Sample:
+     * <pre>
+     *     ServiceHost host = ServiceHost.create();
+     *     host.start();  // you need to call "start()" BEFORE "startCoreServicesSynchronously()"
+     *     host.startCoreServicesSynchronously();
+     *     host.startService(...);
+     *     ...
+     * </pre>
+     *
+     * @param args initialization arguments
+     * @return a ServiceHost
+     */
+    public static ServiceHost create(String... args) throws Throwable {
+        ServiceHost host = new ServiceHost();
+        host.initialize(args);
+        host.registerRuntimeShutdownHook();
+        return host;
+    }
+
+    /**
+     * Default shutdown hook to stop this host.
+     */
+    protected final Thread defaultShutdownHook = new Thread(() -> {
+        this.log(Level.WARNING, "Host stopping ...");
+        this.stop();
+        this.log(Level.WARNING, "Host is stopped");
+    });
+
+
     private Logger logger = Logger.getLogger(getClass().getName());
     private FileHandler handler;
-
-    private final ConcurrentHashMap<String, AuthorizationContext> authorizationContextCache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Set<String>> userLinkToTokenMap = new ConcurrentHashMap<>();
 
     private final Map<String, ServiceDocumentDescription> descriptionCache = new HashMap<>();
     private final Map<String, ServiceDocumentDescription> descriptionCachePerFactoryLink = new HashMap<>();
     private final ServiceDocumentDescription.Builder descriptionBuilder = Builder.create();
 
     private ExecutorService executor;
+    private ForkJoinPool executorPool; // For service resource tracking
     private ScheduledExecutorService scheduledExecutor;
+    private ScheduledThreadPoolExecutor scheduledExecutorPool; // For service resource tracking
 
     private final ConcurrentHashMap<String, Service> attachedServices = new ConcurrentHashMap<>();
     private final ConcurrentSkipListMap<String, Service> attachedNamespaceServices = new ConcurrentSkipListMap<>();
@@ -516,7 +601,15 @@ public class ServiceHost implements ServiceRequestSender {
 
     private final Set<String> pendingServiceDeletions = Collections
             .synchronizedSet(new HashSet<String>());
-    private final ConcurrentHashMap<String, Service> pendingPauseServices = new ConcurrentHashMap<>();
+
+    /**
+     * OpenTracing tracer. Currently spans have recount semantics, unlike OperationContext, so rather than
+     * being more restrictive than OperationContext, we just track such spans independently.
+     */
+    private final Tracer otTracer;
+
+    private OperationProcessingChain opProcessingChain;
+    private AuthorizationFilter authorizationFilter;
 
     private ServiceHostState state;
     private Service documentIndexService;
@@ -532,6 +625,7 @@ public class ServiceHost implements ServiceRequestSender {
     private ServiceRequestListener httpsListener;
 
     private URI documentIndexServiceUri;
+    private URI operationIndexServiceUri;
     private URI authorizationServiceUri;
     private URI transactionServiceUri;
     private URI managementServiceUri;
@@ -544,7 +638,7 @@ public class ServiceHost implements ServiceRequestSender {
     private final ServiceMaintenanceTracker serviceMaintTracker = ServiceMaintenanceTracker
             .create(this);
     private final ServiceResourceTracker serviceResourceTracker = ServiceResourceTracker
-            .create(this, this.attachedServices, this.pendingPauseServices);
+            .create(this, this.attachedServices);
     private final OperationTracker operationTracker = OperationTracker.create(this);
 
     private String hashedId;
@@ -557,10 +651,15 @@ public class ServiceHost implements ServiceRequestSender {
 
     private AuthorizationContext systemAuthorizationContext;
     private AuthorizationContext guestAuthorizationContext;
+    private ScheduledExecutorService serviceScheduledExecutor;
+
+    private List<String> skipLoggingPragmaDirectives = new ArrayList<>();
 
     protected ServiceHost() {
         this.state = new ServiceHostState();
         this.state.id = UUID.randomUUID().toString();
+        this.state.isTracingEnabled = TracerFactory.factory.enabled();
+        this.otTracer = TracerFactory.factory.create(this);
     }
 
     public ServiceHost initialize(String[] args) throws Throwable {
@@ -576,7 +675,6 @@ public class ServiceHost implements ServiceRequestSender {
         CommandLineArgumentParser.parse(hostArgs, args);
         CommandLineArgumentParser.parse(COLOR_LOG_FORMATTER, args);
         initialize(hostArgs);
-        setProcessOwner(true);
         return this;
 
     }
@@ -664,11 +762,6 @@ public class ServiceHost implements ServiceRequestSender {
             setServiceMemoryLimit(ServiceUriPaths.CORE_DOCUMENT_INDEX,
                     DEFAULT_PCT_MEMORY_LIMIT_DOCUMENT_INDEX);
         }
-        if (getServiceMemoryLimitMB(ServiceUriPaths.CORE_BLOB_INDEX,
-                MemoryLimitType.EXACT) == null) {
-            setServiceMemoryLimit(ServiceUriPaths.CORE_BLOB_INDEX,
-                    DEFAULT_PCT_MEMORY_LIMIT_BLOB_INDEX);
-        }
         if (getServiceMemoryLimitMB(ServiceUriPaths.CORE_SERVICE_CONTEXT_INDEX,
                 MemoryLimitType.EXACT) == null) {
             setServiceMemoryLimit(ServiceUriPaths.CORE_SERVICE_CONTEXT_INDEX,
@@ -678,6 +771,17 @@ public class ServiceHost implements ServiceRequestSender {
         return this;
     }
 
+    protected OperationProcessingChain constructOpProcessingChain() {
+        this.authorizationFilter = new AuthorizationFilter();
+
+        return OperationProcessingChain.create(
+                new AuthenticationFilter(),
+                this.authorizationFilter,
+                new RequestRateLimitsFilter(),
+                new ForwardRequestFilter(),
+                new ServiceAvailabilityFilter());
+    }
+
     private void allocateExecutors() {
         if (this.executor != null) {
             this.executor.shutdownNow();
@@ -685,9 +789,25 @@ public class ServiceHost implements ServiceRequestSender {
         if (this.scheduledExecutor != null) {
             this.scheduledExecutor.shutdownNow();
         }
-        this.executor = Executors.newWorkStealingPool(Utils.DEFAULT_THREAD_COUNT);
-        this.scheduledExecutor = Executors.newScheduledThreadPool(Utils.DEFAULT_THREAD_COUNT,
-                r -> new Thread(r, getUri().toString() + "/scheduled/" + this.state.id));
+        if (this.serviceScheduledExecutor != null) {
+            this.serviceScheduledExecutor.shutdownNow();
+        }
+
+        this.executorPool = new ForkJoinPool(Utils.DEFAULT_THREAD_COUNT, (pool) -> {
+            ForkJoinWorkerThread res = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
+            res.setName(getUri() + "/" + res.getName());
+            return res;
+        }, null, false);
+        this.executor = TracingExecutor.create(this.executorPool, this.otTracer);
+
+        this.scheduledExecutorPool = (ScheduledThreadPoolExecutor) Executors.newScheduledThreadPool(
+                Utils.DEFAULT_THREAD_COUNT,
+                new NamedThreadFactory(getUri() + "/scheduled"));
+        this.scheduledExecutor = TracingScheduledExecutor.create(this.scheduledExecutorPool, this.otTracer);
+
+        this.serviceScheduledExecutor = Executors.newScheduledThreadPool(
+                Utils.DEFAULT_THREAD_COUNT / 2,
+                new NamedThreadFactory(getUri() + "/service-scheduled"));
     }
 
     /**
@@ -753,6 +873,13 @@ public class ServiceHost implements ServiceRequestSender {
 
         this.state.initialPeerNodes = args.peerNodes;
         this.state.location = args.location;
+
+        if (args.autoBackupDirectory != null) {
+            this.state.autoBackupDirectoryReference = args.autoBackupDirectory.toUri();
+        } else {
+            this.state.autoBackupDirectoryReference = s.toPath().resolve(DEFAULT_AUTO_BACKUP_DIR).toUri();
+        }
+        this.state.isAutoBackupEnabled = args.isAutoBackupEnabled;
     }
 
     public String getLocation() {
@@ -765,6 +892,25 @@ public class ServiceHost implements ServiceRequestSender {
         }
         this.state.location = location;
     }
+
+    /**
+     * Exposes the underlying executor pool for resource tracking: deliberately package-local.
+     *
+     * @return
+     */
+    ScheduledThreadPoolExecutor getScheduledExecutorPool() {
+        return this.scheduledExecutorPool;
+    }
+
+    /**
+     * Exposes the underlying executor pool for resource tracking: deliberately package-local.
+     *
+     * @return
+     */
+    ForkJoinPool getExecutorPool() {
+        return this.executorPool;
+    }
+
 
     protected void configureLogging(File storageSandboxDir) throws IOException {
         String logConfigFile = System.getProperty("java.util.logging.config.file");
@@ -831,12 +977,13 @@ public class ServiceHost implements ServiceRequestSender {
                                 }
                                 fileState.isStarted = this.state.isStarted;
                                 fileState.isStopping = this.state.isStopping;
+                                fileState.isTracingEnabled = this.state.isTracingEnabled;
                                 if (fileState.maintenanceIntervalMicros < Service.MIN_MAINTENANCE_INTERVAL_MICROS) {
                                     fileState.maintenanceIntervalMicros = Service.MIN_MAINTENANCE_INTERVAL_MICROS;
                                 }
                                 this.state = fileState;
                                 l.countDown();
-                            } catch (Throwable ex) {
+                            } catch (Exception ex) {
                                 log(Level.WARNING, "Invalid state from %s: %s", hostStateFile,
                                         Utils.toJsonHtml(o.getBodyRaw()));
                                 l.countDown();
@@ -887,6 +1034,10 @@ public class ServiceHost implements ServiceRequestSender {
         return this.state.isServiceStateCaching;
     }
 
+    public boolean isTracingEnabled() {
+        return this.state.isTracingEnabled;
+    }
+
     public ServiceHost setServiceStateCaching(boolean enable) {
         this.state.isServiceStateCaching = enable;
         this.serviceResourceTracker.setServiceStateCaching(enable);
@@ -931,12 +1082,58 @@ public class ServiceHost implements ServiceRequestSender {
         this.state.isPeerSynchronizationEnabled = enabled;
     }
 
+    public boolean isRequestLoggingEnabled() {
+        return this.state.requestLoggingInfo != null && this.state.requestLoggingInfo.enabled;
+    }
+
+    public RequestLoggingInfo getRequestLoggingInfo() {
+        return this.state.requestLoggingInfo;
+    }
+
+    public List<String> getSkipLoggingPragmaDirectives() {
+        return this.skipLoggingPragmaDirectives;
+    }
+
+    public void setRequestLoggingInfo(RequestLoggingInfo loggingInfo) {
+        this.state.requestLoggingInfo = loggingInfo;
+
+        // Update pragma directives list for forwarding requests
+        if (loggingInfo.skipForwardingRequests) {
+            if (!this.skipLoggingPragmaDirectives.contains(Operation.PRAGMA_DIRECTIVE_FORWARDED)) {
+                this.skipLoggingPragmaDirectives.add(Operation.PRAGMA_DIRECTIVE_FORWARDED);
+            }
+        } else {
+            this.skipLoggingPragmaDirectives.remove(Operation.PRAGMA_DIRECTIVE_FORWARDED);
+        }
+
+        // Update pragma directives list for synchronization requests
+        if (loggingInfo.skipSynchronizationRequests) {
+            if (!this.skipLoggingPragmaDirectives.contains(Operation.PRAGMA_DIRECTIVE_SYNCH_OWNER)) {
+                this.skipLoggingPragmaDirectives.add(Operation.PRAGMA_DIRECTIVE_SYNCH_OWNER);
+            }
+            if (!this.skipLoggingPragmaDirectives.contains(Operation.PRAGMA_DIRECTIVE_SYNCH_PEER)) {
+                this.skipLoggingPragmaDirectives.add(Operation.PRAGMA_DIRECTIVE_SYNCH_PEER);
+            }
+        } else {
+            this.skipLoggingPragmaDirectives.remove(Operation.PRAGMA_DIRECTIVE_SYNCH_OWNER);
+            this.skipLoggingPragmaDirectives.remove(Operation.PRAGMA_DIRECTIVE_SYNCH_PEER);
+        }
+    }
+
     public int getPeerSynchronizationTimeLimitSeconds() {
         return this.state.peerSynchronizationTimeLimitSeconds;
     }
 
     public void setPeerSynchronizationTimeLimitSeconds(int seconds) {
         this.state.peerSynchronizationTimeLimitSeconds = seconds;
+    }
+
+    public boolean isAutoBackupEnabled() {
+        return this.state.isAutoBackupEnabled;
+    }
+
+    public void setAutoBackupEnabled(boolean enabled) {
+        this.state.isAutoBackupEnabled = enabled;
     }
 
     public int getSecurePort() {
@@ -1020,6 +1217,17 @@ public class ServiceHost implements ServiceRequestSender {
         return this.state.storageSandboxFileReference;
     }
 
+    public long getMaintenanceIntervalMicros() {
+        return this.state.maintenanceIntervalMicros;
+    }
+
+    public long getMaintenanceCheckIntervalMicros() {
+        if (this.state.maintenanceCheckIntervalMicros == null) {
+            return this.state.maintenanceIntervalMicros;
+        }
+        return this.state.maintenanceCheckIntervalMicros;
+    }
+
     public ServiceHost setMaintenanceIntervalMicros(long micros) {
         if (micros <= 0) {
             throw new IllegalArgumentException(
@@ -1033,6 +1241,7 @@ public class ServiceHost implements ServiceRequestSender {
             micros = Service.MIN_MAINTENANCE_INTERVAL_MICROS;
         }
 
+        long minInterval = micros;
         // verify that attached services have intervals greater or equal to suggested value
         for (Service s : this.attachedServices.values()) {
             if (s.getProcessingStage() == ProcessingStage.STOPPED) {
@@ -1046,10 +1255,18 @@ public class ServiceHost implements ServiceRequestSender {
                         "Service %s has a small maintenance interval %d than new interval %d",
                         s.getSelfLink(), s.getMaintenanceIntervalMicros(), micros);
                 log(Level.WARNING, error);
+                minInterval = s.getMaintenanceIntervalMicros();
             }
         }
 
         this.state.maintenanceIntervalMicros = micros;
+        if (this.state.maintenanceCheckIntervalMicros != null
+                && this.state.maintenanceCheckIntervalMicros != minInterval) {
+            this.state.maintenanceCheckIntervalMicros = minInterval;
+        } else if (minInterval < micros) {
+            log(Level.WARNING, "Setting maintenance check interval to %d", minInterval);
+            this.state.maintenanceCheckIntervalMicros = minInterval;
+        }
 
         // we need to cancel the current task and re-schedule and the new
         // interval
@@ -1060,6 +1277,11 @@ public class ServiceHost implements ServiceRequestSender {
         task.cancel(true);
         scheduleMaintenance();
 
+        return this;
+    }
+
+    ServiceHost setMaintenanceCheckIntervalMicros(long intervalMicros) {
+        this.state.maintenanceCheckIntervalMicros = intervalMicros;
         return this;
     }
 
@@ -1150,6 +1372,10 @@ public class ServiceHost implements ServiceRequestSender {
         return this;
     }
 
+    Service getAuthorizationService() {
+        return this.authorizationService;
+    }
+
     public ServiceHost setTransactionService(Service service) {
         this.transactionService = service;
         return this;
@@ -1165,6 +1391,14 @@ public class ServiceHost implements ServiceRequestSender {
 
     Service getManagementService() {
         return this.managementService;
+    }
+
+    ServiceResourceTracker getServiceResourceTracker() {
+        return this.serviceResourceTracker;
+    }
+
+    OperationTracker getOperationTracker() {
+        return this.operationTracker;
     }
 
     public ServiceHost setAuthenticationService(Service service) {
@@ -1194,7 +1428,7 @@ public class ServiceHost implements ServiceRequestSender {
         return this;
     }
 
-    private URI getBasicAuthenticationServiceUri() {
+    URI getBasicAuthenticationServiceUri() {
         if (this.basicAuthenticationService == null) {
             return null;
         }
@@ -1205,7 +1439,7 @@ public class ServiceHost implements ServiceRequestSender {
     }
 
     public ScheduledExecutorService getScheduledExecutor() {
-        return this.scheduledExecutor;
+        return this.serviceScheduledExecutor;
     }
 
     public ExecutorService getExecutor() {
@@ -1217,19 +1451,22 @@ public class ServiceHost implements ServiceRequestSender {
     }
 
     public ExecutorService allocateExecutor(Service s, int threadCount) {
-        return Executors.newFixedThreadPool(threadCount, new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable r) {
-                return new Thread(r, s.getUri() + "/" + Utils.getSystemNowMicrosUtc());
-            }
-        });
+        ExecutorService result = Executors.newFixedThreadPool(threadCount, new NamedThreadFactory(s.getUri().toString()));
+        return TracingExecutor.create(result, this.otTracer);
     }
 
+    @SuppressWarnings("try")
     public ServiceHost start() throws Throwable {
-        return startImpl();
+        if (!isTracingEnabled()) {
+            return startImpl();
+        } else {
+            try (ActiveSpan span = this.otTracer.buildSpan("ServiceHost.start").startActive()) {
+                return startImpl();
+            }
+        }
     }
 
-    private void setSystemProperties() throws Throwable {
+    private void setSystemProperties() {
         Properties props = System.getProperties();
 
         // Prefer IPv4 by default.
@@ -1242,6 +1479,14 @@ public class ServiceHost implements ServiceRequestSender {
     }
 
     private ServiceHost startImpl() throws Throwable {
+
+        // replace attached management service if it is in invalid state.
+        // this may happen when host was restarted (calling host.stop(), then host.start())
+        if (this.managementService == null
+                || this.managementService.getProcessingStage() == ProcessingStage.STOPPED) {
+            setManagementService(new ServiceHostManagementService());
+        }
+
         synchronized (this.state) {
             if (isStarted()) {
                 return this;
@@ -1250,7 +1495,10 @@ public class ServiceHost implements ServiceRequestSender {
             this.state.isStopping = false;
         }
 
-        if (this.executor == null || this.scheduledExecutor == null) {
+        this.opProcessingChain = constructOpProcessingChain();
+
+        if (this.executor == null || this.scheduledExecutor == null
+                || this.serviceScheduledExecutor == null) {
             allocateExecutors();
         }
 
@@ -1371,13 +1619,20 @@ public class ServiceHost implements ServiceRequestSender {
      * Starts core singleton services. Should be called once from the service host entry point.
      */
     public void startDefaultCoreServicesSynchronously() throws Throwable {
+        startDefaultCoreServicesSynchronously(true);
+    }
+
+    /**
+     * Starts core singleton services and optionally joins the local host to peer nodes.
+     * Should be called once from the service host entry point.
+     */
+    public void startDefaultCoreServicesSynchronously(boolean joinPeerNodes) throws Throwable {
         if (findService(ServiceHostManagementService.SELF_LINK) != null) {
             throw new IllegalStateException("Already started");
         }
 
         addPrivilegedService(this.managementService.getClass());
         addPrivilegedService(OperationIndexService.class);
-        addPrivilegedService(LuceneBlobIndexService.class);
         addPrivilegedService(BasicAuthenticationService.class);
 
         // Capture authorization context; this function executes as the system user
@@ -1390,35 +1645,6 @@ public class ServiceHost implements ServiceRequestSender {
             addPrivilegedService(AuthorizationTokenCacheService.class);
             startCoreServicesSynchronously(this.authorizationService, new AuthorizationTokenCacheService());
         }
-
-        // Normalize peer list and find our external address
-        // This must be done BEFORE node group starts.
-        List<URI> peers = getInitialPeerHosts();
-
-        startDefaultReplicationAndNodeGroupServices();
-
-        // The framework supports two phase asynchronous start to avoid explicit
-        // ordering of services. However, core query services must be started before anyone else
-        // since factories with persisted services use queries to enumerate their children.
-        if (this.documentIndexService != null) {
-            addPrivilegedService(this.documentIndexService.getClass());
-            if (this.documentIndexService instanceof LuceneDocumentIndexService) {
-                Service[] queryServiceArray = new Service[] {
-                        this.documentIndexService,
-                        new LuceneBlobIndexService(),
-                        new ServiceContextIndexService(),
-                        new QueryTaskFactoryService(),
-                        new LocalQueryTaskFactoryService(),
-                        TaskFactoryService.create(GraphQueryTaskService.class),
-                        TaskFactoryService.create(SynchronizationTaskService.class) };
-                startCoreServicesSynchronously(queryServiceArray);
-            }
-        }
-
-        List<Service> coreServices = new ArrayList<>();
-        coreServices.add(this.managementService);
-        coreServices.add(new ProcessFactoryService());
-        coreServices.add(new ODataQueryService());
 
         // start AuthN service before factories since its invoked in the IO path on every
         // request
@@ -1433,7 +1659,47 @@ public class ServiceHost implements ServiceRequestSender {
         }
 
         // start the BasicAuthenticationService anyways
-        coreServices.add(this.basicAuthenticationService);
+        startCoreServicesSynchronously(this.basicAuthenticationService);
+
+        // Normalize peer list and find our external address
+        // This must be done BEFORE node group starts.
+        List<URI> peers = getInitialPeerHosts();
+
+        NodeSelectorService defaultNodeSelectorService = startDefaultReplicationAndNodeGroupServices();
+
+        // The framework supports two phase asynchronous start to avoid explicit
+        // ordering of services. However, core query services must be started before anyone else
+        // since factories with persisted services use queries to enumerate their children.
+        if (this.documentIndexService != null) {
+            addPrivilegedService(this.documentIndexService.getClass());
+            if (this.documentIndexService instanceof LuceneDocumentIndexService) {
+                LuceneDocumentIndexService luceneDocumentIndexService = (LuceneDocumentIndexService) this.documentIndexService;
+                Service[] queryServiceArray = new Service[] {
+                        luceneDocumentIndexService,
+                        new LuceneDocumentIndexBackupService(),
+                        new QueryTaskFactoryService(),
+                        new LocalQueryTaskFactoryService(),
+                        TaskFactoryService.create(GraphQueryTaskService.class),
+                        TaskFactoryService.create(SynchronizationTaskService.class),
+                        new QueryPageForwardingService(defaultNodeSelectorService) };
+                startCoreServicesSynchronously(queryServiceArray);
+
+                // register auto-backup consumer to the document index service
+                // turning on/off the feature is checked in consumer to allow toggling at runtime
+                this.registerForServiceAvailability((o, e) -> {
+                    URI subscriptionUri = UriUtils.buildSubscriptionUri(this, this.documentIndexService.getSelfLink());
+                    Operation createSubscriptionOp = Operation.createPost(subscriptionUri).setReferer(getUri());
+
+                    Consumer<Operation> autoBackupConsumer = LuceneDocumentIndexBackupService.createAutoBackupConsumer(this, this.managementService);
+                    startSubscriptionService(createSubscriptionOp, autoBackupConsumer);
+                }, this.documentIndexService.getSelfLink());
+
+            }
+        }
+
+        List<Service> coreServices = new ArrayList<>();
+        coreServices.add(this.managementService);
+        coreServices.add(new ODataQueryService());
 
         // Start persisted factories here, after document index is added
         coreServices.add(AuthCredentialsService.createFactory());
@@ -1455,6 +1721,11 @@ public class ServiceHost implements ServiceRequestSender {
 
         Service transactionFactoryService = new TransactionFactoryService();
         coreServices.add(transactionFactoryService);
+        addPrivilegedService(TransactionService.class);
+
+        Service synchronizationManagementService = new SynchronizationManagementService();
+        coreServices.add(synchronizationManagementService);
+        addPrivilegedService(SynchronizationManagementService.class);
 
         Service[] coreServiceArray = new Service[coreServices.size()];
         coreServices.toArray(coreServiceArray);
@@ -1483,9 +1754,18 @@ public class ServiceHost implements ServiceRequestSender {
         // Restore authorization context
         OperationContext.setAuthorizationContext(ctx);
 
-        schedule(() -> {
-            joinPeers(peers, ServiceUriPaths.DEFAULT_NODE_GROUP);
-        }, this.state.maintenanceIntervalMicros, TimeUnit.MICROSECONDS);
+        if (joinPeerNodes) {
+            // Joining Peers is optional to allow more control on when the
+            // local node should join other peer nodes in the node-group. A node-group
+            // join triggers Xenon's state replication/ synchronization which requires
+            // all user defined factories to be started and 'Available'. If factories
+            // can take longer during host startup, it is preferable to skip joining
+            // peers during core services startup. Instead do it later after all factories
+            // on the local host have been started and Ready.
+            scheduleCore(() -> {
+                joinPeers(peers, ServiceUriPaths.DEFAULT_NODE_GROUP);
+            }, this.state.maintenanceIntervalMicros, TimeUnit.MICROSECONDS);
+        }
     }
 
     public List<URI> getInitialPeerHosts() {
@@ -1526,76 +1806,90 @@ public class ServiceHost implements ServiceRequestSender {
         return outputPath;
     }
 
-    private void startUiFileContentServices(Service s) throws Throwable {
+    private void startUiFileContentServices(Service s) throws Exception {
         if (!s.hasOption(ServiceOption.HTML_USER_INTERFACE)) {
             return;
         }
         Map<Path, String> pathToURIPath = new HashMap<>();
         ServiceDocumentDescription sdd = s.getDocumentTemplate().documentDescription;
 
+        Path rootDir = null;
+        Path baseUriPath = null;
         try {
             if (sdd != null && sdd.userInterfaceResourcePath != null) {
-                String customPathResources = s
-                        .getDocumentTemplate().documentDescription.userInterfaceResourcePath;
-                pathToURIPath = discoverUiResources(Paths.get(customPathResources), s, true);
+                String customPathResources = s.getDocumentTemplate()
+                        .documentDescription.userInterfaceResourcePath;
+                Path cpr = Paths.get(customPathResources);
+                rootDir = discoverUiResources(cpr, s, true, pathToURIPath);
+                baseUriPath = getBaseUriPath(cpr, s, true);
             } else {
                 Path baseResourcePath = Utils.getServiceUiResourcePath(s);
-                pathToURIPath = discoverUiResources(baseResourcePath, s, false);
+                rootDir = discoverUiResources(baseResourcePath, s, false, pathToURIPath);
+                baseUriPath = getBaseUriPath(baseResourcePath, s, false);
             }
-        } catch (Throwable e) {
+        } catch (Exception e) {
             log(Level.WARNING, "Error enumerating UI resources for %s: %s", s.getSelfLink(),
                     Utils.toString(e));
         }
 
-        if (pathToURIPath.isEmpty()) {
-            log(Level.WARNING, "No custom UI resources found for %s", s
-                    .getClass().getName());
+        if (pathToURIPath.isEmpty() || rootDir == null || baseUriPath == null) {
             return;
         }
 
-        for (Entry<Path, String> e : pathToURIPath.entrySet()) {
-            Operation post = Operation
-                    .createPost(UriUtils.buildUri(this, e.getValue()))
-                    .setAuthorizationContext(this.getSystemAuthorizationContext());
-            FileContentService fcs = new FileContentService(e.getKey().toFile());
-            startService(post, fcs);
-        }
+        String selfLink = baseUriPath.toString().replace('\\', '/');
+        Operation post = Operation
+                .createPost(UriUtils.buildUri(this, selfLink))
+                .setAuthorizationContext(this.getSystemAuthorizationContext());
+        this.startService(post, new DirectoryContentService(rootDir));
     }
 
     // Find UI resources for this service (e.g. html, css, js)
-    private Map<Path, String> discoverUiResources(Path path, Service s, boolean hasCustomResources)
-            throws Throwable {
-        Map<Path, String> pathToURIPath = new HashMap<>();
+    private Path discoverUiResources(Path path, Service s, boolean hasCustomResources,
+            Map<Path, String> pathToURIPath)
+            throws Exception {
         Path baseUriPath;
 
+        Path res = null;
+        baseUriPath = getBaseUriPath(path, s, hasCustomResources);
+
+        String prefix = path.toString().replace('\\', '/');
+
+        if (this.state.resourceSandboxFileReference != null) {
+            res = discoverFileResources(s, pathToURIPath, baseUriPath, prefix);
+        }
+
+        if (pathToURIPath.isEmpty()) {
+            res = discoverJarResources(path, s, pathToURIPath, baseUriPath, prefix);
+        }
+
+        return res;
+    }
+
+    private Path getBaseUriPath(Path path, Service s, boolean hasCustomResources) {
+        Path baseUriPath;
         if (!hasCustomResources) {
             baseUriPath = Paths.get(ServiceUriPaths.UI_RESOURCES,
                     Utils.buildServicePath(s.getClass()));
         } else {
             baseUriPath = Paths.get(ServiceUriPaths.UI_RESOURCES, path.toString());
         }
-
-        String prefix = path.toString().replace('\\', '/');
-
-        if (this.state.resourceSandboxFileReference != null) {
-            discoverFileResources(s, pathToURIPath, baseUriPath, prefix);
-        }
-
-        if (pathToURIPath.isEmpty()) {
-            discoverJarResources(path, s, pathToURIPath, baseUriPath, prefix);
-        }
-        return pathToURIPath;
+        return baseUriPath;
     }
 
     /**
      * Infrastructure use. Discover all jar resources for the specified service.
      */
-    public void discoverJarResources(Path path, Service s, Map<Path, String> pathToURIPath,
+    public Path discoverJarResources(Path path, Service s, Map<Path, String> pathToURIPath,
             Path baseUriPath, String prefix) throws URISyntaxException, IOException {
+        Path res = null;
         for (ResourceEntry entry : FileUtils.findResources(s.getClass(), prefix)) {
             Path resourcePath = path.resolve(entry.suffix);
             Path uriPath = baseUriPath.resolve(entry.suffix);
             Path outputPath = this.copyResourceToSandbox(entry.url, resourcePath);
+            if (res == null) {
+                String os = outputPath.toString();
+                res = Paths.get(os.substring(0, os.length() - entry.suffix.toString().length()));
+            }
             if (outputPath == null) {
                 // Failed to copy one resource, disable user interface for this service.
                 s.toggleOption(ServiceOption.HTML_USER_INTERFACE, false);
@@ -1603,18 +1897,19 @@ public class ServiceHost implements ServiceRequestSender {
                 pathToURIPath.put(outputPath, uriPath.toString().replace('\\', '/'));
             }
         }
+        return res;
     }
 
     /**
      * Infrastructure use. Discover all file system resources for the specified service.
      */
-    public void discoverFileResources(Service s, Map<Path, String> pathToURIPath,
+    public Path discoverFileResources(Service s, Map<Path, String> pathToURIPath,
             Path baseUriPath,
             String prefix) {
         File rootDir = new File(new File(this.state.resourceSandboxFileReference), prefix);
         if (!rootDir.exists()) {
             log(Level.INFO, "Resource directory not found: %s", rootDir.toString());
-            return;
+            return baseUriPath;
         }
 
         String basePath = baseUriPath.toString();
@@ -1632,9 +1927,10 @@ public class ServiceHost implements ServiceRequestSender {
         if (pathToURIPath.isEmpty()) {
             log(Level.INFO, "No resources found in directory: %s", rootDir.toString());
         }
+        return rootDir.toPath();
     }
 
-    private void startDefaultReplicationAndNodeGroupServices() throws Throwable {
+    private NodeSelectorService startDefaultReplicationAndNodeGroupServices() throws Throwable {
         // start the node group factory allowing for N number of independent groups
         startCoreServicesSynchronously(new NodeGroupFactoryService());
 
@@ -1650,7 +1946,8 @@ public class ServiceHost implements ServiceRequestSender {
         Operation startPost = Operation.createPost(UriUtils.buildUri(this,
                 ServiceUriPaths.DEFAULT_NODE_SELECTOR));
         startNodeSelectorPosts.add(startPost);
-        nodeSelectorServices.add(new ConsistentHashingNodeSelectorService());
+        NodeSelectorService defaultNodeSelectorService = new ConsistentHashingNodeSelectorService();
+        nodeSelectorServices.add(defaultNodeSelectorService);
 
         // we start second node selector that does 1X replication (owner only)
         createCustomNodeSelectorService(startNodeSelectorPosts,
@@ -1667,6 +1964,8 @@ public class ServiceHost implements ServiceRequestSender {
         // start node selectors before any other core service since the host APIs of forward
         // and broadcast must be ready before any I/O
         startCoreServicesSynchronously(startNodeSelectorPosts, nodeSelectorServices);
+
+        return defaultNodeSelectorService;
     }
 
     void createCustomNodeSelectorService(List<Operation> startNodeSelectorPosts,
@@ -1692,7 +1991,7 @@ public class ServiceHost implements ServiceRequestSender {
                         UriUtils.extendUri(peerNodeBaseUri, nodeGroupUriPath), null);
                 sendJoinPeerRequest(joinBody, localNodeGroupUri);
             }
-        } catch (Throwable e) {
+        } catch (Exception e) {
             log(Level.WARNING, "%s", Utils.toString(e));
         }
     }
@@ -1859,9 +2158,11 @@ public class ServiceHost implements ServiceRequestSender {
         }
 
         if (!l.await(this.state.operationTimeoutMicros, TimeUnit.MICROSECONDS)) {
-            log(Level.SEVERE, "One of the core services failed start: %s",
-                    sb.toString(),
-                    new TimeoutException());
+            String errorMsg = String.format("One of the core services failed start: %s",
+                    sb.toString());
+            TimeoutException e = new TimeoutException(errorMsg);
+            log(Level.SEVERE, errorMsg, e);
+            failure[0] = e;
         }
 
         OperationContext.setAuthorizationContext(originalContext);
@@ -2024,8 +2325,9 @@ public class ServiceHost implements ServiceRequestSender {
             }
         } else {
             if (notificationTargetSelfLink == null) {
+                String prefix = UriUtils.convertPathCharsFromLink(UriUtils.getParentPath(subscribe.getUri().getPath()));
                 notificationTargetSelfLink = UriUtils.buildUriPath(ServiceUriPaths.CORE_CALLBACKS,
-                        nextUUID());
+                        prefix + "-" + nextUUID());
             }
             if (request.usePublicUri) {
                 subscriptionUri = UriUtils.buildPublicUri(this, notificationTargetSelfLink);
@@ -2043,13 +2345,19 @@ public class ServiceHost implements ServiceRequestSender {
                 return null;
             }
 
-            schedule(() -> {
-                sendRequest(Operation.createDelete(UriUtils.buildUri(this,
-                        notificationTarget.getSelfLink())));
+            scheduleCore(() -> {
+                sendRequest(Operation.createDelete(
+                        UriUtils.buildUri(this, notificationTarget.getSelfLink()))
+                        .transferRefererFrom(subscribe));
             }, delta, TimeUnit.MICROSECONDS);
         }
 
-        request.reference = subscriptionUri;
+        if (request.reference == null) {
+            request.reference = subscriptionUri;
+        } else {
+            subscriptionUri = request.reference;
+        }
+
         subscribe.setBody(request);
         Operation post = Operation
                 .createPost(subscriptionUri)
@@ -2155,11 +2463,18 @@ public class ServiceHost implements ServiceRequestSender {
     }
 
     /**
-     * A service becomes available for operation processing after its attached to a running host.
-     * Service initialization is asynchronous and two phase, allowing for multiple services to start
-     * concurrently but still take dependencies on each other
+     * Start a service using the specified operation and service
      */
     public ServiceHost startService(Operation post, Service service) {
+        return startService(post, service, null);
+    }
+
+    /**
+     * Start a service using the specified operation and service.
+     * If this start is an on-demand start due to an incoming request, the incoming
+     * request that triggered this start is provided.
+     */
+    ServiceHost startService(Operation post, Service service, Operation onDemandTriggeringOp) {
         if (service == null) {
             throw new IllegalArgumentException("service is required");
         }
@@ -2195,6 +2510,12 @@ public class ServiceHost implements ServiceRequestSender {
 
         URI serviceUri = post.getUri().normalize();
         String servicePath = UriUtils.normalizeUriPath(serviceUri.getPath());
+
+        if (servicePath.endsWith(UriUtils.URI_WILDCARD_CHAR)) {
+            post.fail(new IllegalArgumentException(
+                    "service path must not end in wild card character: " + servicePath));
+            return this;
+        }
         if (service.getSelfLink() == null) {
             service.setSelfLink(servicePath);
         }
@@ -2214,12 +2535,18 @@ public class ServiceHost implements ServiceRequestSender {
                 post.fail(new IllegalStateException(errorMsg));
                 return this;
             }
-        } else if (checkIfServiceExistsAndAttach(service, servicePath, post)) {
+        } else if (checkIfServiceExistsAndAttach(service, servicePath, post, onDemandTriggeringOp)) {
             // service exists, do not proceed with start
             return this;
         }
 
-        service.setProcessingStage(ProcessingStage.CREATED);
+        try {
+            service.setProcessingStage(ProcessingStage.CREATED);
+        } catch (Exception e) {
+            log(Level.SEVERE, "Unhandled error: %s", Utils.toString(e));
+            post.fail(e);
+            return this;
+        }
 
         // make sure we detach the service on start failure
         post.nestCompletion((o, e) -> {
@@ -2238,14 +2565,14 @@ public class ServiceHost implements ServiceRequestSender {
         }
 
         if (this.isAuthorizationEnabled() && post.getAuthorizationContext() == null) {
-            populateAuthorizationContext(post, authorizationContext -> {
-                // kick off service start state machine
-                processServiceStart(ProcessingStage.INITIALIZING, service, post, post.hasBody());
-            });
+            post.setAuthorizationContext(getGuestAuthorizationContext());
+            // kick off service start state machine
+            processServiceStart(ProcessingStage.INITIALIZING, service, post, post.hasBody());
         } else {
             // kick off service start state machine
             processServiceStart(ProcessingStage.INITIALIZING, service, post, post.hasBody());
         }
+
         return this;
     }
 
@@ -2336,46 +2663,73 @@ public class ServiceHost implements ServiceRequestSender {
         }
     }
 
-    private void restoreActionOnChildServiceToPostOnFactory(String link, Operation op) {
+    void restoreActionOnChildServiceToPostOnFactory(String link, Operation op) {
         log(Level.FINE, "Changing URI for (id:%d) %s from %s to factory",
                 op.getId(), op.getAction(), link);
+
         // restart a PUT to a child service, to a POST to the factory
         op.removePragmaDirective(Operation.PRAGMA_DIRECTIVE_POST_TO_PUT);
         String factoryPath = UriUtils.getParentPath(link);
         op.setUri(UriUtils.buildUri(this, factoryPath));
         op.setAction(Action.POST);
+
+        // If this was a synchronize-owner request, we need to set the body
+        // with the documentSelfLink. Otherwise, the FactoryService will fail
+        // the request.
+        if (op.isSynchronizeOwner() && !op.hasBody()) {
+            ServiceDocument doc = new ServiceDocument();
+            doc.documentSelfLink = link;
+            op.setBody(doc);
+        }
     }
 
     private boolean checkIfServiceExistsAndAttach(Service service, String servicePath,
-            Operation post) {
+            Operation post, Operation onDemandTriggeringOp) {
         boolean isCreateOrSynchRequest = post.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED)
                 || post.isSynchronize();
         Service existing = null;
+        boolean synchPendingDelete = false;
+        boolean isOnDemandStart = onDemandTriggeringOp != null;
 
         synchronized (this.state) {
             existing = this.attachedServices.get(servicePath);
-            if (existing != null) {
-                if (isCreateOrSynchRequest
-                        && existing.getProcessingStage() == ProcessingStage.STOPPED) {
-                    // service was just stopped and about to be removed. We are creating a new instance, so
-                    // its fine to re-attach. We will do a state version check if this is a persisted service
-                    existing = null;
+            if (this.pendingServiceDeletions.contains(servicePath) &&
+                    post.isSynchronizeOwner()) {
+                // We may receive a synch request while a delete is being processed.
+                // If we don't look at pendingServiceDeletions, we may end up starting
+                // a service that is in the deletion phase.
+                synchPendingDelete = true;
+            } else {
+                if (existing != null) {
+                    if ((isCreateOrSynchRequest || isOnDemandStart)
+                            && existing.getProcessingStage() == ProcessingStage.STOPPED) {
+                        // service was just stopped and about to be removed. We are creating a new instance, so
+                        // its fine to re-attach. We will do a state version check if this is a persisted service
+                        existing = null;
+                    }
+                }
+
+                if (existing == null) {
+                    this.attachedServices.put(servicePath, service);
+                    if (service.hasOption(ServiceOption.URI_NAMESPACE_OWNER)) {
+                        this.attachedNamespaceServices.put(servicePath, service);
+                    }
+
+                    if (service.hasOption(ServiceOption.REPLICATION)
+                            && service.hasOption(ServiceOption.FACTORY)) {
+                        this.serviceSynchTracker.addService(servicePath, 0L);
+                    }
+                    this.state.serviceCount++;
+                    return false;
                 }
             }
+        }
 
-            if (existing == null) {
-                this.attachedServices.put(servicePath, service);
-                if (service.hasOption(ServiceOption.URI_NAMESPACE_OWNER)) {
-                    this.attachedNamespaceServices.put(servicePath, service);
-                }
-
-                if (service.hasOption(ServiceOption.REPLICATION)
-                        && service.hasOption(ServiceOption.FACTORY)) {
-                    this.serviceSynchTracker.addService(servicePath, 0L);
-                }
-                this.state.serviceCount++;
-                return false;
-            }
+        if (synchPendingDelete) {
+            // If this is a synch request and the service was going
+            // through deletion, we fail the synch request.
+            Operation.failServiceMarkedDeleted(servicePath, post);
+            return true;
         }
 
         boolean isIdempotent = service.hasOption(ServiceOption.IDEMPOTENT_POST);
@@ -2388,6 +2742,13 @@ public class ServiceHost implements ServiceRequestSender {
         }
 
         if (!isIdempotent && !post.isSynchronize()) {
+            if (isOnDemandStart) {
+                // this is an on-demand start and the service is already attached -
+                // no need to continue with start
+                post.complete();
+                return true;
+            }
+
             ProcessingStage ps = existing.getProcessingStage();
             if (ps == ProcessingStage.STOPPED || ServiceHost.isServiceStarting(ps)) {
                 // there is a possibility of collision with a synchronization attempt: The sync task
@@ -2399,11 +2760,12 @@ public class ServiceHost implements ServiceRequestSender {
                 log(Level.INFO, "Retrying (%d) startService() POST to %s in stage %s",
                         post.getId(),
                         servicePath, existing.getProcessingStage());
-                schedule(() -> {
-                    startService(post, service);
+                scheduleCore(() -> {
+                    startService(post, service, onDemandTriggeringOp);
                 }, this.getMaintenanceIntervalMicros(), TimeUnit.MICROSECONDS);
                 return true;
             }
+
             // service already attached, not idempotent, and this is not a synchronization attempt.
             // We fail request with conflict
             failRequestServiceAlreadyStarted(servicePath, service, post);
@@ -2424,17 +2786,17 @@ public class ServiceHost implements ServiceRequestSender {
                     post.getId(),
                     servicePath, existing.getProcessingStage());
             // Service is in the process of starting or stopping. Retry at a later time.
-            schedule(() -> {
+            scheduleCore(() -> {
                 handleRequest(null, post);
             }, this.getMaintenanceIntervalMicros(), TimeUnit.MICROSECONDS);
             return true;
         }
 
-        log(Level.FINE, "Converting (%d) POST to PUT for idempotent %s in stage %s",
-                post.getId(),
+        // service exists, on IDEMPOTENT factory or sync request. Convert to a PUT
+        String convertReason = post.isSynchronize() ? "synchronizing" : "idempotent";
+        log(Level.FINE, "Converting (%d) POST to PUT for %s %s in stage %s",
+                post.getId(), convertReason,
                 servicePath, existing.getProcessingStage());
-
-        // service exists, on IDEMPOTENT factory. Convert to a PUT
         post.setAction(Action.PUT);
         post.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_POST_TO_PUT);
 
@@ -2444,10 +2806,6 @@ public class ServiceHost implements ServiceRequestSender {
 
     public static boolean isServiceIndexed(Service s) {
         return s.hasOption(ServiceOption.PERSISTENCE);
-    }
-
-    public static boolean isServiceOnDemandLoad(Service s) {
-        return s.hasOption(ServiceOption.ON_DEMAND_LOAD);
     }
 
     public static boolean isServiceImmutable(Service s) {
@@ -2463,12 +2821,12 @@ public class ServiceHost implements ServiceRequestSender {
         }
 
         if (isStopping()) {
-            post.fail(new CancellationException());
+            post.fail(new CancellationException("Host is stopping"));
             return;
         }
 
         if (s.getProcessingStage() == ProcessingStage.STOPPED) {
-            post.fail(new CancellationException());
+            post.fail(new CancellationException("Service is stopped"));
             return;
         }
 
@@ -2484,7 +2842,11 @@ public class ServiceHost implements ServiceRequestSender {
                 if (post.hasBody()) {
                     // make sure body is in native form and has creation time
                     ServiceDocument d = post.getBody(s.getStateType());
-                    d.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
+
+                    // preserve original update time for migration task
+                    if (!post.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_FROM_MIGRATION_TASK) && !post.isFromReplication()) {
+                        d.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
+                    }
                 }
 
                 // Populate authorization context if necessary
@@ -2504,12 +2866,12 @@ public class ServiceHost implements ServiceRequestSender {
             case LOADING_INITIAL_STATE:
                 boolean isImmutableStart = ServiceHost.isServiceCreate(post)
                         && isServiceImmutable(s);
-                if (!isImmutableStart && isServiceIndexed(s) && !post.isFromReplication()) {
+                if (!isImmutableStart && isServiceIndexed(s) && (!post.isFromReplication() ||
+                        post.isSynchronizePeer())) {
                     // Skip querying the index for existing state if any of the following is true:
                     // 1) Service is marked IMMUTABLE. This means no previous version should exist,
                     //     its up to the client to enforce unique links
-                    // 2) Request is from replication. This means state is already attached to the
-                    //     request
+                    // 2) Request is from replication and is not a synch-peer request
                     // 3) Service is NOT indexed.
                     loadInitialServiceState(s, post, ProcessingStage.SYNCHRONIZING,
                             hasClientSuppliedInitialState);
@@ -2536,8 +2898,7 @@ public class ServiceHost implements ServiceRequestSender {
                             hasInitialState);
                 });
 
-                boolean isFactorySync = !ServiceHost.isServiceCreate(post);
-                selectServiceOwnerAndSynchState(s, post, isFactorySync);
+                selectServiceOwnerAndSynchState(s, post);
                 break;
 
             case EXECUTING_CREATE_HANDLER:
@@ -2564,7 +2925,7 @@ public class ServiceHost implements ServiceRequestSender {
                 try {
                     s.adjustStat(Service.STAT_NAME_CREATE_COUNT, 1);
                     s.handleCreate(post);
-                } catch (Throwable e) {
+                } catch (Exception e) {
                     handleUncaughtException(s, post, e);
                     return;
                 } finally {
@@ -2610,9 +2971,8 @@ public class ServiceHost implements ServiceRequestSender {
                 }
 
                 if (!post.hasBody()
-                        && ServiceHost.isServiceOnDemandLoad(s)
                         && post.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK)) {
-                    // skip handleStart for ODL probes (the POST was issued to check if the service
+                    // skip handleStart for probes (the POST was issued to check if the service
                     // existed
                     post.complete();
                     return;
@@ -2621,7 +2981,7 @@ public class ServiceHost implements ServiceRequestSender {
                 opCtx = extractAndApplyContext(post);
                 try {
                     s.handleStart(post);
-                } catch (Throwable e) {
+                } catch (Exception e) {
                     handleUncaughtException(s, post, e);
                     return;
                 } finally {
@@ -2633,8 +2993,10 @@ public class ServiceHost implements ServiceRequestSender {
 
                 if (isServiceIndexed(s) && !s.hasOption(ServiceOption.FACTORY)) {
                     // we only index if this is a synchronization request from
-                    // a remote peer, or this is a new "create", brand new service start.
-                    if (post.isSynchronizePeer() || hasClientSuppliedInitialState) {
+                    // a remote peer (unless it's of the same version of the last one in
+                    // the index), or this is a new "create", brand new service start.
+                    if ((post.isSynchronizePeer() || hasClientSuppliedInitialState) &&
+                            !post.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE)) {
                         needsIndexing = true;
                     }
                 }
@@ -2650,8 +3012,9 @@ public class ServiceHost implements ServiceRequestSender {
                         log(Level.WARNING, "documentKind is null for %s", s.getSelfLink());
                         state.documentKind = Utils.buildKind(s.getStateType());
                     }
+
                     this.serviceResourceTracker.updateCachedServiceState(s,
-                            state, post);
+                                state, post);
                 }
 
                 if (!post.hasBody() || !needsIndexing) {
@@ -2731,7 +3094,7 @@ public class ServiceHost implements ServiceRequestSender {
                 break;
 
             }
-        } catch (Throwable e) {
+        } catch (Exception e) {
             log(Level.SEVERE, "Unhandled error: %s", Utils.toString(e));
             post.fail(e);
         }
@@ -2818,10 +3181,6 @@ public class ServiceHost implements ServiceRequestSender {
             return;
         }
 
-        if (s.hasOption(ServiceOption.INSTRUMENTATION)) {
-            s.adjustStat(Service.STAT_NAME_CACHE_MISS_COUNT, 1);
-        }
-
         Operation getOp = Operation.createGet(op.getUri())
                 .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_INDEX_CHECK)
                 .transferRefererFrom(op)
@@ -2832,7 +3191,7 @@ public class ServiceHost implements ServiceRequestSender {
                     }
 
                     if (!o.hasBody()) {
-                        failRequestServiceNotFound(op);
+                        Operation.failServiceNotFound(op);
                         return;
                     }
 
@@ -2842,16 +3201,28 @@ public class ServiceHost implements ServiceRequestSender {
                         return;
                     }
 
+                    this.serviceResourceTracker.updateCachedServiceState(s, st, op);
+
                     op.linkState(st).complete();
                 });
 
-        Service indexService = this.documentIndexService;
+        Service indexService = getIndexServiceForService(s);
+
         if (indexService == null) {
-            op.fail(new CancellationException());
+            op.fail(new CancellationException("Index service is null"));
             return;
         }
 
         indexService.handleRequest(getOp);
+    }
+
+    private Service getIndexServiceForService(Service s) {
+        Service indexService = this.documentIndexService;
+        if (s.getDocumentIndexPath() != null && ServiceUriPaths.CORE_DOCUMENT_INDEX.hashCode() != s
+                .getDocumentIndexPath().hashCode()) {
+            indexService = this.findService(s.getDocumentIndexPath());
+        }
+        return indexService;
     }
 
     /**
@@ -2867,6 +3238,7 @@ public class ServiceHost implements ServiceRequestSender {
 
         AuthorizationContext ctx = op.getAuthorizationContext();
         if (ctx == null) {
+            log(Level.FINE, String.format("request to %s with null auth context", service.getSelfLink()));
             return false;
         }
 
@@ -2890,9 +3262,14 @@ public class ServiceHost implements ServiceRequestSender {
             document.documentKind = Utils.buildKind(clazz);
         }
 
-        ServiceDocumentDescription documentDescription = buildDocumentDescription(service);
-        QueryFilter queryFilter = ctx.getResourceQueryFilter(op.getAction());
-        if (queryFilter == null || !queryFilter.evaluate(document, documentDescription)) {
+        try {
+            ServiceDocumentDescription documentDescription = buildDocumentDescription(service);
+            QueryFilter queryFilter = ctx.getResourceQueryFilter(op.getAction());
+            if (queryFilter == null || !queryFilter.evaluate(document, documentDescription)) {
+                return false;
+            }
+        } catch (Exception e) {
+            log(Level.SEVERE, "Unexpected failure during authorization check. %s", e.toString());
             return false;
         }
 
@@ -2901,9 +3278,9 @@ public class ServiceHost implements ServiceRequestSender {
 
     void loadInitialServiceState(Service s, Operation serviceStartPost, ProcessingStage next,
             boolean hasClientSuppliedState) {
-        Service indexService = this.documentIndexService;
+        Service indexService = getIndexServiceForService(s);
         if (indexService == null) {
-            serviceStartPost.fail(new CancellationException());
+            serviceStartPost.fail(new CancellationException("Index service is null"));
             return;
         }
 
@@ -2917,6 +3294,10 @@ public class ServiceHost implements ServiceRequestSender {
                     indexQueryOperation, e);
         });
         indexService.handleRequest(getLatestState);
+    }
+
+    ServiceDocument getCachedServiceState(Service s, Operation op) {
+        return this.serviceResourceTracker.getCachedServiceState(s, op);
     }
 
     void cacheServiceState(Service s, ServiceDocument st, Operation op) {
@@ -2958,13 +3339,21 @@ public class ServiceHost implements ServiceRequestSender {
             return;
         }
 
-        ServiceDocument stateFromStore = null;
-        if (indexQueryOperation.hasBody()) {
-            stateFromStore = indexQueryOperation.getBody(s.getStateType());
-            serviceStartPost.linkState(stateFromStore);
-        }
+        ServiceDocument stateFromStore = indexQueryOperation.hasBody() ?
+                indexQueryOperation.getBody(s.getStateType()) : null;
+        boolean isSynchronizePeer = serviceStartPost.isSynchronizePeer();
+
+        ServiceDocument stateToLink = isSynchronizePeer ?
+                (ServiceDocument) serviceStartPost.getBodyRaw() : stateFromStore;
+        serviceStartPost.linkState(stateToLink);
 
         if (!checkServiceExistsOrDeleted(s, stateFromStore, serviceStartPost)) {
+            return;
+        }
+
+        if (isSynchronizePeer) {
+            processServiceStart(next, s,
+                    serviceStartPost, hasClientSuppliedState);
             return;
         }
 
@@ -2998,14 +3387,11 @@ public class ServiceHost implements ServiceRequestSender {
         boolean isDeleted = ServiceDocument.isDeleted(stateFromStore)
                 || this.pendingServiceDeletions.contains(s.getSelfLink());
 
-        if (isDeleted && serviceStartPost.isSynchronizeOwner()) {
-            return true;
-        }
-
         if (!serviceStartPost.hasBody()) {
             if (isDeleted) {
                 // this POST is due to a restart which will never have a body
-                failRequestServiceMarkedDeleted(stateFromStore, serviceStartPost);
+                Operation.failServiceMarkedDeleted(stateFromStore.documentSelfLink,
+                        serviceStartPost);
                 return false;
             } else {
                 // this POST is due to a restart, which will never have a body
@@ -3026,15 +3412,23 @@ public class ServiceHost implements ServiceRequestSender {
                         stateFromStore.documentVersion,
                         initState.documentVersion,
                         serviceStartPost.getRequestHeaderAsIs(Operation.PRAGMA_HEADER));
-                failRequestServiceMarkedDeleted(stateFromStore, serviceStartPost);
+                Operation.failServiceMarkedDeleted(stateFromStore.documentSelfLink,
+                        serviceStartPost);
                 return false;
             }
         }
 
+        if (serviceStartPost.isSynchronizePeer()) {
+            // this is a sync-peer request, which should allow to continue
+            if (stateFromStore.documentVersion == initState.documentVersion) {
+                // avoid creating a duplicate document version
+                serviceStartPost.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE);
+            }
+            return true;
+        }
+
         if (!s.hasOption(ServiceOption.IDEMPOTENT_POST)) {
-            // ON_DEMAND_LOAD services might not be present in the attachedService map, but will
-            // exist in the index. This is an attempt to start such a service that already exists,
-            // operation
+            // This is an attempt to start a service that already exists
             log(Level.WARNING, "Attempt to start existing service %s.Version: %d, in body: %d",
                     stateFromStore.documentSelfLink,
                     stateFromStore.documentVersion,
@@ -3049,12 +3443,17 @@ public class ServiceHost implements ServiceRequestSender {
     void markAsPendingDelete(Service service) {
         if (isServiceIndexed(service)) {
             this.pendingServiceDeletions.add(service.getSelfLink());
+            this.managementService.adjustStat(
+                    ServiceHostManagementService.STAT_NAME_PENDING_SERVICE_DELETION_COUNT, 1);
         }
     }
 
     void unmarkAsPendingDelete(Service service) {
         if (isServiceIndexed(service)) {
             this.pendingServiceDeletions.remove(service.getSelfLink());
+            this.managementService.adjustStat(
+                    ServiceHostManagementService.STAT_NAME_PENDING_SERVICE_DELETION_COUNT, -1);
+
         }
     }
 
@@ -3069,11 +3468,8 @@ public class ServiceHost implements ServiceRequestSender {
         if (service == null) {
             throw new IllegalArgumentException("service is required");
         }
-        stopService(service.getSelfLink());
-    }
 
-    private void stopService(String path) {
-        EnumSet<ServiceOption> options = null;
+        String path = service.getSelfLink();
         synchronized (this.state) {
             Service existing = this.attachedServices.remove(path);
             if (existing == null) {
@@ -3082,7 +3478,6 @@ public class ServiceHost implements ServiceRequestSender {
             }
 
             if (existing != null) {
-                options = existing.getOptions();
                 existing.setProcessingStage(ProcessingStage.STOPPED);
                 if (existing.hasOption(ServiceOption.URI_NAMESPACE_OWNER)) {
                     this.attachedNamespaceServices.remove(path);
@@ -3090,24 +3485,10 @@ public class ServiceHost implements ServiceRequestSender {
             }
 
             this.serviceSynchTracker.removeService(path);
-            this.serviceResourceTracker.clearCachedServiceState(existing, path, null);
-            this.pendingPauseServices.remove(path);
+            this.serviceResourceTracker.clearCachedServiceState(service, null);
 
             this.state.serviceCount--;
         }
-
-        // we do not remove from maintenance tracker, service will
-        // be ignored and never schedule for maintenance if its stopped
-        if (options == null || this.managementService == null) {
-            return;
-        }
-
-        if (options.contains(ServiceOption.ON_DEMAND_LOAD)) {
-            this.managementService.adjustStat(
-                    ServiceHostManagementService.STAT_NAME_ODL_STOP_COUNT,
-                    1);
-        }
-
     }
 
     protected Service findService(String uriPath) {
@@ -3120,13 +3501,20 @@ public class ServiceHost implements ServiceRequestSender {
             return s;
         }
 
-        s = this.attachedServices.get(UriUtils.normalizeUriPath(uriPath));
-        if (s != null) {
-            return s;
+        String normalizedUriPath = UriUtils.normalizeUriPath(uriPath);
+        // Check if we got a new normalized uri path
+        if (!normalizedUriPath.equals(uriPath)) {
+            s = this.attachedServices.get(normalizedUriPath);
+            if (s != null) {
+                return s;
+            }
         }
 
         if (isHelperServicePath(uriPath)) {
-            return findHelperService(uriPath);
+            s = findHelperService(uriPath);
+            if (s != null) {
+                return s;
+            }
         }
 
         if (!doExactMatch) {
@@ -3187,6 +3575,7 @@ public class ServiceHost implements ServiceRequestSender {
     /**
      * Infrastructure use only
      */
+    @SuppressWarnings("try")
     public boolean handleRequest(Service service, Operation inboundOp) {
         if (inboundOp == null && service != null) {
             inboundOp = service.dequeueRequest();
@@ -3208,120 +3597,61 @@ public class ServiceHost implements ServiceRequestSender {
         }
 
         if (!this.state.isStarted) {
-            failRequestServiceNotFound(inboundOp);
+            Operation.failServiceNotFound(inboundOp);
             return true;
         }
 
-        if (this.isAuthorizationEnabled()) {
-            checkAndPopulateAuthContext(service, inboundOp);
-        } else {
-            handleRequestWithAuthContext(service, inboundOp);
-        }
+        if (isTracingEnabled()) {
+            // Create a tracing span for this new request we're handling
+            SpanContext extractedContext = this.otTracer.extract(
+                    Format.Builtin.HTTP_HEADERS,
+                    new TextMapExtractAdapter(inboundOp.getRequestHeaders()));
 
-        return true;
+            try (ActiveSpan span = this.otTracer.buildSpan(inboundOp.getUri().getPath())
+                    // By definition this is a new request, so we don't want to use any active span (e.g. due to
+                    // fastpathing or a bug or some such) as a parent.
+                    .ignoreActiveSpan()
+                    .asChildOf(extractedContext)
+                    .withTag(Tags.SPAN_KIND.getKey(), Tags.SPAN_KIND_SERVER)
+                    .startActive()) {
+                // Populate common operation tags for the span.
+                TracingUtils.setSpanTags(inboundOp, span);
+
+                // capture the response code of the operation
+                final ActiveSpan.Continuation completion_cont = span.capture();
+                nestContinuationActivation(inboundOp, completion_cont);
+                passThroughProcessingChain(inboundOp);
+                return true;
+            }
+        } else {
+            passThroughProcessingChain(inboundOp);
+            return true;
+        }
     }
 
-    private void checkAndPopulateAuthContext(Service service, Operation inboundOp) {
-        if (inboundOp.getAuthorizationContext() != null) {
-            checkAndPopulateAuthzContext(service, inboundOp);
-            return;
-        }
-
-        if (BasicAuthenticationUtils.getAuthToken(inboundOp) != null) {
-            populateAuthorizationContext(inboundOp, (authorizationContext) -> {
-                checkAndPopulateAuthzContext(service, inboundOp);
-            });
-            return;
-        }
-
-        // If the inbound op targets a valid authentication service, then allow it to proceed using
-        // the guest context; this is needed so that clients can get the token.
-        URI authServiceUri = getAuthenticationServiceUri();
-        if (authServiceUri != null
-                && authServiceUri.getPath().equals(inboundOp.getUri().getPath())) {
-            populateAuthorizationContext(inboundOp, (authorizationContext) -> {
-                checkAndPopulateAuthzContext(service, inboundOp);
-            });
-            return;
-        }
-
-        URI basicAuthServiceUri = getBasicAuthenticationServiceUri();
-        if (basicAuthServiceUri != null
-                && basicAuthServiceUri.getPath().equals(inboundOp.getUri().getPath())) {
-            populateAuthorizationContext(inboundOp, authorizationContext -> {
-                checkAndPopulateAuthzContext(service, inboundOp);
-            });
-            return;
-        }
-
-        // Dispatch the operation to the authentication service for handling.
-        inboundOp.nestCompletion((op, ex) -> {
-            if (ex != null) {
-                inboundOp.setBodyNoCloning(op.getBodyRaw())
-                        .setStatusCode(op.getStatusCode()).fail(ex);
-                return;
-            }
-            // If the status code was anything but 200, and the operation
-            // was not marked as failed, terminate the processing chain;
-            // else proceed with the original request using the guest context
-            if (op.getStatusCode() != Operation.STATUS_CODE_OK) {
-                inboundOp.setBodyNoCloning(op.getBodyRaw())
-                        .setStatusCode(op.getStatusCode()).complete();
-                return;
-            }
-            populateAuthorizationContext(inboundOp, authorizationContext -> {
-                checkAndPopulateAuthzContext(service, inboundOp);
-            });
+    private void passThroughProcessingChain(Operation inboundOp) {
+        // Pass the operation through the processing chain.
+        OperationProcessingContext context = this.opProcessingChain.createContext(this);
+        final Operation finalInboundOp = inboundOp;
+        this.opProcessingChain.processRequest(inboundOp, context, o -> {
+            handleRequestAfterOpProcessingChain(context.getService(), finalInboundOp);
         });
-        queueOrScheduleRequest(this.authenticationService, inboundOp);
     }
 
-    private void checkAndPopulateAuthzContext(Service service, Operation inboundOp) {
-        if (this.authorizationService != null) {
-            inboundOp.nestCompletion(op -> {
-                handleRequestWithAuthContext(null, inboundOp);
-            });
-            queueOrScheduleRequest(this.authorizationService, inboundOp);
-        } else {
-            handleRequestWithAuthContext(service, inboundOp);
-        }
-    }
-
-    private void handleRequestWithAuthContext(Service service, Operation inboundOp) {
-        String path;
+    private void handleRequestAfterOpProcessingChain(Service service, Operation inboundOp) {
         if (service == null) {
-            path = inboundOp.getUri().getPath();
+            String path = inboundOp.getUri().getPath();
             if (path == null) {
-                failRequestServiceNotFound(inboundOp);
+                Operation.failServiceNotFound(inboundOp);
                 return;
             }
 
             // request service using either prefix or longest match
             service = findService(path, false);
-        } else {
-            path = service.getSelfLink();
-        }
-
-        // if this service was about to stop, due to memory pressure, cancel, its still active
-        Service pendingStopService = this.pendingPauseServices.remove(path);
-        if (pendingStopService != null) {
-            service = pendingStopService;
-        }
-
-        if (applyRequestRateLimit(service, inboundOp)) {
-            return;
-        }
-
-        if (queueRequestUntilServiceAvailable(inboundOp, service, path)) {
-            return;
-        }
-
-        if (queueOrForwardRequest(service, path, inboundOp)) {
-            return;
         }
 
         if (service == null) {
-            failRequestServiceNotFound(inboundOp);
+            Operation.failServiceNotFound(inboundOp);
             return;
         }
 
@@ -3340,565 +3670,11 @@ public class ServiceHost implements ServiceRequestSender {
         return;
     }
 
-    void getAuthorizationContext(Operation op, Consumer<AuthorizationContext> authorizationContextHandler) {
-        String token = BasicAuthenticationUtils.getAuthToken(op);
-
-        if (token == null) {
-            authorizationContextHandler.accept(null);
-            return;
-        }
-
-        AuthorizationContext ctx = this.authorizationContextCache.get(token);
-        if (ctx != null) {
-            ctx = checkAndGetAuthorizationContext(ctx, ctx.getClaims(), token, op);
-            authorizationContextHandler.accept(ctx);
-            return;
-        }
-
-        verifyToken(token, op, authorizationContextHandler);
+    void retryOnDemandLoadConflict(Operation op, Service s) {
+        this.serviceResourceTracker.retryOnDemandLoadConflict(op, s);
     }
 
-    private void verifyToken(String token, Operation op,
-            Consumer<AuthorizationContext> authorizationContextHandler) {
-        boolean shoudRetry = true;
-        URI tokenVerificationUri = getAuthenticationServiceUri();
-
-        if (getBasicAuthenticationServiceUri().equals(getAuthenticationServiceUri())) {
-            // if authenticationService is BasicAuthenticationService, then no need to retry
-            shoudRetry = false;
-        }
-
-        verifyTokenInternal(token, op, tokenVerificationUri, authorizationContextHandler, shoudRetry);
-    }
-
-    private void verifyTokenInternal(String token, Operation parentOp, URI tokenVerificationUri,
-            Consumer<AuthorizationContext> authorizationContextHandler, boolean shouldRetry) {
-        Operation verifyOp = Operation
-                .createPost(tokenVerificationUri)
-                .setReferer(parentOp.getUri())
-                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_VERIFY_TOKEN)
-                .addRequestHeader(Operation.REQUEST_AUTH_TOKEN_HEADER, token)
-                .setCompletion(
-                        (resultOp, ex) -> {
-                            if (ex != null) {
-                                log(Level.WARNING, "Error verifying token: %s", ex);
-                                if (shouldRetry) {
-                                    log(Level.INFO, "Retrying token verification with basic auth.");
-                                    verifyTokenInternal(token, parentOp, getBasicAuthenticationServiceUri(),
-                                            authorizationContextHandler, false);
-                                } else {
-                                    authorizationContextHandler.accept(null);
-                                }
-                            } else {
-                                Claims claims = resultOp.getBody(Claims.class);
-                                // check to see if the subject is valid
-                                Operation getUserOp = Operation.createGet(
-                                        AuthUtils.buildAuthProviderHostUri(this, claims.getSubject()))
-                                        .setReferer(parentOp.getUri())
-                                        .setCompletion((getOp, getEx) -> {
-                                            if (getEx != null) {
-                                                log(Level.WARNING, "Error obtaining subject: %s", getEx);
-                                                // return a null context. This will result in the auth context
-                                                // for this operation defaulting to the guest context
-                                                authorizationContextHandler.accept(null);
-                                                return;
-                                            }
-                                            AuthorizationContext authCtx = checkAndGetAuthorizationContext(
-                                                    null, claims, token, parentOp);
-                                            authorizationContextHandler.accept(authCtx);
-                                        });
-                                getUserOp.setAuthorizationContext(getSystemAuthorizationContext());
-                                sendRequest(getUserOp);
-                            }
-                        });
-        verifyOp.setAuthorizationContext(getSystemAuthorizationContext());
-        sendRequest(verifyOp);
-    }
-
-    private AuthorizationContext checkAndGetAuthorizationContext(AuthorizationContext ctx,
-            Claims claims, String token, Operation op) {
-
-        if (claims == null) {
-            log(Level.INFO, "Request to %s has no claims found with token: %s",
-                    op.getUri().getPath(), token);
-            return null;
-        }
-
-        Long expirationTime = claims.getExpirationTime();
-        if (expirationTime != null && expirationTime <= Utils.getSystemNowMicrosUtc()) {
-            synchronized (this.state) {
-                this.authorizationContextCache.remove(token);
-                this.userLinkToTokenMap.remove(claims.getSubject());
-            }
-            return null;
-        }
-
-        if (ctx != null) {
-            return ctx;
-        }
-
-        AuthorizationContext.Builder b = AuthorizationContext.Builder.create();
-        b.setClaims(claims);
-        b.setToken(token);
-        ctx = b.getResult();
-        synchronized (this.state) {
-            this.authorizationContextCache.put(token, ctx);
-            addUserToken(this.userLinkToTokenMap, claims.getSubject(), token);
-        }
-        return ctx;
-    }
-
-    /**
-     * Helper method to associate a token with a userServiceLink
-     * @param userLinktoTokenMap map to add the entry to
-     * @param userServiceLink the user service reference
-     * @param token user token
-     */
-    private void addUserToken(Map<String, Set<String>> userLinktoTokenMap, String userServiceLink,
-            String token) {
-        Set<String> tokenSet = userLinktoTokenMap.get(userServiceLink);
-        if (tokenSet == null) {
-            tokenSet = new HashSet<String>();
-        }
-        tokenSet.add(token);
-        userLinktoTokenMap.put(userServiceLink, tokenSet);
-    }
-
-    void failRequestServiceNotFound(Operation inboundOp) {
-        failRequestServiceNotFound(inboundOp,
-                ServiceErrorResponse.ERROR_CODE_INTERNAL_MASK);
-    }
-
-    void failRequestServiceNotFound(Operation inboundOp, int errorCode) {
-        failRequest(inboundOp, Operation.STATUS_CODE_NOT_FOUND,
-                errorCode,
-                new ServiceNotFoundException(inboundOp.getUri().toString()));
-    }
-
-    private void failRequestServiceMarkedDeleted(ServiceDocument stateFromStore,
-            Operation serviceStartPost) {
-        failRequest(serviceStartPost, Operation.STATUS_CODE_CONFLICT,
-                ServiceErrorResponse.ERROR_CODE_STATE_MARKED_DELETED,
-                new IllegalStateException("Service marked deleted: "
-                        + stateFromStore.documentSelfLink));
-    }
-
-    void failRequestServiceAlreadyStarted(String path, Service s, Operation post) {
-        ProcessingStage st = ProcessingStage.AVAILABLE;
-        if (s != null) {
-            st = s.getProcessingStage();
-        }
-        Exception e = new ServiceAlreadyStartedException(path, st);
-        failRequest(post, Operation.STATUS_CODE_CONFLICT,
-                ServiceErrorResponse.ERROR_CODE_SERVICE_ALREADY_EXISTS,
-                e);
-    }
-
-
-    /**
-     * Forwards request to a peer, if local node is not the owner for the service. This method is
-     * part of the consensus logic for the replication protocol. It serves the following functions:
-     *
-     * 1) If this request came from a client, it performs the role of finding the owner, on behalf
-     * of the client
-     *
-     * 2) If this request came from a peer node AND the local node is the owner, then it handles
-     * request, initiating the replication state machine
-     *
-     * 3) If the request came from a peer owner node, the local node is acting as a certifier
-     * replica and needs to verify it agrees on epoch,  owner and the state version.
-     *
-     * In both cases 2 and 3 the request will be handled locally.
-     *
-     * Note that we do not require the service to be present locally. We will use the URI path to
-     * select an owner and forward.
-     *
-     * @return
-     */
-    private boolean queueOrForwardRequest(Service s, String path, Operation op) {
-        if (s == null && op.isFromReplication()) {
-            if (op.getAction() == Action.DELETE) {
-                op.complete();
-            } else {
-                failRequestServiceNotFound(op);
-            }
-            return true;
-        }
-
-        String nodeSelectorPath;
-        Service parent = null;
-        EnumSet<ServiceOption> options;
-        if (s != null) {
-            // Common path, service is known.
-            options = s.getOptions();
-
-            if (options == null) {
-                return false;
-            } else if (options.contains(ServiceOption.UTILITY)) {
-                // find the parent service, which will have the complete option set
-                // relevant to forwarding
-                path = UriUtils.getParentPath(path);
-                parent = findService(path);
-                if (parent == null) {
-                    if (op.getRetryCount() == 0) {
-                        op.setRetryCount(1);
-                    }
-                    if (op.decrementRetriesRemaining() >= 0) {
-                        log(Level.WARNING, "Parent for %s missing, retrying", op.getUri().getPath());
-                        retryPauseOrOnDemandLoadConflict(op, false);
-                        return true;
-                    }
-                    failRequestServiceNotFound(op);
-                    return true;
-                }
-                options = parent.getOptions();
-            }
-
-            if (options == null
-                    || !options.contains(ServiceOption.OWNER_SELECTION)
-                    || options.contains(ServiceOption.FACTORY)) {
-                return false;
-            }
-        } else {
-            // Service is unknown.
-            // Find the service options indirectly, if there is a parent factory.
-            if (isHelperServicePath(path)) {
-                path = UriUtils.getParentPath(path);
-            }
-
-            String factoryPath = UriUtils.getParentPath(path);
-            if (factoryPath == null) {
-                failRequestServiceNotFound(op);
-                return true;
-            }
-
-            parent = findService(factoryPath);
-            if (parent == null) {
-                failRequestServiceNotFound(op);
-                return true;
-            }
-            options = parent.getOptions();
-
-            if (options == null ||
-                    !options.contains(ServiceOption.FACTORY) ||
-                    !options.contains(ServiceOption.REPLICATION)) {
-                return false;
-            }
-        }
-
-        if (op.isForwardingDisabled()) {
-            return false;
-        }
-
-        if (options.contains(ServiceOption.ON_DEMAND_LOAD) &&
-                op.getAction() == Action.DELETE &&
-                op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE)) {
-            // This request was to stop an ODL service as part of reducing Xenon's
-            // memory foot-print (See ServiceResourceTracker). So we will avoid forwarding
-            // the request to the owner and instead just stop the local service instance.
-            if (s == null) {
-                op.complete();
-                return true;
-            }
-            return false;
-        }
-
-        if (parent != null) {
-            nodeSelectorPath = parent.getPeerNodeSelectorPath();
-        } else {
-            nodeSelectorPath = s.getPeerNodeSelectorPath();
-        }
-
-        op.setStatusCode(Operation.STATUS_CODE_OK);
-
-        String servicePath = path;
-        Service parentService = parent;
-        CompletionHandler ch = (o, e) -> {
-            if (e != null) {
-                log(Level.SEVERE, "Owner selection failed for service %s, op %d. Error: %s", op
-                        .getUri().getPath(), op.getId(), e.toString());
-                op.setRetryCount(0).fail(e);
-                run(() -> {
-                    handleRequest(s, null);
-                });
-                return;
-            }
-
-            // fail or forward the request if we do not agree with the sender, who the owner is
-            SelectOwnerResponse rsp = o.getBody(SelectOwnerResponse.class);
-
-            if (op.isFromReplication()) {
-                ServiceDocument body = op.getBody(s.getStateType());
-                if (rsp.isLocalHostOwner) {
-                    failRequestOwnerMismatch(op, rsp.ownerNodeId, body);
-                    return;
-                }
-
-                queueOrScheduleRequest(s, op);
-                return;
-            }
-
-            CompletionHandler fc = (fo, fe) -> {
-                if (fe != null) {
-                    retryOrFailRequest(op, fo, fe);
-                    return;
-                }
-
-                op.setStatusCode(fo.getStatusCode());
-                if (fo.hasBody()) {
-                    op.setBodyNoCloning(fo.getBodyRaw());
-                }
-                op.transferResponseHeadersFrom(fo);
-                op.complete();
-            };
-
-            Operation forwardOp = op.clone().setCompletion(fc);
-            if (rsp.isLocalHostOwner) {
-                if (s == null) {
-                    queueOrFailRequestForServiceNotFoundOnOwner(
-                            parentService, servicePath, op, rsp.availableNodeCount);
-                    return;
-                }
-                queueOrScheduleRequest(s, forwardOp);
-                return;
-            }
-
-            if (op.isForwarded()) {
-                // this was forwarded from another node, but we do not think we own the service
-                failRequestOwnerMismatch(op, op.getUri().getPath(), null);
-                return;
-            }
-
-            // Forwarded operations are retried until the parent operation, from the client,
-            // expires. Since a peer might have become unresponsive, we want short time outs
-            // and retries, to whatever peer we select, on each retry.
-            forwardOp.setExpiration(Utils.fromNowMicrosUtc(
-                    this.state.operationTimeoutMicros / 10));
-            forwardOp.setUri(SelectOwnerResponse.buildUriToOwner(rsp, op));
-
-            prepareForwardRequest(forwardOp);
-            // Local host is not the owner, but is the entry host for a client. Forward to owner
-            // node
-            sendRequest(forwardOp);
-        };
-
-        Operation selectOwnerOp = Operation
-                .createPost(null)
-                .setExpiration(op.getExpirationMicrosUtc())
-                .setCompletion(ch);
-        selectOwner(nodeSelectorPath, path, selectOwnerOp);
-        return true;
-    }
-
-    private void queueOrFailRequestForServiceNotFoundOnOwner(
-            Service parent, String path, Operation op, int availableNodeCount) {
-        if (this.serviceResourceTracker.checkAndResumeService(op)) {
-            return;
-        }
-
-        boolean synchService = parent != null &&
-                parent.hasOption(ServiceOption.FACTORY) &&
-                parent.hasOption(ServiceOption.REPLICATION) &&
-                op.getAction() != Action.POST &&
-                availableNodeCount > 1 &&
-                !op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY);
-
-        if (!synchService) {
-            if (op.getAction() == Action.DELETE) {
-                // do not queue DELETE actions for services not present, complete with success
-                op.complete();
-                return;
-            }
-            checkPragmaAndRegisterForAvailability(path, op);
-            return;
-        }
-
-        this.serviceSynchTracker.failWithNotFoundOrSynchronize(parent, path, op);
-    }
-
-    void checkPragmaAndRegisterForAvailability(String path, Operation op) {
-        if (!op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY)) {
-            this.failRequestServiceNotFound(op);
-            return;
-        }
-
-        log(Level.INFO, "(%d) Registering for %s to become available on owner %s", op.getId(),
-                path, getId());
-        // service not available, register, then retry
-        op.nestCompletion((avop) -> {
-            handleRequest(null, op);
-        });
-        registerForServiceAvailability(op, path);
-    }
-
-    void failRequestOwnerMismatch(Operation op, String id, ServiceDocument body) {
-        String owner = body != null ? body.documentOwner : "";
-        op.setStatusCode(Operation.STATUS_CODE_CONFLICT);
-        Throwable e = new IllegalStateException(String.format(
-                "Owner in body: %s, computed locally: %s",
-                owner, id));
-        ServiceErrorResponse rsp = ServiceErrorResponse.create(e, op.getStatusCode(),
-                EnumSet.of(ErrorDetail.SHOULD_RETRY));
-        rsp.setInternalErrorCode(ServiceErrorResponse.ERROR_CODE_OWNER_MISMATCH);
-        op.fail(e, rsp);
-    }
-
-    public void failRequestActionNotSupported(Operation request) {
-        request.setStatusCode(Operation.STATUS_CODE_BAD_METHOD).fail(
-                new IllegalArgumentException("Action not supported: " + request.getAction()));
-    }
-
-    public void failRequestLimitExceeded(Operation request) {
-        // Add a header indicating retry should be attempted after some interval.
-        // Currently set to just one second, subject to change in the future
-        request.addResponseHeader(Operation.RETRY_AFTER_HEADER, "1");
-        // a specific ServiceErrorResponse will be added in the future with retry hints
-        request.setStatusCode(Operation.STATUS_CODE_UNAVAILABLE)
-                .fail(new CancellationException("queue limit exceeded"));
-    }
-
-    private void failForwardRequest(Operation op, Operation fo, Throwable fe) {
-        op.setStatusCode(fo.getStatusCode());
-        op.setBodyNoCloning(fo.getBodyRaw()).fail(fe);
-    }
-
-    void retryPauseOrOnDemandLoadConflict(Operation op,
-            boolean isOdlConflict) {
-        this.serviceResourceTracker.retryPauseOrOnDemandLoadConflict(op, isOdlConflict);
-    }
-
-    private void retryOrFailRequest(Operation op, Operation fo, Throwable fe) {
-        boolean shouldRetry = false;
-
-        if (fo.hasBody()) {
-            ServiceErrorResponse rsp = fo.clone().getBody(ServiceErrorResponse.class);
-            if (rsp != null && rsp.details != null) {
-                shouldRetry = rsp.details.contains(ErrorDetail.SHOULD_RETRY);
-            }
-        }
-
-        if (fo.getStatusCode() == Operation.STATUS_CODE_TIMEOUT) {
-            // the I/O code might have timed out, but we will keep retrying until the operation
-            // expiration is reached
-            shouldRetry = true;
-        }
-
-        if (op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORWARDED)) {
-            // only retry on the node the client directly communicates with. Any node that receives
-            // a forwarded operation will have forwarding disabled set, and should not retry
-            shouldRetry = false;
-        }
-
-        if (op.getExpirationMicrosUtc() < Utils.getSystemNowMicrosUtc()) {
-            op.setBodyNoCloning(fo.getBodyRaw())
-                    .fail(new CancellationException("Expired at " + op.getExpirationMicrosUtc()));
-            return;
-        }
-
-        if (!shouldRetry) {
-            failForwardRequest(op, fo, fe);
-            return;
-        }
-
-        this.operationTracker.trackOperationForRetry(Utils.getNowMicrosUtc(), fe, op);
-    }
-
-    /**
-     * Determine if the request should be queued because the target service is in the process
-     * of being started or, if its parent suffix is registered to a factory, the factory is not yet available
-     */
-    boolean queueRequestUntilServiceAvailable(Operation inboundOp, Service s, String path) {
-        if (s != null && s.getProcessingStage() == ProcessingStage.AVAILABLE) {
-            return false;
-        }
-
-        if (isHelperServicePath(path)) {
-            path = UriUtils.getParentPath(path);
-        }
-
-        boolean waitForService = isServiceStarting(s, path);
-
-        String parentPath = UriUtils.getParentPath(path);
-        if (parentPath != null && !waitForService) {
-            Service parentService = this.findService(parentPath);
-            // Only wait for factory if the logical parent of this service
-            // is a factory which itself is starting
-            if (parentService != null) {
-                if (parentService.hasOption(ServiceOption.FACTORY)) {
-                    waitForService = isServiceStarting(parentService, parentPath);
-                    FactoryService parent = (FactoryService) parentService;
-                    if (!inboundOp.isFromReplication()
-                            && parent.hasChildOption(ServiceOption.OWNER_SELECTION)) {
-                        // owner must do registration for availability, so proceed to queueOrForward
-                        return false;
-                    }
-                }
-                // the service might be paused (stopped due to memory pressure)
-                if (parentService.hasOption(ServiceOption.PERSISTENCE)) {
-                    if (this.serviceResourceTracker.checkAndResumeService(inboundOp)) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        if (inboundOp.isFromReplication()) {
-            // If this is a replicated update request but the service is not
-            // AVAILABLE, then we fail the request with 404 - NOT FOUND error.
-            if (!isServiceAvailable(s) && inboundOp.isUpdate()) {
-                this.log(Level.WARNING, "Service %s is not available. Failing replication request",
-                        inboundOp.getUri().getPath());
-
-                IllegalStateException ex = new IllegalStateException("Service not found on replica");
-                failRequest(inboundOp, Operation.STATUS_CODE_NOT_FOUND,
-                        ServiceErrorResponse.ERROR_CODE_SERVICE_NOT_FOUND_ON_REPLICA, ex);
-                return true;
-            }
-        }
-
-        if (inboundOp
-                .hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY)) {
-            waitForService = true;
-        }
-
-        if (waitForService || inboundOp.isFromReplication()) {
-            if (inboundOp.getAction() == Action.DELETE) {
-                // do not register for availability on DELETE action, allow downstream code to forward
-                return false;
-            }
-
-            if (isStopping()) {
-                // host is stopping, request will fail downstream
-                return false;
-            }
-
-            // service is in the process of starting
-            inboundOp.nestCompletion((o) -> {
-                inboundOp.setTargetReplicated(false);
-                handleRequest(null, inboundOp);
-            });
-
-            registerForServiceAvailability(inboundOp, path);
-            return true;
-        }
-
-        // indicate we are not waiting for service start, request should be forwarded or failed
-        return false;
-    }
-
-    private static void failRequest(Operation request, int statusCode, int errorCode, Throwable e) {
-        request.setStatusCode(statusCode);
-        ServiceErrorResponse r = Utils.toServiceErrorResponse(e, request);
-        r.statusCode = statusCode;
-        r.errorCode = errorCode;
-
-        if (e instanceof ServiceNotFoundException) {
-            r.stackTrace = null;
-        }
-        request.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON).fail(e, r);
-    }
-
-    private void queueOrScheduleRequest(Service s, Operation op) {
+    void queueOrScheduleRequest(Service s, Operation op) {
         ProcessingStage stage = s.getProcessingStage();
         if (stage == ProcessingStage.AVAILABLE) {
             queueOrScheduleRequestInternal(s, op);
@@ -3918,13 +3694,8 @@ public class ServiceHost implements ServiceRequestSender {
                 handleRequest(null, op);
                 return;
             }
-            if (s.hasOption(ServiceOption.ON_DEMAND_LOAD)) {
-                retryPauseOrOnDemandLoadConflict(op, true);
-                return;
-            }
-            op.setStatusCode(Operation.STATUS_CODE_NOT_FOUND);
-        } else if (stage == ProcessingStage.PAUSED) {
-            retryPauseOrOnDemandLoadConflict(op, false);
+
+            retryOnDemandLoadConflict(op, s);
             return;
         }
 
@@ -3932,84 +3703,20 @@ public class ServiceHost implements ServiceRequestSender {
     }
 
     private void queueOrScheduleRequestInternal(Service s, Operation op) {
-        if (!s.queueRequest(op)) {
-            Runnable r = () -> {
-                OperationContext opCtx = extractAndApplyContext(op);
-                try {
-                    s.handleRequest(op);
-                } catch (Throwable e) {
-                    handleUncaughtException(s, op, e);
-                } finally {
-                    OperationContext.setFrom(opCtx);
-                }
-            };
-            this.executor.execute(r);
+        if (s.queueRequest(op)) {
+            return;
         }
-    }
-
-    private boolean applyRequestRateLimit(Service s, Operation op) {
-        if (this.state.requestRateLimits.isEmpty()) {
-            return false;
-        }
-
-        if (op.isFromReplication() || op.isForwarded()) {
-            // rate limiting is applied on the entry point host
-            return false;
-        }
-
-        if (!op.isRemote()) {
-            return false;
-        }
-
-        AuthorizationContext authCtx = op.getAuthorizationContext();
-        if (authCtx == null) {
-            return false;
-        }
-
-        Claims claims = authCtx.getClaims();
-        if (claims == null) {
-            return false;
-        }
-
-        String subject = claims.getSubject();
-        if (subject == null) {
-            return false;
-        }
-
-        RequestRateInfo rateInfo = this.state.requestRateLimits.get(subject);
-        if (rateInfo == null) {
-            return false;
-        }
-
-
-        synchronized (rateInfo) {
-            rateInfo.timeSeries.add(Utils.getSystemNowMicrosUtc(), 0, 1);
-            TimeBin mostRecentBin = rateInfo.timeSeries.bins
-                    .get(rateInfo.timeSeries.bins.lastKey());
-            if (mostRecentBin.sum < rateInfo.limit) {
-                return false;
+        Runnable r = () -> {
+            OperationContext opCtx = extractAndApplyContext(op);
+            try {
+                s.handleRequest(op);
+            } catch (Exception e) {
+                handleUncaughtException(s, op, e);
+            } finally {
+                OperationContext.setFrom(opCtx);
             }
-        }
-
-        this.getManagementService().adjustStat(
-                ServiceHostManagementService.STAT_NAME_RATE_LIMITED_OP_COUNT, 1);
-
-        if (rateInfo.options.contains(Option.PAUSE_PROCESSING)) {
-            // Add option as a hint to the request listener to throttle the channel associated with
-            // the operation
-            op.toggleOption(OperationOption.RATE_LIMITED, true);
-        }
-
-        if (!rateInfo.options.contains(Option.FAIL)) {
-            return false;
-        }
-
-        failRequestLimitExceeded(op);
-        Operation nextOp = s.dequeueRequest();
-        if (nextOp != null) {
-            run(() -> handleRequest(null, nextOp));
-        }
-        return true;
+        };
+        this.executor.execute(r);
     }
 
     private void handleUncaughtException(Service s, Operation op, Throwable e) {
@@ -4038,7 +3745,38 @@ public class ServiceHost implements ServiceRequestSender {
             return;
         }
 
-        c.send(op);
+        if (!isTracingEnabled()) {
+            c.send(op);
+        } else {
+            // Trace the request we're about to send.
+            // We don't have enough information here to set a great operationName; in future we'll want to provide a way
+            // to customise it e.g. via properties on the operation.
+            try (ActiveSpan span = this.otTracer.buildSpan(op.getUri().getPath())
+                    .withTag(Tags.SPAN_KIND.getKey(), Tags.SPAN_KIND_CLIENT)
+                    .startActive()) {
+                TracingUtils.setSpanTags(op, span);
+                // Pass the span into the network request, propagating it across hosts.
+                this.otTracer.inject(span.context(), Format.Builtin.HTTP_HEADERS,
+                        new TextMapInjectAdapter(op.getRequestHeaders()));
+                final ActiveSpan.Continuation cont = span.capture();
+                // Capture the HTTP status code into the span.
+                nestContinuationActivation(op, cont);
+                c.send(op);
+            }
+        }
+    }
+
+    private void nestContinuationActivation(Operation op, Continuation cont) {
+        op.nestCompletionCloneSafe((o, e) -> {
+            try (ActiveSpan contspan = cont.activate()) {
+                contspan.setTag(Tags.HTTP_STATUS.getKey(), Integer.toString(o.getStatusCode()));
+                if (e == null) {
+                    o.complete();
+                } else {
+                    o.fail(e);
+                }
+            }
+        });
     }
 
     private void traceOperation(Operation op) {
@@ -4057,8 +3795,35 @@ public class ServiceHost implements ServiceRequestSender {
             }
         }
 
+        if (getOperationTracingLevel().intValue() <= Level.FINE.intValue()) {
+            // include stats for all levels with equal or lower level
+            String name = op.getUri().getPath() + ":" + op.getAction();
+            ServiceStat st = this.getManagementService().getStat(name);
+            // add a statistic for the service and action
+            synchronized (name.intern()) {
+                if (st == null || st.timeSeriesStats == null) {
+                    this.serviceResourceTracker.createTimeSeriesStat(name, 1.0);
+                    st = getManagementService().getStat(name);
+                }
+            }
+            getManagementService().adjustStat(st, 1.0);
+        }
+
+        if (getOperationTracingLevel() == Level.FINER) {
+            // we log only on the specific level, intentionally, to reduce side-effects
+            log(Level.INFO, op.toLogString());
+        }
+
+        if (getOperationTracingLevel().intValue() > Level.FINEST.intValue()) {
+            return;
+        }
+
+        if (this.operationIndexServiceUri == null) {
+            this.operationIndexServiceUri = UriUtils.buildUri(this, OperationIndexService.class);
+        }
+
         Operation.SerializedOperation tracingOp = Operation.SerializedOperation.create(op);
-        sendRequest(Operation.createPost(UriUtils.buildUri(this, OperationIndexService.class))
+        sendRequest(Operation.createPost(this.operationIndexServiceUri)
                 .setReferer(getUri())
                 .setBodyNoCloning(tracingOp));
     }
@@ -4145,7 +3910,6 @@ public class ServiceHost implements ServiceRequestSender {
         this.pendingServiceDeletions.clear();
         this.state.isStarted = false;
 
-        this.authorizationContextCache.clear();
         this.authorizationServiceUri = null;
 
         removeLogging();
@@ -4153,7 +3917,7 @@ public class ServiceHost implements ServiceRequestSender {
         try {
             this.client.stop();
             this.client = null;
-        } catch (Throwable e1) {
+        } catch (Exception e1) {
         }
 
         // listener will implicitly shutdown the executor (which is shared for both I/O dispatching
@@ -4165,13 +3929,15 @@ public class ServiceHost implements ServiceRequestSender {
                 this.httpsListener.stop();
                 this.httpsListener = null;
             }
-        } catch (Throwable e1) {
+        } catch (Exception e1) {
         }
 
         this.executor.shutdownNow();
         this.scheduledExecutor.shutdownNow();
+        this.serviceScheduledExecutor.shutdownNow();
         this.executor = null;
         this.scheduledExecutor = null;
+        this.opProcessingChain.close();
     }
 
     private List<Service> stopServices(Set<Service> servicesToClose) {
@@ -4257,6 +4023,13 @@ public class ServiceHost implements ServiceRequestSender {
         log(Level.INFO, "Waiting for DELETE from %d core services", coreServiceCount);
         this.coreServices.clear();
         waitForServiceStop(cLatch);
+
+        // stopping management service
+        Service managementService = getManagementService();
+        if (managementService != null && managementService.getSelfLink() != null) {
+            stopService(managementService);
+        }
+
         log(Level.INFO, "All core services stopped");
     }
 
@@ -4274,7 +4047,7 @@ public class ServiceHost implements ServiceRequestSender {
                     log(Level.WARNING, "%s did not complete DELETE", l);
                 }
             }
-        } catch (Throwable e) {
+        } catch (Exception e) {
             log(Level.INFO, "%s", e.toString());
         }
     }
@@ -4283,12 +4056,12 @@ public class ServiceHost implements ServiceRequestSender {
             final Service s) {
         Operation delete = Operation.createDelete(s.getUri())
                 .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE)
-                .setReplicationDisabled(true)
+                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_FORWARDING)
                 .setCompletion(removeServiceCompletion)
                 .setReferer(getUri());
         try {
             queueOrScheduleRequest(s, delete);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             log(Level.WARNING, Utils.toString(e));
             removeServiceCompletion.handle(delete, e);
         }
@@ -4332,6 +4105,8 @@ public class ServiceHost implements ServiceRequestSender {
             return true;
         } else if (serviceUriPath.endsWith(SERVICE_URI_SUFFIX_SUBSCRIPTIONS)) {
             return true;
+        } else if (serviceUriPath.endsWith(SERVICE_URI_SUFFIX_SYNCHRONIZATION)) {
+            return true;
         } else if (serviceUriPath.endsWith(SERVICE_URI_SUFFIX_TEMPLATE)) {
             return true;
         } else if (serviceUriPath.endsWith(SERVICE_URI_SUFFIX_UI)) {
@@ -4370,6 +4145,16 @@ public class ServiceHost implements ServiceRequestSender {
         for (java.util.logging.Handler h : this.logger.getParent().getHandlers()) {
             h.setLevel(newLevel);
         }
+        return this;
+    }
+
+    public ServiceHost toggleOperationProcessingLogging(boolean loggingEnabled) {
+        this.opProcessingChain.toggleLogging(loggingEnabled);
+        return this;
+    }
+
+    public ServiceHost setOperationProcessingLogFilter(Predicate<Operation> logFilter) {
+        this.opProcessingChain.setLogFilter(logFilter);
         return this;
     }
 
@@ -4445,7 +4230,7 @@ public class ServiceHost implements ServiceRequestSender {
         registerForServiceAvailability(op, checkReplica, nodeSelectorPath, servicePaths);
     }
 
-    void registerForServiceAvailability(Operation opTemplate, String... servicePaths) {
+    public void registerForServiceAvailability(Operation opTemplate, String... servicePaths) {
         registerForServiceAvailability(opTemplate, false, ServiceUriPaths.DEFAULT_NODE_SELECTOR,
                 servicePaths);
     }
@@ -4694,6 +4479,10 @@ public class ServiceHost implements ServiceRequestSender {
             ch.handle(null, new IllegalStateException("service not found"));
             return;
         }
+        String peerNodeSelectorPath = s.getPeerNodeSelectorPath();
+        if (peerNodeSelectorPath != null && !peerNodeSelectorPath.equals(nodeSelectorPath)) {
+            nodeSelectorPath = peerNodeSelectorPath;
+        }
         NodeGroupUtils.checkServiceAvailability(ch, s.getHost(), s.getSelfLink(), nodeSelectorPath);
     }
 
@@ -4707,8 +4496,8 @@ public class ServiceHost implements ServiceRequestSender {
     public SystemHostInfo updateSystemInfo(boolean enumerateNetworkInterfaces) {
 
         this.info.availableProcessorCount = Runtime.getRuntime().availableProcessors();
-        this.info.osName = Utils.getOsName(this.info);
-        this.info.osFamily = Utils.determineOsFamily(this.info.osName);
+        this.info.osName = this.info.getOsName();
+        this.info.osFamily = SystemHostInfo.determineOsFamily(this.info.osName);
 
         updateMemoryAndDiskInfo();
 
@@ -4759,7 +4548,7 @@ public class ServiceHost implements ServiceRequestSender {
             }
 
             this.info.ipAddresses = ipAddresses;
-        } catch (Throwable e) {
+        } catch (Exception e) {
             log(Level.SEVERE, "Failure: %s", Utils.toString(e));
         }
 
@@ -4787,7 +4576,7 @@ public class ServiceHost implements ServiceRequestSender {
             this.info.freeDiskByteCount = f.getFreeSpace();
             this.info.usableDiskByteCount = f.getUsableSpace();
             this.info.totalDiskByteCount = f.getTotalSpace();
-        } catch (Throwable e) {
+        } catch (Exception e) {
             log(Level.WARNING, "Exception getting disk usage: %s", Utils.toString(e));
         }
     }
@@ -4833,14 +4622,7 @@ public class ServiceHost implements ServiceRequestSender {
     }
 
     public void run(Runnable task) {
-        if (this.executor.isShutdown()) {
-            throw new IllegalStateException("Stopped");
-        }
-        OperationContext origContext = OperationContext.getOperationContext();
-        this.executor.execute(() -> {
-            OperationContext.setFrom(origContext);
-            executeRunnableSafe(task);
-        });
+        run(this.executor, task);
     }
 
     /**
@@ -4853,6 +4635,7 @@ public class ServiceHost implements ServiceRequestSender {
         if (executor.isShutdown()) {
             throw new IllegalStateException("Stopped");
         }
+
         OperationContext origContext = OperationContext.getOperationContext();
         executor.execute(() -> {
             OperationContext.setFrom(origContext);
@@ -4860,16 +4643,33 @@ public class ServiceHost implements ServiceRequestSender {
         });
     }
 
+    /**
+     * Schedules a task using the shared service executor
+     */
     public ScheduledFuture<?> schedule(Runnable task, long delay, TimeUnit unit) {
+        return schedule(this.serviceScheduledExecutor, task, delay, unit);
+    }
+
+    /**
+     * Infrastructure use only. Do not use for non core scheduled tasks. The method
+     * signature will likely change in the future so the caller is validated against the
+     * set of core services.
+     */
+    public ScheduledFuture<?> scheduleCore(Runnable task, long delay, TimeUnit unit) {
+        return schedule(this.scheduledExecutor, task, delay, unit);
+    }
+
+    private ScheduledFuture<?> schedule(ScheduledExecutorService e, Runnable task, long delay,
+            TimeUnit unit) {
         if (this.isStopping()) {
             throw new IllegalStateException("Stopped");
         }
-        if (this.scheduledExecutor.isShutdown()) {
+        if (e.isShutdown()) {
             throw new IllegalStateException("Stopped");
         }
 
         OperationContext origContext = OperationContext.getOperationContext();
-        return this.scheduledExecutor.schedule(() -> {
+        return e.schedule(() -> {
             OperationContext.setFrom(origContext);
             executeRunnableSafe(task);
         }, delay, unit);
@@ -4878,7 +4678,7 @@ public class ServiceHost implements ServiceRequestSender {
     private void executeRunnableSafe(Runnable task) {
         try {
             task.run();
-        } catch (Throwable e) {
+        } catch (Exception e) {
             log(Level.SEVERE, "Unhandled exception executing task: %s", Utils.toString(e));
         }
     }
@@ -4900,7 +4700,8 @@ public class ServiceHost implements ServiceRequestSender {
                     MaintenanceStage.UTILS, deadline);
         };
 
-        this.maintenanceTask = schedule(r, getMaintenanceIntervalMicros(), TimeUnit.MICROSECONDS);
+        long intervalMicros = getMaintenanceCheckIntervalMicros();
+        this.maintenanceTask = scheduleCore(r, intervalMicros, TimeUnit.MICROSECONDS);
     }
 
     /**
@@ -4949,17 +4750,24 @@ public class ServiceHost implements ServiceRequestSender {
             }
 
             if (stage == null) {
-                // update the maintenance count stat for the ServiceHost before, completing
-                // the current maintenance run.
-                this.managementService.adjustStat(
-                        Service.STAT_NAME_SERVICE_HOST_MAINTENANCE_COUNT, 1);
+                if (this.managementService != null) {
+                    // update the maintenance count stat for the ServiceHost before, completing
+                    // the current maintenance run.
+                    this.managementService.adjustStat(
+                            Service.STAT_NAME_SERVICE_HOST_MAINTENANCE_COUNT, 1);
+
+                    // Update the count of services that are pending delete on the service host.
+                    this.managementService.setStat(
+                            ServiceHostManagementService.STAT_NAME_PENDING_SERVICE_DELETION_COUNT,
+                            this.pendingServiceDeletions.size());
+                }
 
                 post.complete();
                 scheduleMaintenance();
                 return;
             }
             performMaintenanceStage(post, stage, deadline);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             log(Level.SEVERE, "Uncaught exception: %s", e.toString());
             post.fail(e);
         }
@@ -4976,17 +4784,10 @@ public class ServiceHost implements ServiceRequestSender {
         try {
             this.operationTracker.performMaintenance(now);
             performMaintenanceStage(post, nextStage, deadline);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             log(Level.WARNING, "Exception: %s", Utils.toString(e));
             performMaintenanceStage(post, nextStage, deadline);
         }
-    }
-
-    /**
-     * Infrastructure use only. Invoked from the service context index service
-     */
-    public void resumeService(String path, Service resumedService) {
-        this.serviceResourceTracker.resumeService(path, resumedService);
     }
 
     public ServiceHost setOperationTimeOutMicros(long timeoutMicros) {
@@ -5042,10 +4843,6 @@ public class ServiceHost implements ServiceRequestSender {
         this.client = client;
     }
 
-    public long getMaintenanceIntervalMicros() {
-        return this.state.maintenanceIntervalMicros;
-    }
-
     void saveServiceState(Service s, Operation op, ServiceDocument state) {
         // If this request doesn't originate from replication (which might happen asynchronously, i.e. through
         // (re-)synchronization after a node group change), don't update the documentAuthPrincipalLink because
@@ -5067,7 +4864,7 @@ public class ServiceHost implements ServiceRequestSender {
             return;
         }
 
-        Service indexService = this.documentIndexService;
+        Service indexService = getIndexServiceForService(s);
 
         // serialize state and compute signature. The index service will take
         // the serialized state and store as is, and it will index all fields
@@ -5079,10 +4876,9 @@ public class ServiceHost implements ServiceRequestSender {
         body.description = buildDocumentDescription(s);
         body.serializedDocument = op.getLinkedSerializedState();
         op.linkSerializedState(null);
-        if (!op.isFromReplication()) {
-            // Do not cache state, in replicas
-            cacheServiceState(s, state, op);
-        }
+
+        ServiceDocument previousState = this.serviceResourceTracker.getCachedServiceState(s, op);
+        cacheServiceState(s, state, op);
 
         Operation post = Operation.createPost(indexService.getUri())
                 .setBodyNoCloning(body)
@@ -5091,12 +4887,22 @@ public class ServiceHost implements ServiceRequestSender {
                         unmarkAsPendingDelete(s);
                     }
                     if (e != null) {
-                        this.serviceResourceTracker.clearCachedServiceState(s, null, op);
+                        if (previousState != null) {
+                            this.serviceResourceTracker.resetCachedServiceState(s, previousState, op);
+                        } else {
+                            this.serviceResourceTracker.clearCachedServiceState(s, op);
+                        }
                         op.fail(e);
                         return;
                     }
+
                     op.complete();
                 });
+
+        if (op.getAction() == Action.POST
+                && op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE)) {
+            post.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE);
+        }
 
         // Just like we do in loadServiceState, special case co-located indexing service and bypass
         // normal processing path, to reduce latency. The call is still assumed to be asynchronous
@@ -5106,10 +4912,10 @@ public class ServiceHost implements ServiceRequestSender {
 
     /**
      * Infrastructure use only
-     * @see ServiceSynchronizationTracker#selectServiceOwnerAndSynchState(Service, Operation, boolean)
+     * @see ServiceSynchronizationTracker#selectServiceOwnerAndSynchState(Service, Operation)
      */
-    void selectServiceOwnerAndSynchState(Service s, Operation op, boolean isFactorySync) {
-        this.serviceSynchTracker.selectServiceOwnerAndSynchState(s, op, isFactorySync);
+    void selectServiceOwnerAndSynchState(Service s, Operation op) {
+        this.serviceSynchTracker.selectServiceOwnerAndSynchState(s, op);
     }
 
     NodeSelectorService findNodeSelectorService(String path,
@@ -5133,7 +4939,7 @@ public class ServiceHost implements ServiceRequestSender {
     public void broadcastRequest(String selectorPath, String key, boolean excludeThisHost,
             Operation request) {
         if (isStopping()) {
-            request.fail(new CancellationException());
+            request.fail(new CancellationException("Host is stopping"));
             return;
         }
 
@@ -5164,14 +4970,8 @@ public class ServiceHost implements ServiceRequestSender {
         nss.selectAndForward(request, req);
     }
 
-    private ThreadLocal<SelectAndForwardRequest> selectOwnerRequests = new ThreadLocal<SelectAndForwardRequest>() {
-
-        @Override
-        public SelectAndForwardRequest initialValue() {
-            return new SelectAndForwardRequest();
-        }
-
-    };
+    private ThreadLocal<SelectAndForwardRequest> selectOwnerRequests = ThreadLocal
+            .withInitial(SelectAndForwardRequest::new);
 
     /**
      * Convenience method that issues a {@code SelectOwnerRequest} to the node selector service. If
@@ -5179,7 +4979,7 @@ public class ServiceHost implements ServiceRequestSender {
      */
     public void selectOwner(String selectorPath, String key, Operation op) {
         if (isStopping()) {
-            op.fail(new CancellationException());
+            op.fail(new CancellationException("Host is stopping"));
             return;
         }
 
@@ -5207,7 +5007,7 @@ public class ServiceHost implements ServiceRequestSender {
      */
     public void forwardRequest(String selectorPath, String key, Operation request) {
         if (isStopping()) {
-            request.fail(new CancellationException());
+            request.fail(new CancellationException("Host is stopping"));
             return;
         }
 
@@ -5231,7 +5031,7 @@ public class ServiceHost implements ServiceRequestSender {
             String selectionKey,
             Operation op) {
         if (isStopping()) {
-            op.fail(new CancellationException());
+            op.fail(new CancellationException("Host is stopping"));
             return;
         }
 
@@ -5288,9 +5088,26 @@ public class ServiceHost implements ServiceRequestSender {
                 }
             }
 
+            // For wildcard search on index-service(e.g.: "/core/document-index?documentSelfLink=/core/examples/*"),
+            // when there is no matching in data store, it also searches available services on the host.
+            // Since document-index is already searched, only non-persisted stateful or stateless services are the
+            // target to check the authorization.
+            if (isAuthorizationEnabled()) {
+                // For non-persisted service, state is kept in resource-tracker cache.
+                // For stateless service, resource-tracker returns null.
+                // When null is passed to "isAuthorized()" method, it creates an empty ServiceDocument with self link
+                // from passed service; so that, it can check auth against selflink for stateless services.
+                // This is same behavior in "StatelessService#authorizeRequest()"
+                ServiceDocument state = this.serviceResourceTracker.getCachedServiceState(s, get);
+                if (!isAuthorized(s, state, get)) {
+                    continue;
+                }
+            }
+
             r.documentLinks.add(path);
         }
         r.documentOwner = getId();
+        r.documentCount = (long) r.documentLinks.size();
         get.setBodyNoCloning(r).complete();
     }
 
@@ -5352,6 +5169,7 @@ public class ServiceHost implements ServiceRequestSender {
             }
         }
         r.documentOwner = getId();
+        r.documentCount = (long) r.documentLinks.size();
         get.setBodyNoCloning(r).complete();
     }
 
@@ -5366,7 +5184,7 @@ public class ServiceHost implements ServiceRequestSender {
     public ServiceDocumentDescription buildDocumentDescription(String servicePath) {
         Service s = findService(servicePath);
         if (s == null) {
-            // on demand load or paused services will not be attached, but will still have
+            // on demand load services will not be attached, but will still have
             // valid descriptions cached. Look up their description using their parent (factory)
             // link
             String parentPath = UriUtils.getParentPath(servicePath);
@@ -5400,8 +5218,9 @@ public class ServiceHost implements ServiceRequestSender {
 
             // Description has to be built in three stages:
             // 1) Build the base description and add it to the cache
-            desc = this.descriptionBuilder.buildDescription(serviceStateClass, s.getOptions(),
-                    RequestRouter.findRequestRouter(s.getOperationProcessingChain()));
+            desc = this.descriptionBuilder.buildDescription(this, s,
+                    s.getOptions(),
+                    ServiceDocumentDescriptionHelper.findAndDocumentRequestRouter(s));
 
             if (s.getOptions().contains(ServiceOption.IMMUTABLE)) {
                 if (desc.versionRetentionLimit > ServiceDocumentDescription.DEFAULT_VERSION_RETENTION_LIMIT) {
@@ -5530,88 +5349,24 @@ public class ServiceHost implements ServiceRequestSender {
     }
 
     /**
-     * Infrastructure use only. Only services added as privileged can use this method.
+     * Infrastructure use only.
      */
     public void cacheAuthorizationContext(Service s, String token, AuthorizationContext ctx) {
-        if (!this.isPrivilegedService(s)) {
-            throw new RuntimeException("Service not allowed to cache authorization token");
-        }
-        synchronized (this.state) {
-            this.authorizationContextCache.put(token, ctx);
-            addUserToken(this.userLinkToTokenMap, ctx.getClaims().getSubject(), token);
-        }
+        this.authorizationFilter.cacheAuthorizationContext(this, token, ctx);
     }
 
     /**
-     * Infrastructure use only. Only services added as privileged can use this method.
+     * Infrastructure use only.
      */
     public void clearAuthorizationContext(Service s, String userLink) {
-        if (!this.isPrivilegedService(s)) {
-            throw new RuntimeException("Service not allowed to clear authorization token");
-        }
-        synchronized (this.state) {
-            Set<String> tokenSet = this.userLinkToTokenMap.remove(userLink);
-            if (tokenSet != null) {
-                for (String token : tokenSet) {
-                    this.authorizationContextCache.remove(token);
-                }
-            }
-        }
+        this.authorizationFilter.clearAuthorizationContext(this, userLink);
     }
 
     /**
-     * Infrastructure use only. Only services added as privileged can use this method.
+     * Infrastructure use only.
      */
     public AuthorizationContext getAuthorizationContext(Service s, String token) {
-        if (!this.isPrivilegedService(s)) {
-            throw new RuntimeException("Service not allowed to retrieve authorization token");
-        }
-        return this.authorizationContextCache.get(token);
-    }
-
-    private void populateAuthorizationContext(Operation op, Consumer<AuthorizationContext> authorizationContextHandler) {
-        getAuthorizationContext(op, authorizationContext -> {
-            if (authorizationContext == null) {
-                // No (valid) authorization context, fall back to guest context
-                authorizationContext = getGuestAuthorizationContext();
-            }
-            op.setAuthorizationContext(authorizationContext);
-            authorizationContextHandler.accept(authorizationContext);
-        });
-    }
-
-    /**
-     * Generate new authorization context for a system user.
-     *
-     * @return fresh authorization context
-     */
-    private AuthorizationContext createAuthorizationContext(String userLink) {
-        Claims.Builder cb = new Claims.Builder();
-        cb.setIssuer(AuthenticationConstants.DEFAULT_ISSUER);
-        cb.setSubject(userLink);
-
-        // Set an effective expiration to never
-        Calendar cal = Calendar.getInstance();
-        cal.set(9999, Calendar.DECEMBER, 31);
-        cb.setExpirationTime(TimeUnit.MILLISECONDS.toMicros(cal.getTimeInMillis()));
-
-        // Generate token for set of claims
-        Claims claims = cb.getResult();
-        String token;
-        try {
-            token = getTokenSigner().sign(claims);
-        } catch (GeneralSecurityException e) {
-            // This function is run first when the host starts, which will fail if this
-            // exception comes up. This is necessary because the host cannot function
-            // without having access to the system user's context.
-            throw new RuntimeException(e);
-        }
-
-        AuthorizationContext.Builder ab = AuthorizationContext.Builder.create();
-        ab.setClaims(claims);
-        ab.setToken(token);
-        ab.setPropagateToClient(false);
-        return ab.getResult();
+        return this.authorizationFilter.getAuthorizationContext(token);
     }
 
     /**
@@ -5623,7 +5378,8 @@ public class ServiceHost implements ServiceRequestSender {
         AuthorizationContext ctx = this.systemAuthorizationContext;
         if (ctx == null) {
             // No locking needed; duplicate work is benign
-            ctx = createAuthorizationContext(SystemUserService.SELF_LINK);
+            ctx = this.authorizationFilter.createAuthorizationContext(getTokenSigner(),
+                    SystemUserService.SELF_LINK);
             this.systemAuthorizationContext = ctx;
         }
 
@@ -5631,12 +5387,17 @@ public class ServiceHost implements ServiceRequestSender {
     }
 
     /**
-     * Creates and returns an authorization context for a given user.
+     * Returns an authorization context for a given user.
      *
      * @return authorization context.
      */
     protected AuthorizationContext getAuthorizationContextForSubject(String subject) {
-        return createAuthorizationContext(subject);
+        if (subject.equals(SystemUserService.SELF_LINK)) {
+            return getSystemAuthorizationContext();
+        } else if (subject.equals(GuestUserService.SELF_LINK)) {
+            return getGuestAuthorizationContext();
+        }
+        return this.authorizationFilter.createAuthorizationContext(getTokenSigner(),subject);
     }
 
     /**
@@ -5648,7 +5409,8 @@ public class ServiceHost implements ServiceRequestSender {
         AuthorizationContext ctx = this.guestAuthorizationContext;
         if (ctx == null) {
             // No locking needed; duplicate work is benign
-            ctx = createAuthorizationContext(GuestUserService.SELF_LINK);
+            ctx = this.authorizationFilter.createAuthorizationContext(getTokenSigner(),
+                    GuestUserService.SELF_LINK);
             this.guestAuthorizationContext = ctx;
         }
 
@@ -5761,5 +5523,69 @@ public class ServiceHost implements ServiceRequestSender {
         }
 
         return ipAddresses.contains(remoteService.getHost());
+    }
+
+    /**
+     * Returns shutdown hook that stops this host.
+     * Override this method to change the shutdown hook behavior.
+     *
+     * @return shutdown hook that stops the host
+     */
+    public Thread getRuntimeShutdownHook() {
+        return this.defaultShutdownHook;
+    }
+
+    /**
+     * Register host shutdown hook.
+     */
+    public void registerRuntimeShutdownHook() {
+        Runtime.getRuntime().addShutdownHook(getRuntimeShutdownHook());
+    }
+
+    /**
+     * Remove host shutdown hook.
+     * @return
+     */
+    public boolean unregisterRuntimeShutdownHook() {
+        return Runtime.getRuntime().removeShutdownHook(getRuntimeShutdownHook());
+    }
+
+    public void failRequestServiceAlreadyStarted(String path, Service s, Operation post) {
+        ProcessingStage st = ProcessingStage.AVAILABLE;
+        if (s != null) {
+            st = s.getProcessingStage();
+        }
+
+        Exception e;
+        if (s != null && s.hasOption(ServiceOption.IMMUTABLE)) {
+            // Even though we were able to detect violation of self-link uniqueness
+            // in this case, generally we do not try to enforce uniqueness for
+            // IMMUTABLE services in all cases. Instead it is the responsibility of
+            // the caller to ensure uniqueness of self-links.
+            e = new ServiceAlreadyStartedException(path,
+                    "Self-link uniqueness not guaranteed for Immutable Services.");
+            log(Level.WARNING, e.getMessage());
+        } else {
+            e = new ServiceAlreadyStartedException(path, st);
+        }
+
+        Operation.fail(post, Operation.STATUS_CODE_CONFLICT,
+                ServiceErrorResponse.ERROR_CODE_SERVICE_ALREADY_EXISTS,
+                e);
+    }
+
+
+    /**
+     * Get the {@link io.opentracing.Tracer} tracer this host is using.
+     * <p>
+     *     This can be used to get the active span source via getTracer.activeSpan(), which
+     *     allows service developers to create spans around any thing that they want to instrument - whether
+     *     thats aggregations of regular Operations, or other tasks like custom IO handling, library callouts, or
+     *     for use with their own executor hand-offs.
+     * </p>
+     * @return
+     */
+    public Tracer getTracer() {
+        return this.otTracer;
     }
 }

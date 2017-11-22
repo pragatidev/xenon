@@ -14,15 +14,18 @@
 package com.vmware.xenon.common;
 
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
-import com.vmware.xenon.services.common.NodeGroupService;
+import com.vmware.xenon.common.config.XenonConfiguration;
 import com.vmware.xenon.services.common.QueryTask;
+import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
 import com.vmware.xenon.services.common.ServiceUriPaths;
 import com.vmware.xenon.services.common.TaskService;
 
@@ -33,8 +36,22 @@ public class SynchronizationTaskService
         extends TaskService<SynchronizationTaskService.State> {
 
     public static final String FACTORY_LINK = ServiceUriPaths.SYNCHRONIZATION_TASKS;
-    public static final String PROPERTY_NAME_SYNCHRONIZATION_LOGGING = Utils.PROPERTY_NAME_PREFIX
-            + "SynchronizationTaskService.isDetailedLoggingEnabled";
+
+
+    public static final String STAT_NAME_CHILD_SYNCH_RETRY_COUNT = "childSynchRetryCount";
+    public static final String STAT_NAME_SYNCH_RETRY_COUNT = "synchRetryCount";
+
+    /**
+     * Maximum synch-task retry limit.
+     * We are using exponential backoff for synchronization retry, that means last synch retry will
+     * be tried after 2 ^ 8 * getMaintenanceIntervalMicros(), which is ~4 minutes if maintenance interval is 1 second.
+     */
+    public static final int MAX_CHILD_SYNCH_RETRY_COUNT = XenonConfiguration.integer(
+            SynchronizationTaskService.class,
+            "MAX_CHILD_SYNCH_RETRY_COUNT",
+            8
+    );
+
 
     public static SynchronizationTaskService create(Supplier<Service> childServiceInstantiator) {
         if (childServiceInstantiator.get() == null) {
@@ -46,7 +63,7 @@ public class SynchronizationTaskService
     }
 
     public enum SubStage {
-        QUERY, SYNCHRONIZE, RESTART
+        QUERY, SYNCHRONIZE, RESTART, CHECK_NG_AVAILABILITY
     }
 
     public static class State extends TaskService.TaskServiceState {
@@ -74,6 +91,12 @@ public class SynchronizationTaskService
          */
         public EnumSet<ServiceOption> childOptions;
 
+
+        /**
+         * Document index link used by the child service
+         */
+        public String childDocumentIndexLink;
+
         /**
          * Upper limit to the number of results per page of the broadcast query task.
          */
@@ -96,16 +119,26 @@ public class SynchronizationTaskService
          */
         @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
         public URI queryPageReference;
+
+        /**
+         * Number of child services for which synchronization is completed.
+         */
+        @UsageOption(option = PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
+        public int synchCompletionCount;
     }
 
     private Supplier<Service> childServiceInstantiator;
 
-    private final boolean isDetailedLoggingEnabled = Boolean
-            .getBoolean(PROPERTY_NAME_SYNCHRONIZATION_LOGGING);
+    private final boolean isDetailedLoggingEnabled = XenonConfiguration.bool(
+            SynchronizationTaskService.class,
+            "isDetailedLoggingEnabled",
+            false
+    );
 
     public SynchronizationTaskService() {
         super(State.class);
         toggleOption(ServiceOption.IDEMPOTENT_POST, true);
+        toggleOption(ServiceOption.INSTRUMENTATION, true);
     }
 
     /**
@@ -142,9 +175,11 @@ public class SynchronizationTaskService
         // in the CREATED stage. This is because, handleStart only creates a
         // place-holder task per factoryService without actually kicking-off
         // the state-machine.
+        Service childTemplate = this.childServiceInstantiator.get();
         initialState.taskInfo = new TaskState();
         initialState.taskInfo.stage = TaskState.TaskStage.CREATED;
-        initialState.childOptions = this.childServiceInstantiator.get().getOptions();
+        initialState.childOptions = childTemplate.getOptions();
+        initialState.childDocumentIndexLink = childTemplate.getDocumentIndexPath();
         initialState.documentExpirationTimeMicros = Long.MAX_VALUE;
     }
 
@@ -213,10 +248,8 @@ public class SynchronizationTaskService
         }
 
         State task = getState(put);
-
         TaskState.TaskStage currentStage = task.taskInfo.stage;
         SubStage currentSubStage = task.subStage;
-
         State body = validatePutRequest(task, put);
         if (body == null) {
             return;
@@ -274,6 +307,9 @@ public class SynchronizationTaskService
             // redundant since the FactoryService may already have
             // changed the status to un-available, but just for
             // correctness we do it here again.
+            task.synchCompletionCount = 0;
+            setStat(STAT_NAME_CHILD_SYNCH_RETRY_COUNT, 0);
+            setStat(STAT_NAME_CHILD_SYNCH_FAILURE_COUNT, 0);
             setFactoryAvailability(task, false, (o) -> handleSubStage(task), put);
         } else {
             put.complete();
@@ -293,11 +329,8 @@ public class SynchronizationTaskService
         boolean isMembershipTimeSet = (putTask.membershipUpdateTimeMicros != null);
         boolean hasReplicationOption = currentTask.childOptions.contains(ServiceOption.REPLICATION);
         if (!isMembershipTimeSet && hasReplicationOption || isMembershipTimeSet && !hasReplicationOption) {
-            put.fail(new IllegalArgumentException("membershipUpdateTimeMicros not set correctly"));
-            return null;
-        }
-        if (currentTask.childOptions.contains(ServiceOption.ON_DEMAND_LOAD)) {
-            put.fail(new IllegalArgumentException("ON_DEMAND_LOAD services must synchronize on-demand."));
+            put.fail(new IllegalArgumentException("membershipUpdateTimeMicros not set correctly: "
+                    + putTask.membershipUpdateTimeMicros));
             return null;
         }
         if (currentTask.membershipUpdateTimeMicros != null &&
@@ -316,7 +349,7 @@ public class SynchronizationTaskService
             // is not running anymore, we set the factory as Available. If the task
             // was already running then the factory would become Available as soon
             // as the task reached the FINISHED stage.
-            if (!TaskState.isInProgress(currentTask.taskInfo)) {
+            if (TaskState.isFinished(currentTask.taskInfo)) {
                 setFactoryAvailability(currentTask, true,
                         (o) -> put.fail(Operation.STATUS_CODE_BAD_REQUEST, e, rsp), null);
             } else {
@@ -325,6 +358,25 @@ public class SynchronizationTaskService
             return null;
         }
         return putTask;
+    }
+
+    /**
+     * Validate that the PATCH we got requests reasonable changes to our state.
+     */
+    @Override
+    protected boolean validateTransition(
+            Operation patch, SynchronizationTaskService.State currentTask, SynchronizationTaskService.State patchBody) {
+        boolean validTransition = super.validateTransition(patch, currentTask, patchBody);
+        if (!validTransition) {
+            return false;
+        }
+
+        if (!TaskState.isInProgress(currentTask.taskInfo) && !TaskState.isInProgress(patchBody.taskInfo)) {
+            patch.fail(new IllegalArgumentException("Task stage cannot transitioned to same stopped state"));
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -351,19 +403,20 @@ public class SynchronizationTaskService
             // back to QUERY stage.
             task.taskInfo.stage = TaskState.TaskStage.STARTED;
             task.subStage = SubStage.QUERY;
+            task.synchCompletionCount = 0;
+            setStat(STAT_NAME_CHILD_SYNCH_RETRY_COUNT, 0);
+            setStat(STAT_NAME_CHILD_SYNCH_FAILURE_COUNT, 0);
         } else {
             updateState(task, body);
         }
 
-        if (this.isDetailedLoggingEnabled) {
-            logInfo("Transitioning task from %s-%s to %s-%s",
-                    currentStage, currentSubStage, task.taskInfo.stage, task.subStage);
-        }
+        logInfo("Transitioning task from %s-%s to %s-%s, Services synchronized: %d",
+                currentStage, currentSubStage, task.taskInfo.stage, task.subStage, task.synchCompletionCount);
 
-        boolean isTaskFinished = !TaskState.isInProgress(task.taskInfo);
+        boolean isTaskFinished = TaskState.isFinished(task.taskInfo);
         if (isTaskFinished) {
-            // Since the synch-task finished (regardless of failure), we will
-            // mark the factory as available here. Complete the patch *after* we set availability
+            // Since the synch-task finished, we will mark the factory
+            // as available here. Complete the patch *after* we set availability
             // to avoid races with other self patches
             setFactoryAvailability(task, true, null, patch);
         } else {
@@ -397,6 +450,9 @@ public class SynchronizationTaskService
         case SYNCHRONIZE:
             handleSynchronizeStage(task, true);
             break;
+        case CHECK_NG_AVAILABILITY:
+            handleCheckNodeGroupAvailabilityStage(task);
+            break;
         default:
             logWarning("Unexpected sub stage: %s", task.subStage);
             break;
@@ -406,11 +462,9 @@ public class SynchronizationTaskService
     private void handleQueryStage(State task) {
         QueryTask queryTask = buildChildQueryTask(task);
         Operation queryPost = Operation
-                .createPost(this, ServiceUriPaths.CORE_QUERY_TASKS)
+                .createPost(this, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS)
                 .setBody(queryTask)
                 .setConnectionSharing(true)
-                .setExpiration(
-                        Utils.fromNowMicrosUtc(NodeGroupService.PEER_REQUEST_TIMEOUT_MICROS))
                 .setCompletion((o, e) -> {
                     if (getHost().isStopping()) {
                         sendSelfCancellationPatch(task, "host is stopping");
@@ -430,11 +484,12 @@ public class SynchronizationTaskService
                     // Query returned zero results.Self-patch the task
                     // to FINISHED state.
                     if (rsp == null || rsp.nextPageLink == null) {
-                        sendSelfFinishedPatch(task);
+                        sendSelfPatch(task, TaskState.TaskStage.STARTED,
+                                subStageSetter(SubStage.CHECK_NG_AVAILABILITY));
                         return;
                     }
 
-                    URI queryTaskUri = UriUtils.buildUri(this.getHost(), ServiceUriPaths.CORE_QUERY_TASKS);
+                    URI queryTaskUri = UriUtils.buildUri(this.getHost(), ServiceUriPaths.CORE_LOCAL_QUERY_TASKS);
                     task.queryPageReference = UriUtils.buildUri(queryTaskUri, rsp.nextPageLink);
 
                     sendSelfPatch(task, TaskState.TaskStage.STARTED,
@@ -447,6 +502,7 @@ public class SynchronizationTaskService
     private QueryTask buildChildQueryTask(State task) {
         QueryTask queryTask = new QueryTask();
         queryTask.querySpec = new QueryTask.QuerySpecification();
+        queryTask.indexLink = task.childDocumentIndexLink;
         queryTask.taskInfo.isDirect = true;
 
         // Add clause for documentSelfLink = <FactorySelfLink>/*
@@ -472,8 +528,7 @@ public class SynchronizationTaskService
         queryTask.documentExpirationTimeMicros = Utils.fromNowMicrosUtc(timeoutMicros);
 
         // Make this a broadcast query so that we get child services from all peer nodes.
-        queryTask.querySpec.options = EnumSet.of(
-                QueryTask.QuerySpecification.QueryOption.BROADCAST);
+        queryTask.querySpec.options = EnumSet.of(QueryOption.BROADCAST, QueryOption.FORWARD_ONLY);
 
         // Set the node-selector link.
         queryTask.nodeSelectorLink = task.nodeSelectorLink;
@@ -486,7 +541,7 @@ public class SynchronizationTaskService
 
     private void handleSynchronizeStage(State task, boolean verifyOwnership) {
         if (task.queryPageReference == null) {
-            sendSelfFinishedPatch(task);
+            sendSelfPatch(task, TaskState.TaskStage.STARTED, subStageSetter(SubStage.CHECK_NG_AVAILABILITY));
             return;
         }
 
@@ -514,32 +569,61 @@ public class SynchronizationTaskService
             }
 
             ServiceDocumentQueryResult rsp = o.getBody(QueryTask.class).results;
+
+            // Delete the read page.
+            // Since this is a broadcast query, deleting the result page cascade deletes query result pages.
+            // Also, there will be no previous pages since FORWARD_ONLY option is enabled.
+            Operation.createDelete(task.queryPageReference)
+                    .setConnectionTag(ServiceClient.CONNECTION_TAG_SYNCHRONIZATION)
+                    .setCompletion((op, ex) -> {
+                        if (ex != null) {
+                            logWarning("Failed to delete query result page %s: %s", rsp.documentSelfLink, Utils.toString(ex));
+                        }
+                    })
+                    .sendWith(this);
+
             if (rsp.documentCount == 0 || rsp.documentLinks.isEmpty()) {
-                sendSelfFinishedPatch(task);
+                sendSelfPatch(task, TaskState.TaskStage.STARTED, subStageSetter(SubStage.CHECK_NG_AVAILABILITY));
                 return;
             }
-            synchronizeChildrenInQueryPage(task, rsp);
+            List<String> list = new ArrayList<>(rsp.documentLinks);
+            synchronizeChildrenInQueryPage(task, rsp, list, 0, list.size());
         };
 
         sendRequest(Operation.createGet(task.queryPageReference)
-                .setExpiration(
-                        Utils.fromNowMicrosUtc(NodeGroupService.PEER_REQUEST_TIMEOUT_MICROS))
+                .setConnectionSharing(true)
+                .setConnectionTag(ServiceClient.CONNECTION_TAG_SYNCHRONIZATION)
+                .setRetryCount(3)
                 .setCompletion(c));
     }
 
-    private void synchronizeChildrenInQueryPage(State task, ServiceDocumentQueryResult rsp) {
+    private void synchronizeChildrenInQueryPage(State task, ServiceDocumentQueryResult rsp, List<String> documentLinks, int retryCount, int totalServiceCount) {
         if (getHost().isStopping()) {
             sendSelfCancellationPatch(task, "host is stopping");
             return;
         }
 
-        // track child service request in parallel, passing a single parent operation
-        AtomicInteger pendingStarts = new AtomicInteger(rsp.documentLinks.size());
+        // Keep track of failed services.
+        List<String> failedServices = new ArrayList<>();
+
+        // Track child service request in parallel, passing a single parent operation
+        AtomicInteger pendingStarts = new AtomicInteger(documentLinks.size());
+
         Operation.CompletionHandler c = (o, e) -> {
-            int r = pendingStarts.decrementAndGet();
             if (e != null && !getHost().isStopping()) {
-                logWarning("Restart for children failed: %s", e.getMessage());
+                logWarning("Synchronization failed for service %s with status code %d, message %s",
+                        o.getUri().getPath(), o.getStatusCode(), e.getMessage());
+                if (o.getStatusCode() >= Operation.STATUS_CODE_SERVER_FAILURE_THRESHOLD ||
+                        o.getStatusCode() == Operation.STATUS_CODE_TIMEOUT) {
+                    synchronized (this) {
+                        failedServices.add(o.getUri().getPath());
+                    }
+                }
             }
+
+            // Wait for failedServices to be updated for all failed services before proceeding further.
+            // Keeping this decrement statement here makes sure that we do not have race condition with failedServices.
+            int r = pendingStarts.decrementAndGet();
 
             if (getHost().isStopping()) {
                 sendSelfCancellationPatch(task, "host is stopping");
@@ -550,18 +634,63 @@ public class SynchronizationTaskService
                 return;
             }
 
+            // Retry synchronization for services failed to synch last time.
+            // Only retry if failed services are less than the half of the total services and
+            // maximum retry count is not reached.
+
+            if (!failedServices.isEmpty()) {
+                if (failedServices.size() <= task.queryResultLimit / 2) {
+                    if (retryCount < MAX_CHILD_SYNCH_RETRY_COUNT) {
+                        synchronized (this) {
+                            if (!getHost().isStopping()) {
+                                logWarning("Retrying synchronization for %d failed services", failedServices.size());
+
+                                scheduleRetry(
+                                        () -> synchronizeChildrenInQueryPage(
+                                                task,
+                                                rsp,
+                                                failedServices,
+                                                retryCount + 1,
+                                                totalServiceCount),
+                                        STAT_NAME_CHILD_SYNCH_RETRY_COUNT);
+                                adjustStat(STAT_NAME_SYNCH_RETRY_COUNT, 1);
+                            }
+
+                            return;
+                        }
+                    } else {
+                        if (!getHost().isStopping()) {
+                            logSevere("Synchronization failed for %d services", failedServices.size());
+                        }
+                        adjustStat(STAT_NAME_CHILD_SYNCH_FAILURE_COUNT, failedServices.size());
+                        task.synchCompletionCount += (totalServiceCount - failedServices.size());
+                        sendSelfFailurePatch(task, "Too many retries in synchronizing child services");
+                        return;
+                    }
+                } else {
+                    // Just fail the synch-task since we go so many failures
+                    adjustStat(STAT_NAME_CHILD_SYNCH_FAILURE_COUNT, failedServices.size());
+                    task.synchCompletionCount += (totalServiceCount - failedServices.size());
+                    sendSelfFailurePatch(task, "Too many failures in synchronizing child services");
+                    return;
+                }
+            }
+
+            setStat(STAT_NAME_CHILD_SYNCH_RETRY_COUNT, 0);
             task.queryPageReference = rsp.nextPageLink != null
                     ? UriUtils.buildUri(task.queryPageReference, rsp.nextPageLink)
                     : null;
 
+            task.synchCompletionCount += totalServiceCount;
+
             if (task.queryPageReference == null) {
-                sendSelfFinishedPatch(task);
+                sendSelfPatch(task, TaskState.TaskStage.STARTED, subStageSetter(SubStage.CHECK_NG_AVAILABILITY));
                 return;
             }
             sendSelfPatch(task, TaskState.TaskStage.STARTED, subStageSetter(SubStage.SYNCHRONIZE));
         };
 
-        for (String link : rsp.documentLinks) {
+        for (String link : documentLinks) {
             if (getHost().isStopping()) {
                 sendSelfCancellationPatch(task, "host is stopping");
                 return;
@@ -569,6 +698,47 @@ public class SynchronizationTaskService
 
             synchronizeService(task, link, c);
         }
+    }
+
+    private void scheduleRetry(Runnable task, String statNameRetryCount) {
+        adjustStat(statNameRetryCount, 1);
+        ServiceStats.ServiceStat stat = getStat(statNameRetryCount);
+
+        long retryCounter = 0;
+        if (stat != null) {
+            retryCounter = (long) stat.latestValue;
+        }
+
+        // Use exponential backoff algorithm in retry logic. The idea is to exponentially
+        // increase the delay for each retry based on the number of previous retries.
+        // This is done to reduce the load of retries on the system by all the tasks
+        // at same time, and giving system more time to stabilize
+        // in next retry then the previous retry.
+        long delay = getExponentialDelay(statNameRetryCount);
+
+        logWarning("%s: Scheduling retry #%d of task (counter:%s) in %d microseconds",
+                getSelfLink(),
+                retryCounter,
+                statNameRetryCount,
+                delay);
+
+        getHost().scheduleCore(task, delay, TimeUnit.MICROSECONDS);
+    }
+
+    /**
+     * Exponential backoff rely on retry count stat. If this stat is not available
+     * then we will fall back to constant delay for each retry.
+     * To get exponential delay, multiply retry count's power of 2 with constant delay.
+     * @param statNameRetryCount
+     */
+    private long getExponentialDelay(String statNameRetryCount) {
+        long delay = getHost().getMaintenanceIntervalMicros();
+        ServiceStats.ServiceStat stat = getStat(statNameRetryCount);
+        if (stat != null && stat.latestValue > 0) {
+            return (1 << ((long)stat.latestValue)) * delay;
+        }
+
+        return delay;
     }
 
     private boolean verifySynchronizationOwnership(State task) {
@@ -625,16 +795,41 @@ public class SynchronizationTaskService
                 .setBody(d)
                 .setCompletion(c)
                 .setReferer(getUri())
+                .setConnectionSharing(true)
+                .setConnectionTag(ServiceClient.CONNECTION_TAG_SYNCHRONIZATION)
                 .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_OWNER)
-                .setExpiration(
-                        Utils.fromNowMicrosUtc(NodeGroupService.PEER_REQUEST_TIMEOUT_MICROS))
                 .setRetryCount(0);
         try {
             sendRequest(synchRequest);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             logSevere(e);
             synchRequest.fail(e);
         }
+    }
+
+    private void handleCheckNodeGroupAvailabilityStage(State task) {
+        // get node selector state
+        Operation getNodeSelectorStateOp = Operation
+                .createGet(getHost(), task.nodeSelectorLink)
+                .setCompletion((o, e) -> {
+                    if (e != null || !o.hasBody()) {
+                        sendSelfFailurePatch(task, "failed to get node selector state");
+                        return;
+                    }
+
+                    NodeSelectorState nsState = o.getBody(NodeSelectorState.class);
+
+                    // check for node group availability
+                    if (!NodeSelectorState.isAvailable(nsState)) {
+                        // node group is not available - failing the task to
+                        // prevent factory from being marked available
+                        sendSelfFailurePatch(task, "node group is not available");
+                        return;
+                    }
+
+                    sendSelfFinishedPatch(task);
+                });
+        sendRequest(getNodeSelectorStateOp);
     }
 
     private void setFactoryAvailability(
@@ -646,6 +841,8 @@ public class SynchronizationTaskService
         Operation put = Operation.createPut(
                 UriUtils.buildAvailableUri(this.getHost(), task.factorySelfLink))
                 .setBody(body)
+                .setConnectionSharing(true)
+                .setConnectionTag(ServiceClient.CONNECTION_TAG_SYNCHRONIZATION)
                 .setCompletion((o, e) -> {
                     if (parentOp != null) {
                         parentOp.complete();
@@ -660,6 +857,12 @@ public class SynchronizationTaskService
                     }
                 });
         sendRequest(put);
+    }
+
+    @Override
+    protected void sendSelfPatch(State taskState, TaskState.TaskStage stage, Consumer<State> updateTaskState) {
+        taskState.failureMessage = "";
+        super.sendSelfPatch(taskState, stage, updateTaskState);
     }
 
     private Consumer<State> subStageSetter(SubStage subStage) {

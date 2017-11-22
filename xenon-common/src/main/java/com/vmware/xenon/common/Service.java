@@ -151,10 +151,9 @@ public interface Service extends ServiceRequestSender {
         IDEMPOTENT_POST,
 
         /**
-         * Runtime will load factory child services the first time a client attempts to access
-         * them. Replication services might load due to synchronization, when joining node groups.
+         * Deprecated
          *
-         * Requires: FACTORY_ITEM (services created through factories)
+         * All stateful persistent services are now started on-demand
          *
          */
         ON_DEMAND_LOAD,
@@ -169,7 +168,8 @@ public interface Service extends ServiceRequestSender {
          * violates these assumptions (by using {@link Operation#PRAGMA_DIRECTIVE_FORCE_INDEX_UPDATE}
          * for example), behavior is unspecified.
          *
-         * Requires: ON_DEMAND_LOAD
+         * Requires: PERSISTENCE
+         * Not compatible with: PERIODIC_MAINTENANCE, INSTRUMENTATION
          */
         IMMUTABLE,
 
@@ -190,6 +190,14 @@ public interface Service extends ServiceRequestSender {
          *
          */
         URI_NAMESPACE_OWNER,
+
+        /**
+         * Advanced option, reserved.
+         *
+         * Service is a core runtime service that requires isolation and higher guarantees from
+         * other services
+         */
+        CORE,
 
         /**
          * Set by runtime. Service is associated with another service providing functionality for
@@ -272,16 +280,10 @@ public interface Service extends ServiceRequestSender {
         REPLICATE_STATE,
 
         /**
-         * Service is ready for operation processing. Any operations received while in the STARTED
-         * or INITIALIZED stage will be dequeued.
+         * Service is available. Any operations received before it became
+         * available will be dequeued and processed.
          */
         AVAILABLE,
-
-        /**
-         * Service is paused due to memory pressure. Its detached from the service host and its
-         * runtime context is persisted to disk.
-         */
-        PAUSED,
 
         /**
          * Service is stopped and its resources have been released
@@ -315,6 +317,7 @@ public interface Service extends ServiceRequestSender {
     static final String STAT_NAME_AVAILABLE = "isAvailable";
     static final String STAT_NAME_FAILURE_COUNT = "failureCount";
     static final String STAT_NAME_REQUEST_OUT_OF_ORDER_COUNT = "requestOutOfOrderCount";
+    static final String STAT_NAME_REQUEST_FAILURE_QUEUE_LIMIT_EXCEEDED_COUNT = "requestFailureQueueLimitExceededCount";
     static final String STAT_NAME_STATE_PERSIST_LATENCY = "statePersistLatencyMicros";
     static final String STAT_NAME_OPERATION_QUEUEING_LATENCY = "operationQueueingLatencyMicros";
     static final String STAT_NAME_SERVICE_HANDLER_LATENCY = "operationHandlerProcessingLatencyMicros";
@@ -327,29 +330,27 @@ public interface Service extends ServiceRequestSender {
     static final String STAT_NAME_MAINTENANCE_COMPLETION_DELAYED_COUNT = "maintenanceCompletionDelayedCount";
     static final String STAT_NAME_DOCUMENT_OWNER_TOGGLE_ON_MAINT_COUNT = "maintenanceDocumentOwnerToggleOnCount";
     static final String STAT_NAME_DOCUMENT_OWNER_TOGGLE_OFF_MAINT_COUNT = "maintenanceDocumentOwnerToggleOffCount";
-    static final String STAT_NAME_CACHE_MISS_COUNT = "stateCacheMissCount";
-    static final String STAT_NAME_CACHE_CLEAR_COUNT = "stateCacheClearCount";
     static final String STAT_NAME_VERSION_CONFLICT_COUNT = "stateVersionConflictCount";
     static final String STAT_NAME_VERSION_IN_CONFLICT = "stateVersionInConflict";
-    static final String STAT_NAME_PAUSE_COUNT = "pauseCount";
-    static final String STAT_NAME_RESUME_COUNT = "resumeCount";
     static final String STAT_NAME_MAINTENANCE_DURATION = "maintenanceDuration";
+    static final String STAT_NAME_SYNCH_TASK_RETRY_COUNT = "synchTaskRetryCount";
+    static final String STAT_NAME_CHILD_SYNCH_FAILURE_COUNT = "childSynchFailureCount";
 
     /**
      * Estimate on run time context cost in bytes, per service instance. Services should not use instanced
      * fields, so, other than queuing context and utility service usage, the memory overhead should be small
      */
-    static final int MAX_SERIALIZED_SIZE_BYTES = 1024 * 64;
+    int MAX_SERIALIZED_SIZE_BYTES = 1024 * 64;
 
     /**
      * Default operation queue limit
      */
-    static final int OPERATION_QUEUE_DEFAULT_LIMIT = 10000;
+    int OPERATION_QUEUE_DEFAULT_LIMIT = 10000;
 
     /**
      * Default Synchronization queue limit
      */
-    static final int SYNCH_QUEUE_DEFAULT_LIMIT = 100;
+    int SYNCH_QUEUE_DEFAULT_LIMIT = 100;
 
     /**
      * Equivalent to {@code getSelfId} and {@code UriUtils.getLastPathSegment}
@@ -430,6 +431,7 @@ public interface Service extends ServiceRequestSender {
     /**
      * Sends a request using the default service client associated with the host
      */
+    @Override
     void sendRequest(Operation op);
 
     /**
@@ -460,6 +462,10 @@ public interface Service extends ServiceRequestSender {
 
     long getMaintenanceIntervalMicros();
 
+    void setCacheClearDelayMicros(long micros);
+
+    long getCacheClearDelayMicros();
+
     ServiceHost getHost();
 
     String getSelfLink();
@@ -483,12 +489,25 @@ public interface Service extends ServiceRequestSender {
      * The default node selector services uses a consistent hashing scheme and
      * picks among all available nodes.
      */
-    void setPeerNodeSelectorPath(String link);
+    void setPeerNodeSelectorPath(String path);
 
     /**
-     * If replication is enabled, returns the URI path for the replication selector associated with the service
+     * Returns the URI path for the replication selector associated with the service
      */
     String getPeerNodeSelectorPath();
+
+    /**
+     * Sets the URI path to a document index service instance.
+     *
+     * The default document index is durable (disk backed) and is used when {@link ServiceOption#PERSISTENCE}
+     * is enabled
+     */
+    void setDocumentIndexPath(String path);
+
+    /**
+     * Returns the URI path for the document index service associated with the service
+     */
+    String getDocumentIndexPath();
 
     ServiceStat getStat(String name);
 
@@ -506,7 +525,7 @@ public interface Service extends ServiceRequestSender {
 
     void setOperationProcessingChain(OperationProcessingChain opProcessingChain);
 
-    ServiceRuntimeContext setProcessingStage(ProcessingStage initialized);
+    void setProcessingStage(ProcessingStage initialized);
 
     ServiceDocument setInitialState(Object state, Long initialVersion);
 

@@ -13,24 +13,31 @@
 
 package com.vmware.xenon.common;
 
+import static java.util.stream.Collectors.toSet;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.lang.reflect.Field;
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.LongStream;
 import java.util.stream.Stream;
@@ -39,6 +46,7 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import com.vmware.xenon.common.FactoryService.FactoryServiceConfiguration;
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.test.MinimalTestServiceState;
 import com.vmware.xenon.common.test.TestContext;
@@ -47,9 +55,49 @@ import com.vmware.xenon.common.test.TestRequestSender;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
+import com.vmware.xenon.services.common.InMemoryLuceneDocumentIndexService;
 import com.vmware.xenon.services.common.MinimalFactoryTestService;
 import com.vmware.xenon.services.common.MinimalTestService;
 import com.vmware.xenon.services.common.ServiceUriPaths;
+import com.vmware.xenon.services.common.TaskService;
+import com.vmware.xenon.services.common.TestLuceneDocumentIndexService.InMemoryExampleService;
+
+class ControlledStateSynchTaskService extends TaskService<ControlledStateSynchTaskService.State> {
+
+    public ControlledStateSynchTaskService() {
+        super(State.class);
+        toggleOption(ServiceOption.IDEMPOTENT_POST, true);
+    }
+
+    public static class State extends SynchronizationTaskService.State {
+        int maxFailureCount;
+        int failureCount;
+    }
+
+    @Override
+    public void handlePut(Operation put) {
+        State state = this.getState(put);
+
+        if (state.failureCount < state.maxFailureCount) {
+            state.taskInfo.stage = TaskState.TaskStage.FAILED;
+        } else {
+            state.taskInfo.stage = TaskState.TaskStage.FINISHED;
+        }
+
+        state.failureCount++;
+        put.setBody(state);
+        put.complete();
+    }
+
+    @Override
+    public void handlePatch(Operation patch) {
+        State state = this.getState(patch);
+        State body = patch.getBody(State.class);
+        state.maxFailureCount = body.maxFailureCount;
+        patch.setBody(state);
+        patch.complete();
+    }
+}
 
 class TypeMismatchTestFactoryService extends FactoryService {
 
@@ -67,7 +115,7 @@ class TypeMismatchTestFactoryService extends FactoryService {
 }
 
 class SynchTestFactoryService extends FactoryService {
-    private static final int MAINTENANCE_DELAY_HANDLE_MICROS = 50;
+    private static final int MAINTENANCE_DELAY_HANDLE_MILLISECONDS = 150;
     public static final String TEST_FACTORY_PATH = "/subpath/testfactory";
     public static final String TEST_SERVICE_PATH = TEST_FACTORY_PATH + "/instanceX";
 
@@ -105,8 +153,8 @@ class SynchTestFactoryService extends FactoryService {
         }
 
         if (task != null) {
-            getHost().schedule(task, MAINTENANCE_DELAY_HANDLE_MICROS,
-                    TimeUnit.MICROSECONDS);
+            getHost().schedule(task, MAINTENANCE_DELAY_HANDLE_MILLISECONDS,
+                    TimeUnit.MILLISECONDS);
         }
         super.handleNodeGroupMaintenance(post);
     }
@@ -160,6 +208,101 @@ public class TestFactoryService extends BasicReusableHostTestCase {
         thpt = (double) this.iterationCount / (e - s);
         thpt *= TimeUnit.SECONDS.toNanos(1);
         this.host.log("UUID.randomUUID().toString() throughput (calls/sec) %f", thpt);
+    }
+
+    /**
+     * Test verifies that FactoryService retries child services' synchronization task on task's failure.
+     *
+     * 1. First a Test Factory Service is created, which internally creates SynchronizationTaskService for
+     *    synchronization of its child services.
+     * 2. We need to control the failures of SynchronizationTaskService. For that we delete it and create our
+     *    own test Synch Task Service on the same link as of SynchronizationTaskService for our Test Facotry Service.
+     * 3. In test Synch Task Service we control its failures and verify that our Test Factory Service retired
+     *    calling test Synch Task Service again and again on failures.
+     *    And stopped retrying after success or maximum retries.
+     */
+    @Test
+    public void synchronizationTaskRetryOnFailure() throws Throwable {
+        int testSynchRetryCount = 3;
+
+        this.host.waitForNodeGroupConvergence();
+
+        // Create test factory service
+        this.host.waitForReplicatedFactoryServiceAvailable(
+                UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK),
+                ServiceUriPaths.DEFAULT_NODE_SELECTOR);
+
+        String synchTaskServicePath = UriUtils.buildUriPath(
+                SynchronizationTaskService.FACTORY_LINK,
+                UriUtils.convertPathCharsFromLink(ExampleService.FACTORY_LINK));
+
+        URI synchTaskServiceUri = UriUtils.buildUri(this.host.getUri(), synchTaskServicePath);
+
+        // Delete the original synchronization Task associated with test factory service. We will later
+        // replace self-link of this Task with our test Task service to control the success/failure of synch task.
+        this.host.sendAndWaitExpectSuccess(Operation
+                .createDelete(synchTaskServiceUri)
+                .setCompletion(this.host.getCompletion()));
+
+        // Create synchronization Task with same link, but new Task service.
+        ControlledStateSynchTaskService.State state = new ControlledStateSynchTaskService.State();
+        state.taskInfo = new TaskState();
+        state.maxFailureCount = testSynchRetryCount;
+        state.documentSelfLink = synchTaskServicePath;
+
+        Operation post = Operation
+                .createPost(this.host, synchTaskServicePath)
+                .setBody(state);
+
+        this.host.startService(post, new ControlledStateSynchTaskService());
+        this.host.waitForServiceAvailable(synchTaskServiceUri);
+
+        // Trigger node group maintenance. This will call handleNodeGroupMaintenance in test factory service,
+        // which will trigger the synchronization Task, but this time, our injected synch Task will be called.
+        this.host.scheduleNodeGroupChangeMaintenance(ServiceUriPaths.DEFAULT_NODE_SELECTOR);
+
+        // Verify that synchronization was retried at-least 1 time.
+        waitForSynchRetries(Service.STAT_NAME_SYNCH_TASK_RETRY_COUNT,
+                (synchRetryCount) -> synchRetryCount.latestValue >= 1);
+
+        // Wait for synchronization gets completed after retries, and retry counter is reset to 0.
+        waitForSynchRetries(Service.STAT_NAME_SYNCH_TASK_RETRY_COUNT,
+                (synchRetryCount) -> synchRetryCount.latestValue == 0);
+
+        // Make test synch Task to be in FAILED state forever, to test maximum retry limit.
+        state = new ControlledStateSynchTaskService.State();
+        state.maxFailureCount = Integer.MAX_VALUE;
+        state.documentSelfLink = synchTaskServicePath;
+
+        this.host.sendAndWaitExpectSuccess(
+                Operation.createPatch(this.host, synchTaskServicePath)
+                    .setBody(state)
+                    .setCompletion(this.host.getCompletion()));
+
+        this.host.scheduleNodeGroupChangeMaintenance(ServiceUriPaths.DEFAULT_NODE_SELECTOR);
+
+        // Speed up the retries.
+        this.host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(1));
+
+        // Verify that synchronization was retried maximum times.
+        waitForSynchRetries(Service.STAT_NAME_SYNCH_TASK_RETRY_COUNT,
+                (synchRetryCount) -> synchRetryCount.latestValue >= FactoryService.MAX_SYNCH_RETRY_COUNT);
+
+        // Verify overall synch failure count
+        waitForSynchRetries(Service.STAT_NAME_CHILD_SYNCH_FAILURE_COUNT,
+                (synchFailureCount) -> synchFailureCount.latestValue >= 1);
+    }
+
+    private void waitForSynchRetries(String statName,
+                                     Function<ServiceStats.ServiceStat, Boolean> check) {
+        this.host.waitFor("Expected retries not completed", () -> {
+            URI statsURI = UriUtils.buildStatsUri(this.host, ExampleService.FACTORY_LINK);
+            ServiceStats factoryStats = this.host.getServiceState(null, ServiceStats.class, statsURI);
+            ServiceStats.ServiceStat synchRetryCount = factoryStats.entries
+                    .get(statName);
+
+            return synchRetryCount != null && check.apply(synchRetryCount);
+        });
     }
 
     /**
@@ -288,28 +431,15 @@ public class TestFactoryService extends BasicReusableHostTestCase {
         this.host.waitForServiceAvailable(factoryService.getUri());
 
         f = new MinimalFactoryTestService();
-        f.setChildServiceCaps(EnumSet.of(ServiceOption.PERSISTENCE, ServiceOption.ON_DEMAND_LOAD));
-        factoryService = (MinimalFactoryTestService) this.host
-                .startServiceAndWait(f, UUID.randomUUID().toString(), null);
-        this.host.waitForServiceAvailable(factoryService.getUri());
-
-        f = new MinimalFactoryTestService();
-        f.setChildServiceCaps(EnumSet.of(ServiceOption.ON_DEMAND_LOAD));
+        f.toggleOption(ServiceOption.REPLICATION, true);
+        f.setChildServiceCaps(EnumSet.of(ServiceOption.REPLICATION));
         factoryService = (MinimalFactoryTestService) this.host
                 .startServiceAndWait(f, UUID.randomUUID().toString(), null);
         this.host.waitForServiceAvailable(factoryService.getUri());
 
         f = new MinimalFactoryTestService();
         f.toggleOption(ServiceOption.REPLICATION, true);
-        f.setChildServiceCaps(EnumSet.of(ServiceOption.ON_DEMAND_LOAD, ServiceOption.REPLICATION));
-        factoryService = (MinimalFactoryTestService) this.host
-                .startServiceAndWait(f, UUID.randomUUID().toString(), null);
-        this.host.waitForServiceAvailable(factoryService.getUri());
-
-        f = new MinimalFactoryTestService();
-        f.toggleOption(ServiceOption.REPLICATION, true);
-        f.setChildServiceCaps(EnumSet.of(ServiceOption.ON_DEMAND_LOAD,
-                ServiceOption.PERSISTENCE,
+        f.setChildServiceCaps(EnumSet.of(ServiceOption.PERSISTENCE,
                 ServiceOption.REPLICATION));
         factoryService = (MinimalFactoryTestService) this.host
                 .startServiceAndWait(f, UUID.randomUUID().toString(), null);
@@ -412,6 +542,37 @@ public class TestFactoryService extends BasicReusableHostTestCase {
                 factoryService.getUri());
     }
 
+    @Test
+    public void invalidSubChildPath() throws Throwable {
+        MinimalFactoryTestService f = new MinimalFactoryTestService();
+        f.setChildServiceCaps(EnumSet.of(ServiceOption.PERSISTENCE));
+        f = (MinimalFactoryTestService) this.host
+                .startServiceAndWait(f, UUID.randomUUID().toString(), null);
+        this.host.waitForServiceAvailable(f.getUri());
+
+        // create a child
+        MinimalTestServiceState initialState = (MinimalTestServiceState) this.host
+                .buildMinimalTestState();
+        initialState.documentSelfLink = "foo";
+        Operation post = Operation
+                .createPost(f.getUri())
+                .setBody(initialState);
+        this.host.sendAndWaitExpectSuccess(post);
+
+        // confirm child is running with a GET
+        Operation get = Operation
+                .createGet(UriUtils.extendUri(f.getUri(), initialState.documentSelfLink));
+        this.host.sendAndWaitExpectSuccess(get);
+
+        // create a bogus URI with a nested suffix, should result in error
+        TestRequestSender sender = this.host.getTestRequestSender();
+
+        get = Operation
+                .createGet(UriUtils.extendUri(f.getUri(),
+                        initialState.documentSelfLink + "/sub-child"));
+        sender.sendAndWaitFailure(get);
+    }
+
     private void doFactoryServiceChildCreation(long count, URI factoryUri)
             throws Throwable {
         doFactoryServiceChildCreation(EnumSet.noneOf(ServiceOption.class),
@@ -441,7 +602,7 @@ public class TestFactoryService extends BasicReusableHostTestCase {
             MinimalTestServiceState initialState = (MinimalTestServiceState) this.host
                     .buildMinimalTestState();
 
-            initialState.documentSelfLink = UUID.randomUUID().toString();
+            initialState.documentSelfLink = this.host.nextUUID();
             initialStates.put(UriUtils.extendUri(factoryUri,
                     initialState.documentSelfLink), initialState);
 
@@ -764,7 +925,7 @@ public class TestFactoryService extends BasicReusableHostTestCase {
                                 this.host.failIteration(new IllegalStateException(
                                         "Should have rejected request"));
                             } else {
-                                ServiceErrorResponse rsp = o.getBody(ServiceErrorResponse.class);
+                                ServiceErrorResponse rsp = o.getErrorResponseBody();
                                 if (rsp.message == null
                                         || !rsp.message.toLowerCase()
                                                 .contains("body is required")) {
@@ -950,13 +1111,13 @@ public class TestFactoryService extends BasicReusableHostTestCase {
     @Test
     public void testFactoryPostHandling() throws Throwable {
         startFactoryService();
-
-        this.host.testStart(4);
-        idempotentPostReturnsUpdatedOpBody();
-        checkDerivedSelfLinkWhenProvidedSelfLinkIsJustASuffix();
-        checkDerivedSelfLinkWhenProvidedSelfLinkAlreadyContainsAPath();
-        checkDerivedSelfLinkWhenProvidedSelfLinkLooksLikeItContainsAPathButDoesnt();
-        this.host.testWait();
+        TestRequestSender sender = host.getTestRequestSender();
+        idempotentPostReturnsUpdatedOpBody(sender);
+        checkDerivedSelfLinkWhenProvidedSelfLinkIsJustASuffix(sender);
+        checkDerivedSelfLinkWhenProvidedSelfLinkAlreadyContainsAPath(sender);
+        checkSelfLinkWithAcceptableChars(sender);
+        failPostWhenProvidedSelfLinkContainsUriPathChar(sender);
+        failPostWhenProvidedSelfLinkContainsInvalidPathChar(sender);
     }
 
     @Test
@@ -1014,6 +1175,8 @@ public class TestFactoryService extends BasicReusableHostTestCase {
         validateLimitAndOrderBy(stateSupplier, 1, true, "counter", true, true);
         validateLimitAndOrderBy(stateSupplier, 5, false, "counter", false, true);
         validateLimitAndOrderBy(stateSupplier, 10, false, "name", true, false);
+
+        validateSkip();
     }
 
     private void validateCount(Supplier<Stream<ExampleServiceState>> stateSupplier,
@@ -1047,7 +1210,7 @@ public class TestFactoryService extends BasicReusableHostTestCase {
 
     private void validateOrderBy(Supplier<Stream<ExampleServiceState>> stateSupplier,
             String fieldName, boolean asc, boolean filter) throws Throwable {
-        String queryString = String.format("$orderby=%s %s", fieldName, asc ? "asc" : "desc");
+        String queryString = String.format("$expand&$orderby=%s %s", fieldName, asc ? "asc" : "desc");
         if (filter) {
             queryString += String.format("&$filter=%s lt %s", fieldName, stateSupplier.get().count());
         }
@@ -1071,7 +1234,7 @@ public class TestFactoryService extends BasicReusableHostTestCase {
 
     private void validateLimitAndOrderBy(Supplier<Stream<ExampleServiceState>> stateSupplier, long limit,
             boolean count, String fieldName, boolean asc, boolean filter) throws Throwable {
-        String queryString = String.format("$limit=%s&$count=%s&$orderby=%s %s",
+        String queryString = String.format("$expand&$limit=%s&$count=%s&$orderby=%s %s",
                 limit, count, fieldName, asc ? "asc" : "desc");
         if (filter) {
             queryString += String.format("&$filter=%s lt %s", fieldName, stateSupplier.get().count());
@@ -1121,6 +1284,32 @@ public class TestFactoryService extends BasicReusableHostTestCase {
         }
 
         assertTrue(current == stateSupplier.get().count());
+    }
+
+    private void validateSkip() throws Throwable {
+        // validate skip
+        ODataFactoryQueryResult result = getResult("$skip=3");
+        assertEquals(2, result.documentLinks.size());
+
+        // skip with limit
+        result = getResult("$skip=1&$limit=2");
+        assertNotNull(result.nextPageLink);
+        ServiceDocumentQueryResult nextResult = getNextResult(result.nextPageLink);
+        assertEquals(2, nextResult.documentLinks.size());
+        assertNull(nextResult.nextPageLink);
+
+        // skip with top
+        result = getResult("$skip=2&$top=2");
+        assertEquals(2, result.documentLinks.size());
+        assertNull(result.nextPageLink);
+
+        // skip with orderby
+        ODataFactoryQueryResult ordered = getResult("$orderby=counter asc");
+        result = getResult("$skip=2&$orderby=counter asc");
+        assertEquals(3, result.documentLinks.size());
+        assertEquals("expected 3rd doc shows up on 1st result", ordered.documentLinks.get(2), result.documentLinks.get(0));
+        assertEquals("expected 4th doc shows up on 2nd result", ordered.documentLinks.get(3), result.documentLinks.get(1));
+        assertEquals("expected 5th doc shows up on 3rd result", ordered.documentLinks.get(4), result.documentLinks.get(2));
     }
 
     private ODataFactoryQueryResult getResult(String queryString) throws Throwable {
@@ -1227,121 +1416,62 @@ public class TestFactoryService extends BasicReusableHostTestCase {
         this.host.registerForServiceAvailability(this.host.getCompletion(),
                 SomeFactoryService.SELF_LINK);
         this.host.testWait();
-
     }
 
-    private void idempotentPostReturnsUpdatedOpBody() throws Throwable {
+    private void idempotentPostReturnsUpdatedOpBody(TestRequestSender sender) throws Throwable {
         SomeDocument doc = new SomeDocument();
         doc.documentSelfLink = "/subpath/fff/apple";
         doc.value = 2;
-
-        this.host.send(Operation.createPost(this.factoryUri)
-                .setBody(doc)
-                .setCompletion(
-                        (o, e) -> {
-                            if (e != null) {
-                                this.host.failIteration(e);
-                                return;
-                            }
-
-                            this.host.send(Operation.createPost(this.factoryUri)
-                                    .setBody(doc)
-                                    .setCompletion(
-                                            (o2, e2) -> {
-                                                if (e2 != null) {
-                                                    this.host.failIteration(e2);
-                                                    return;
-                                                }
-
-                                                SomeDocument doc2 = o2.getBody(SomeDocument.class);
-                                                try {
-                                                    assertNotNull(doc2);
-                                                    assertEquals(4, doc2.value);
-                                                    this.host.completeIteration();
-                                                } catch (AssertionError e3) {
-                                                    this.host.failIteration(e3);
-                                                }
-                                            }));
-                        }));
+        sender.sendAndWait(Operation.createPost(this.factoryUri).setBody(doc));
+        Operation o = sender.sendAndWait(Operation.createPost(this.factoryUri).setBody(doc));
+        SomeDocument doc2 = o.getBody(SomeDocument.class);
+        assertNotNull(doc2);
+        assertEquals(4, doc2.value);
     }
 
-    private void checkDerivedSelfLinkWhenProvidedSelfLinkIsJustASuffix() throws Throwable {
+    private void checkDerivedSelfLinkWhenProvidedSelfLinkIsJustASuffix(TestRequestSender sender) throws Throwable {
         SomeDocument doc = new SomeDocument();
-        doc.documentSelfLink = "freddy/x1";
-
-        this.host.send(Operation.createPost(this.factoryUri)
-                .setBody(doc)
-                .setCompletion((o, e) -> {
-                    if (e != null) {
-                        this.host.failIteration(e);
-                        return;
-                    }
-
-                    String selfLink = o.getBody(SomeDocument.class).documentSelfLink;
-                    URI opUri = o.getUri();
-
-                    String expectedPath = "/subpath/fff/freddy/x1";
-                    try {
-                        assertEquals(expectedPath, selfLink);
-                        assertEquals(UriUtils.buildUri(this.host, expectedPath), opUri);
-                        this.host.completeIteration();
-                    } catch (Throwable e2) {
-                        this.host.failIteration(e2);
-                    }
-                }));
+        doc.documentSelfLink = "freddy-x1";
+        Operation o = sender.sendAndWait(Operation.createPost(this.factoryUri)
+                .setBody(doc));
+        String selfLink = o.getBody(SomeDocument.class).documentSelfLink;
+        URI opUri = o.getUri();
+        String expectedPath = "/subpath/fff/freddy-x1";
+        assertEquals(expectedPath, selfLink);
+        assertEquals(UriUtils.buildUri(this.host, expectedPath), opUri);
     }
 
-    private void checkDerivedSelfLinkWhenProvidedSelfLinkAlreadyContainsAPath() throws Throwable {
+    private void checkDerivedSelfLinkWhenProvidedSelfLinkAlreadyContainsAPath(TestRequestSender sender) throws Throwable {
         SomeDocument doc = new SomeDocument();
-        doc.documentSelfLink = "/subpath/fff/freddy/x2";
-
-        this.host.send(Operation.createPost(this.factoryUri)
-                .setBody(doc)
-                .setCompletion((o, e) -> {
-                    if (e != null) {
-                        this.host.failIteration(e);
-                        return;
-                    }
-
-                    String selfLink = o.getBody(SomeDocument.class).documentSelfLink;
-                    URI opUri = o.getUri();
-
-                    String expectedPath = "/subpath/fff/freddy/x2";
-                    try {
-                        assertEquals(expectedPath, selfLink);
-                        assertEquals(UriUtils.buildUri(this.host, expectedPath), opUri);
-                        this.host.completeIteration();
-                    } catch (Throwable e2) {
-                        this.host.failIteration(e2);
-                    }
-                }));
+        doc.documentSelfLink = "/subpath/fff/freddy-x2";
+        Operation o = sender.sendAndWait(Operation.createPost(this.factoryUri)
+                .setBody(doc));
+        String selfLink = o.getBody(SomeDocument.class).documentSelfLink;
+        URI opUri = o.getUri();
+        String expectedPath = "/subpath/fff/freddy-x2";
+        assertEquals(expectedPath, selfLink);
+        assertEquals(UriUtils.buildUri(this.host, expectedPath), opUri);
     }
 
-    private void checkDerivedSelfLinkWhenProvidedSelfLinkLooksLikeItContainsAPathButDoesnt()
+    private void failPostWhenProvidedSelfLinkContainsUriPathChar(TestRequestSender sender)
             throws Throwable {
         SomeDocument doc = new SomeDocument();
-        doc.documentSelfLink = "/subpath/fffreddy/x3";
+        doc.documentSelfLink = "reddy/x3";
+        sender.sendAndWaitFailure(Operation.createPost(this.factoryUri).setBody(doc));
+    }
 
-        this.host.send(Operation.createPost(this.factoryUri)
-                .setBody(doc)
-                .setCompletion((o, e) -> {
-                    if (e != null) {
-                        this.host.failIteration(e);
-                        return;
-                    }
+    private void failPostWhenProvidedSelfLinkContainsInvalidPathChar(TestRequestSender sender)
+            throws Throwable {
+        SomeDocument doc = new SomeDocument();
+        doc.documentSelfLink = "{{reddyx3}}";
+        sender.sendAndWaitFailure(Operation.createPost(this.factoryUri).setBody(doc));
+    }
 
-                    String selfLink = o.getBody(SomeDocument.class).documentSelfLink;
-                    URI opUri = o.getUri();
-
-                    String expectedPath = "/subpath/fff/subpath/fffreddy/x3";
-                    try {
-                        assertEquals(expectedPath, selfLink);
-                        assertEquals(UriUtils.buildUri(this.host, expectedPath), opUri);
-                        this.host.completeIteration();
-                    } catch (Throwable e2) {
-                        this.host.failIteration(e2);
-                    }
-                }));
+    private void checkSelfLinkWithAcceptableChars(TestRequestSender sender)
+            throws Throwable {
+        SomeDocument doc = new SomeDocument();
+        doc.documentSelfLink = "1212:red::123";
+        sender.sendAndWait(Operation.createPost(this.factoryUri).setBody(doc));
     }
 
     @Test
@@ -1365,6 +1495,98 @@ public class TestFactoryService extends BasicReusableHostTestCase {
         assertEquals("Default Message modified", response.message);
     }
 
+    @Test
+    public void buildChildSelfLinksUsingRequestBody() throws Throwable {
+        FactoryService factoryService = new SomeFactoryService();
+        factoryService.setUseBodyForSelfLink(true);
+        factoryService.toggleOption(ServiceOption.IDEMPOTENT_POST, false);
+
+        String factoryPath = SomeFactoryService.SELF_LINK + "/self-links";
+
+        TestContext ctx = this.host.testCreate(1);
+        Operation post = Operation
+                .createPost(this.host, factoryPath)
+                .setCompletion(ctx.getCompletion());
+        this.host.startService(post, factoryService);
+        ctx.await();
+
+        TestRequestSender sender = new TestRequestSender(this.host);
+        SomeDocument state = new SomeDocument();
+        state.stringValue = UUID.randomUUID().toString();
+
+        // Create a service and verify that the self-link is
+        // based on the value set for the stringValue field.
+        Operation op = Operation
+                .createPost(this.host, factoryPath)
+                .setReferer(this.host.getUri())
+                .setBody(state);
+        Operation response = sender.sendAndWait(op);
+        String selfLink = response.getBody(SomeDocument.class).documentSelfLink;
+        assertTrue(selfLink.equals(factoryPath + "/" + state.stringValue));
+
+        // Try re-creating a service instance using the same stringValue
+        // field. Because the service does not use idempotent-post, we should
+        // get a CONFLICT error.
+        op = Operation
+                .createPost(this.host, factoryPath)
+                .setReferer(this.host.getUri())
+                .setBody(state);
+        TestRequestSender.FailureResponse failureResponse = sender.sendAndWaitFailure(op);
+        assertEquals(Operation.STATUS_CODE_CONFLICT, failureResponse.op.getStatusCode());
+
+        // Try sending a request with null body, we should
+        // get a BAD REQUEST error.
+        op = Operation
+                .createPost(this.host, factoryPath)
+                .setReferer(this.host.getUri())
+                .setBody(null);
+        failureResponse = sender.sendAndWaitFailure(op);
+        assertEquals(Operation.STATUS_CODE_BAD_REQUEST, failureResponse.op.getStatusCode());
+
+        // Try sending a request with stringValue set to null, we should again
+        // get a BAD REQUEST error.
+        state.stringValue = null;
+        op = Operation
+                .createPost(this.host, factoryPath)
+                .setReferer(this.host.getUri())
+                .setBody(state);
+        failureResponse = sender.sendAndWaitFailure(op);
+        assertEquals(Operation.STATUS_CODE_BAD_REQUEST, failureResponse.op.getStatusCode());
+    }
+
+    @Test
+    public void childOptionsInConfigGetRequest() throws Throwable {
+        EnumSet<ServiceOption> exampleOptions = new ExampleService().getOptions();
+        URI configUri = UriUtils.buildConfigUri(this.host, ExampleService.FACTORY_LINK);
+        Operation get = Operation.createGet(configUri);
+        FactoryServiceConfiguration config = this.host.getTestRequestSender().sendAndWait(get, FactoryServiceConfiguration.class);
+        assertEquals(exampleOptions, config.childOptions);
+    }
+
+    @Test
+    public void inMemoryIndexServiceFactoryGet() throws Throwable {
+        this.host.startServiceAndWait(InMemoryLuceneDocumentIndexService.class,
+                InMemoryLuceneDocumentIndexService.SELF_LINK);
+        Service exampleFactory = InMemoryExampleService.createFactory();
+        this.host.startServiceAndWait(exampleFactory, InMemoryExampleService.FACTORY_LINK, null);
+
+        List<Operation> posts = new ArrayList<>();
+        int count = 100;
+        for (int i = 0; i < count; i++) {
+            ExampleServiceState state = new ExampleServiceState();
+            state.name = "foo-" + i;
+            posts.add(Operation.createPost(this.host, InMemoryExampleService.FACTORY_LINK).setBody(state));
+        }
+        List<ExampleServiceState> states = this.sender.sendAndWait(posts, ExampleServiceState.class);
+        Set<String> links = states.stream().map(state -> state.documentSelfLink).collect(toSet());
+
+        Operation factoryGet = Operation.createGet(this.host, InMemoryExampleService.FACTORY_LINK);
+        ServiceDocumentQueryResult result = this.sender.sendAndWait(factoryGet, ServiceDocumentQueryResult.class);
+
+        assertEquals(count, result.documentLinks.size());
+        assertTrue("factory get should return all selfLinks", result.documentLinks.containsAll(links));
+    }
+
     public static class SomeFactoryService extends FactoryService {
 
         public static final String SELF_LINK = FAC_PATH;
@@ -1379,6 +1601,13 @@ public class TestFactoryService extends BasicReusableHostTestCase {
             return new SomeStatefulService();
         }
 
+        @Override
+        public String buildDefaultChildSelfLink(ServiceDocument document) {
+            if (((SomeDocument)document).stringValue == null) {
+                throw new IllegalArgumentException("stringValue is required");
+            }
+            return ((SomeDocument)document).stringValue;
+        }
     }
 
     public static class SomeStatefulService extends StatefulService {
@@ -1399,9 +1628,8 @@ public class TestFactoryService extends BasicReusableHostTestCase {
     }
 
     public static class SomeDocument extends ServiceDocument {
-
         public int value;
-
+        public String stringValue;
     }
 
     public static class ExampleBarService extends StatelessService {
@@ -1420,6 +1648,7 @@ public class TestFactoryService extends BasicReusableHostTestCase {
             return FactoryService.create(ExampleBarService.class);
         }
 
+        @Override
         public void handleStart(Operation start) {
             ExampleBarServiceContext body = start.getBody(ExampleBarServiceContext.class);
             if (body.message == null) {
@@ -1430,10 +1659,12 @@ public class TestFactoryService extends BasicReusableHostTestCase {
             start.complete();
         }
 
+        @Override
         public void handleGet(Operation get) {
             get.setBody(this.context).complete();
         }
 
+        @Override
         public void handlePost(Operation post) {
             this.context.message += " modified";
             post.setBody(this.context).complete();

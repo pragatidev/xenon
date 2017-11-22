@@ -26,7 +26,7 @@ import java.util.stream.Collectors;
  */
 public class LocalizationUtil {
 
-    public static final Locale DEFAULT_LOCALE = Locale.US;
+    public static final Locale DEFAULT_LOCALE = Locale.ENGLISH;
 
     private static final String MESSAGES_BASE_FILENAME = "i18n/messages";
 
@@ -64,7 +64,7 @@ public class LocalizationUtil {
         try {
             message = messages.getString(e.getErrorMessageCode());
         } catch (MissingResourceException ex) {
-            message = e.getSystemMessage();
+            message = e.getMessage();
         }
 
         MessageFormat f = new MessageFormat(message, locale);
@@ -81,7 +81,7 @@ public class LocalizationUtil {
         }
 
         List<Locale> locales = Locale.LanguageRange.parse(requestedLangs).stream()
-                .map(rang‌​e -> new Locale(rang‌​e.getRange()))
+                .map(range -> Locale.forLanguageTag(range.getRange()))
                 .collect(Collectors.toList());
 
         for (Locale locale : locales) {

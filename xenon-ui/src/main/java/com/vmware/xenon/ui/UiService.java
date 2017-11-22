@@ -39,7 +39,7 @@ public class UiService extends UiContentService {
     @Override
     public void handlePost(Operation post) {
         if (!post.hasBody()) {
-            getHost().failRequestActionNotSupported(post);
+            Operation.failActionNotSupported(post);
             return;
         }
 

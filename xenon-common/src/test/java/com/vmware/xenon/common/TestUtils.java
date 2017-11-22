@@ -18,11 +18,13 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.io.ByteArrayOutputStream;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.ByteBuffer;
 import java.nio.charset.MalformedInputException;
@@ -32,7 +34,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Comparator;
+import java.util.Date;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -42,7 +47,9 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ForkJoinPool;
@@ -54,20 +61,27 @@ import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.Kryo.DefaultInstantiatorStrategy;
 import com.esotericsoftware.kryo.io.Output;
 import com.esotericsoftware.kryo.serializers.VersionFieldSerializer;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
-
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.ExpectedException;
 import org.objenesis.strategy.StdInstantiatorStrategy;
 
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceDocumentDescription.Builder;
 import com.vmware.xenon.common.ServiceDocumentDescription.PropertyIndexingOption;
 import com.vmware.xenon.common.SystemHostInfo.OsFamily;
+import com.vmware.xenon.common.serialization.GsonSerializers;
+import com.vmware.xenon.common.serialization.JsonMapper;
 import com.vmware.xenon.common.serialization.KryoSerializers;
 import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.common.test.VerificationHost;
+import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
+import com.vmware.xenon.services.common.QueryValidationTestService.NestedType;
 import com.vmware.xenon.services.common.QueryValidationTestService.QueryValidationServiceState;
 
 public class TestUtils {
@@ -78,6 +92,12 @@ public class TestUtils {
      * large iteration count benchmarks
      */
     public boolean checkHashCollisions = true;
+
+    @Rule
+    public TestResults testResults = new TestResults();
+
+    @Rule
+    public ExpectedException expectedEx = ExpectedException.none();
 
     @Test
     public void registerKind() {
@@ -133,6 +153,7 @@ public class TestUtils {
             log.info("Total chars: " + sum);
             double thpt = this.iterationCount / ((end - start) / 1000000000.0);
             log.info("Throughput (calls / sec): " + thpt);
+            this.testResults.getReport().lastValue(TestResults.KEY_THROUGHPUT, thpt);
         } finally {
             Utils.setTimeDriftThreshold(Utils.DEFAULT_TIME_DRIFT_THRESHOLD_MICROS);
         }
@@ -163,8 +184,14 @@ public class TestUtils {
         }
         long e = System.nanoTime() / 1000;
         double thpt = this.iterationCount / ((e - s) / 1000000.0);
+
+        this.testResults.getReport().lastValue(TestResults.KEY_THROUGHPUT, thpt);
         Logger.getAnonymousLogger().info("Throughput: " + thpt);
         Logger.getAnonymousLogger().info("Collisions: " + collisionCount);
+    }
+
+    private static String computeHash(byte[] content, int offset, int length) {
+        return Long.toHexString(FNVHash.compute(content, offset, length));
     }
 
     @Test
@@ -177,8 +204,8 @@ public class TestUtils {
         for (int i = 0; i < this.iterationCount; i++) {
             String k = "-string-" + i;
             byte[] bytes = k.getBytes(Utils.CHARSET);
-            String stringHash = Utils.computeHash(bytes, 0, bytes.length);
-            String stringHash2 = Utils.computeHash(bytes, 0, bytes.length);
+            String stringHash = computeHash(bytes, 0, bytes.length);
+            String stringHash2 = computeHash(bytes, 0, bytes.length);
             assertEquals(stringHash, stringHash2);
             assertTrue(keys.add(k));
         }
@@ -225,30 +252,6 @@ public class TestUtils {
     }
 
     @Test
-    public void toHexString() {
-        byte[] bytes = new byte[4];
-        bytes[0] = 0x12;
-        bytes[1] = 0x34;
-        bytes[2] = (byte) 0xAB;
-        bytes[3] = (byte) 0xCD;
-
-        String out = Utils.toHexString(bytes);
-        assertEquals("1234abcd", out);
-    }
-
-    @Test
-    public void toHexStringZeroes() {
-        byte[] bytes = new byte[4];
-        bytes[0] = 0x00;
-        bytes[1] = 0x00;
-        bytes[2] = 0x00;
-        bytes[3] = 0x00;
-
-        String out = Utils.toHexString(bytes);
-        assertEquals("00000000", out);
-    }
-
-    @Test
     public void toBytes() {
         final int expectedByteCount = 115;
         int count = 100000;
@@ -272,6 +275,7 @@ public class TestUtils {
                 String.format(
                         "Binary serializations per second: %f, iterations: %d, byte count: %d",
                         thpt, count, byteCount));
+        this.testResults.getReport().lastValue(TestResults.KEY_THROUGHPUT, thpt);
     }
 
     @Test
@@ -342,6 +346,52 @@ public class TestUtils {
         return k;
     }
 
+    /**
+     * This test detects accidental changes to how the signature is calculated. Change it
+     * if signature calculation has changed, otherwise it is a regression.
+     */
+    @Test
+    public void testSignature() {
+        CommandLineArgumentParser.parseFromProperties(this);
+        ServiceDocumentDescription desc = Builder.create()
+                .buildDescription(QueryValidationServiceState.class);
+
+        QueryValidationServiceState document = new QueryValidationServiceState();
+        document.nestedComplexValue = new NestedType();
+        document.nestedComplexValue.id = "document.nestedComplexValue.id";
+        document.nestedComplexValue.longValue = Long.MIN_VALUE;
+        document.documentKind = Utils.buildKind(document.getClass());
+        document.documentSelfLink = "documentSelfLink";
+        document.documentVersion = 0;
+        document.documentExpirationTimeMicros = 1111111111;
+        document.documentSourceLink = "documentSourceLink";
+        document.documentOwner = "owner";
+        document.documentUpdateTimeMicros = 222222222;
+        document.documentAuthPrincipalLink = "documentAuthPrincipalLink";
+        document.documentUpdateAction = "PUT";
+
+        document.referenceValue = URI.create("http://www.example.com");
+        document.mapOfStrings = new LinkedHashMap<>();
+        document.mapOfStrings.put("key1", "value1");
+        document.binaryContent = document.documentKind.getBytes(Utils.CHARSET_OBJECT);
+        document.booleanValue = false;
+        document.doublePrimitive = 3;
+        document.doubleValue = Double.valueOf(3);
+        document.id = document.documentSelfLink;
+        document.serviceLink = document.documentSelfLink;
+        document.dateValue = new Date(1422344512424L);
+        document.listOfStrings = Arrays.asList("1", "2", "3");
+
+        String wellKnownSignature = "6f06213cfdb5a51a";
+
+        Logger.getAnonymousLogger().info(
+                String.format(
+                        "Expected signature (%s) of document:\n%s",
+                        wellKnownSignature, Utils.toJsonHtml(document)));
+        String sig = Utils.computeSignature(document, desc);
+        assertEquals(wellKnownSignature, sig);
+    }
+
     @Test
     public void registerCustomKryoSerializer() {
         try {
@@ -386,7 +436,7 @@ public class TestUtils {
                             outDocumentImplicitDefault.position());
             ExampleServiceState stDeserialized = (ExampleServiceState) KryoSerializers
                     .deserializeDocument(
-                    outDocumentDefault.getBuffer(), 0, outDocumentDefault.position());
+                            outDocumentDefault.getBuffer(), 0, outDocumentDefault.position());
             assertEquals(st.id, stDeserializedFromObject.id);
             assertEquals(st.id, stDeserializedImplicit.id);
             assertEquals(st.id, stDeserialized.id);
@@ -516,15 +566,15 @@ public class TestUtils {
         // now change derived fields and expect the signature to change
         QueryValidationServiceState changed = Utils.clone(original);
         changed.documentExpirationTimeMicros = Utils.getNowMicrosUtc();
-        assertTrue(false == ServiceDocument.equals(desc, original, changed));
+        assertFalse(ServiceDocument.equals(desc, original, changed));
 
         changed = Utils.clone(original);
         changed.textValue = UUID.randomUUID().toString();
-        assertTrue(false == ServiceDocument.equals(desc, original, changed));
+        assertFalse(ServiceDocument.equals(desc, original, changed));
 
         changed = Utils.clone(original);
         changed.mapOfStrings.put(UUID.randomUUID().toString(), UUID.randomUUID().toString());
-        assertTrue(false == ServiceDocument.equals(desc, original, changed));
+        assertFalse(ServiceDocument.equals(desc, original, changed));
 
         // finally do a simple throughput test
         logThroughput(this.iterationCount, useBinary, desc, original);
@@ -570,6 +620,50 @@ public class TestUtils {
                         "Binary: %s, PODO: %s, Ser+des+signature per second: %f, byte count: %d",
                         useBinary, original.getClass().getSimpleName(),
                         throughput, length));
+    }
+
+    @Test
+    public void signatureThroughput() {
+        CommandLineArgumentParser.parseFromProperties(this);
+        ServiceDocumentDescription desc = Builder.create()
+                .buildDescription(QueryValidationServiceState.class);
+
+        QueryValidationServiceState document = VerificationHost.buildQueryValidationState();
+        document.documentKind = Utils.buildKind(document.getClass());
+        document.documentSelfLink = UUID.randomUUID().toString();
+        document.documentVersion = 0;
+        document.documentExpirationTimeMicros = Utils.getNowMicrosUtc();
+        document.documentSourceLink = UUID.randomUUID().toString();
+        document.documentOwner = UUID.randomUUID().toString();
+        document.documentUpdateTimeMicros = Utils.getNowMicrosUtc();
+        document.documentAuthPrincipalLink = UUID.randomUUID().toString();
+        document.documentUpdateAction = UUID.randomUUID().toString();
+
+        document.mapOfStrings = new LinkedHashMap<>();
+        document.mapOfStrings.put("key1", "value1");
+        document.mapOfStrings.put("key2", "value2");
+        document.mapOfStrings.put("key3", "value3");
+        document.binaryContent = document.documentKind.getBytes();
+        document.booleanValue = false;
+        document.doublePrimitive = 3;
+        document.doubleValue = Double.valueOf(3);
+        document.id = document.documentSelfLink;
+        document.serviceLink = document.documentSelfLink;
+        document.dateValue = new Date();
+        document.listOfStrings = Arrays.asList("1", "2", "3", "4", "5");
+
+        long start = System.nanoTime();
+        for (int i = 0; i < this.iterationCount; i++) {
+            Utils.computeSignature(document, desc);
+        }
+
+        long duration = System.nanoTime() - start;
+
+        double thpt = this.iterationCount * 1000.0 * 1000.0 * 1000.0 / duration;
+        Logger.getAnonymousLogger().info(
+                String.format(
+                        "Signature calculation throughput: %.2f/sec", thpt));
+        this.testResults.getReport().lastValue(TestResults.KEY_THROUGHPUT, thpt);
     }
 
     public QueryValidationServiceState serializedAndCompareDocuments(
@@ -702,6 +796,19 @@ public class TestUtils {
     }
 
     @Test
+    public void toJsonHtml() {
+        ServiceDocument doc = new ServiceDocument();
+        String json = Utils.toJsonHtml(doc);
+        assertTrue(json.contains("  "));
+    }
+
+    @Test
+    public void toJsonHtmlNull() {
+        String json = Utils.toJsonHtml(null);
+        assertEquals(json, "null");
+    }
+
+    @Test
     public void validateServiceOption() {
         // positive tests
         EnumSet<ServiceOption> options = EnumSet.of(ServiceOption.REPLICATION,
@@ -740,12 +847,6 @@ public class TestUtils {
 
         options = EnumSet.of(ServiceOption.OWNER_SELECTION);
         checkOptions(options, true);
-
-        options = EnumSet.of(ServiceOption.PERIODIC_MAINTENANCE, ServiceOption.ON_DEMAND_LOAD);
-        checkOptions(options, true);
-
-        options = EnumSet.of(ServiceOption.ON_DEMAND_LOAD, ServiceOption.PERSISTENCE);
-        checkOptions(options, false);
     }
 
     @Test
@@ -766,6 +867,23 @@ public class TestUtils {
 
         Instant actual = Utils.fromJson("\"2013-05-30T23:38:27.085Z\"", Instant.class);
         assertEquals(expected, actual);
+    }
+
+    @Test
+    public void testGsonParserErrorSuppressed() throws JsonSyntaxException {
+        this.expectedEx.expect(JsonSyntaxException.class);
+        this.expectedEx.expectMessage("JSON body could not be parsed");
+        JsonMapper jsonMapper = new JsonMapper();
+        jsonMapper.setJsonSuppressGsonSerializationErrors(true);
+        jsonMapper.fromJson("TEST", ExampleServiceState.class);
+    }
+
+    @Test
+    public void testGsonParserError() throws JsonSyntaxException {
+        this.expectedEx.expect(JsonSyntaxException.class);
+        this.expectedEx.expectMessage("Expected BEGIN_OBJECT but was STRING");
+        JsonMapper jsonMapper = new JsonMapper();
+        jsonMapper.fromJson("TEST", ExampleServiceState.class);
     }
 
     @Test
@@ -791,40 +909,40 @@ public class TestUtils {
         SystemHostInfo systemHostInfo = new SystemHostInfo();
         systemHostInfo.properties.put(SystemHostInfo.PROPERTY_NAME_OS_NAME, expected);
 
-        assertEquals(expected, Utils.getOsName(systemHostInfo));
+        assertEquals(expected, systemHostInfo.getOsName());
     }
 
     @Test
     public void testDetermineOsFamilyForWindows() throws Exception {
         final String osName = "Windows NT";
 
-        assertEquals(OsFamily.WINDOWS, Utils.determineOsFamily(osName));
+        assertEquals(OsFamily.WINDOWS, SystemHostInfo.determineOsFamily(osName));
     }
 
     @Test
     public void testDetermineOsFamilyForLinux() throws Exception {
         final String osName = "Linux";
 
-        assertEquals(OsFamily.LINUX, Utils.determineOsFamily(osName));
+        assertEquals(OsFamily.LINUX, SystemHostInfo.determineOsFamily(osName));
     }
 
     @Test
     public void testDetermineOsFamilyForMac() throws Exception {
         final String osName = "Mac OS X";
 
-        assertEquals(OsFamily.MACOS, Utils.determineOsFamily(osName));
+        assertEquals(OsFamily.MACOS, SystemHostInfo.determineOsFamily(osName));
     }
 
     @Test
     public void testDetermineOsFamilyForOther() throws Exception {
         final String osName = "TI 99/4A";
 
-        assertEquals(OsFamily.OTHER, Utils.determineOsFamily(osName));
+        assertEquals(OsFamily.OTHER, SystemHostInfo.determineOsFamily(osName));
     }
 
     @Test
     public void testDetermineOsFamilyForNull() throws Exception {
-        assertEquals(OsFamily.OTHER, Utils.determineOsFamily(null));
+        assertEquals(OsFamily.OTHER, SystemHostInfo.determineOsFamily(null));
     }
 
     @Test
@@ -872,6 +990,46 @@ public class TestUtils {
         }
 
         assertNull(Utils.getServiceUiResourcePath(new MyService()));
+    }
+
+    @Test
+    public void testGetFromPrimitives() {
+        Map<String, Object> map = new HashMap<>();
+        map.put("bt", true);
+        map.put("bf", false);
+        map.put("int", 123);
+        map.put("double", 3.14);
+        map.put("string", "hello");
+        ExampleServiceState doc = new ExampleServiceState();
+        doc.documentSelfLink = "selfLink";
+        doc.tags = new HashSet<>(Arrays.asList("t1", "t2"));
+        map.put("doc", doc);
+
+        validateExtract(Utils.toJson(map));
+        validateExtract(Utils.fromJson(Utils.toJson(map), JsonElement.class));
+    }
+
+    private void validateExtract(Object jsonRepr) {
+        assertEquals(true, Utils.getJsonMapValue(jsonRepr, "bt", Boolean.class));
+        assertEquals(false, Utils.getJsonMapValue(jsonRepr, "bf", Boolean.class));
+        assertEquals(Integer.valueOf(123), Utils.getJsonMapValue(jsonRepr, "int", Integer.class));
+        assertEquals(Double.valueOf(3.14), Utils.getJsonMapValue(jsonRepr, "double", Double.class));
+        assertEquals("hello", Utils.getJsonMapValue(jsonRepr, "string", String.class));
+        assertEquals("selfLink", Utils.getJsonMapValue(jsonRepr, "doc", ExampleServiceState.class).documentSelfLink);
+        assertTrue(Utils.getJsonMapValue(jsonRepr, "doc", ExampleServiceState.class).tags.contains("t1"));
+
+        assertNull(Utils.getJsonMapValue(jsonRepr, "badKey", ExampleServiceState.class));
+
+        // coercion to string always possible
+        assertEquals("true", Utils.getJsonMapValue(jsonRepr, "bt", String.class));
+
+        try {
+            // must fail if object is expected
+            Utils.getJsonMapValue(jsonRepr, "bt", ServiceDocument.class);
+            fail("Impossible conversion");
+        } catch (JsonSyntaxException ignore) {
+
+        }
     }
 
     @Test
@@ -984,6 +1142,28 @@ public class TestUtils {
         }
     }
 
+    @Test
+    public void testEncodeGzipResponseBody() throws Throwable {
+        String body = "This is the original body content, but gzipped";
+        byte[] gzippedBody = compress(body);
+
+        Operation op = Operation
+                .createGet(null)
+                .setContentLength(body.length())
+                .setBody(body)
+                .addRequestHeader(Operation.ACCEPT_ENCODING_HEADER,
+                        Operation.CONTENT_ENCODING_GZIP)
+                .addResponseHeader(Operation.CONTENT_TYPE_HEADER, Operation.MEDIA_TYPE_TEXT_PLAIN);
+
+        byte[] encodedBody = Utils.encodeBody(op, body, Operation.MEDIA_TYPE_TEXT_PLAIN, false);
+
+        assertTrue(Arrays.equals(gzippedBody, encodedBody));
+
+        // Content encoding header is present
+        assertEquals(op.getResponseHeader(Operation.CONTENT_ENCODING_HEADER),
+                Operation.CONTENT_ENCODING_GZIP);
+    }
+
     private static byte[] compress(String str) throws Exception {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         GZIPOutputStream gzip = new GZIPOutputStream(out);
@@ -1021,5 +1201,51 @@ public class TestUtils {
         assertNotEquals(sign1, sign2);
         assertNotEquals(sign2, sign3);
         assertNotEquals(sign1, sign3);
+    }
+
+    @Test
+    public void testBuildServiceConfig() {
+        Service exampleService = new ExampleService();
+        exampleService.setHost(VerificationHost.create());
+
+        ServiceConfiguration config = new ServiceConfiguration();
+        Utils.buildServiceConfig(config, exampleService);
+
+        assertEquals(exampleService.getOptions(), config.options);
+        assertEquals(exampleService.getMaintenanceIntervalMicros(), config.maintenanceIntervalMicros);
+        assertEquals(ExampleServiceState.VERSION_RETENTION_LIMIT, config.versionRetentionLimit);
+        assertEquals(ExampleServiceState.VERSION_RETENTION_FLOOR, config.versionRetentionFloor);
+        assertEquals(exampleService.getPeerNodeSelectorPath(), config.peerNodeSelectorPath);
+        assertEquals(exampleService.getDocumentIndexPath(), config.documentIndexPath);
+    }
+
+    @Test
+    public void hashJsonMaps() {
+        Map<String, String> asc = new TreeMap<>();
+        for (int i = 0; i < 50; i++) {
+            asc.put(UUID.randomUUID().toString(), UUID.randomUUID().toString());
+        }
+
+        Map<String, String> desc = new TreeMap<>(Comparator.reverseOrder());
+        desc.putAll(asc);
+
+        Map<String, String> juh = new HashMap<>();
+        juh.putAll(asc);
+
+        Map<String, String> chm = new ConcurrentHashMap<>();
+        chm.putAll(juh);
+
+        assertNotEquals(asc.toString(), desc.toString());
+        assertNotEquals(asc.toString(), juh.toString());
+        assertNotEquals(asc.toString(), chm.toString());
+
+        long ascH = GsonSerializers.hashJson(asc, 0);
+        long descH = GsonSerializers.hashJson(desc, 0);
+        long juhH = GsonSerializers.hashJson(juh, 0);
+        long chmH = GsonSerializers.hashJson(chm, 0);
+
+        assertEquals(ascH, descH);
+        assertEquals(ascH, juhH);
+        assertEquals(ascH, chmH);
     }
 }

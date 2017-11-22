@@ -68,6 +68,12 @@ public class QueryTask extends ServiceDocument {
              * The subject link of the user that created the query task.
              */
             public transient String subjectLink;
+
+            /**
+             * Kind scope for the query. If the query does not contain one or more kind clauses, the
+             * field will be null;
+             */
+            public Set<String> kindScope;
         }
 
         public enum QueryOption {
@@ -77,6 +83,13 @@ public class QueryTask extends ServiceDocument {
              * PATCH to be sent on the service.
              */
             CONTINUOUS,
+
+            /**
+             * Query results are updated in real time, by using {@code QueryFilter} instance on the index.
+             * Any update to the index will cause a self PATCH to be sent on the service if the query filter
+             * does not satisfy the new state but was a match for the previous state.
+             */
+            CONTINIOUS_STOP_MATCH,
 
             /**
              * Query results will return the number of documents that satisfy the query and populate the
@@ -102,6 +115,21 @@ public class QueryTask extends ServiceDocument {
              * collection
              */
             EXPAND_CONTENT,
+
+            /**
+             * Query results include the values for selected fields included in
+             * {@link QuerySpecification#selectTerms}. The fields are then available through
+             * the state documents in the {@link ServiceDocumentQueryResult#documents}
+             * collection
+             */
+            EXPAND_SELECTED_FIELDS,
+
+            /**
+             * Query results will be in binary form. This option should only be set on local query tasks,
+             * with the client co-located (same service host) as the query task. This should not
+             * be used along with EXPAND_CONTENT / EXPAND_BUILTIN_CONTENT_ONLY / OWNER_SELECTION.
+             */
+            EXPAND_BINARY_CONTENT,
 
             /**
              * Infrastructure use only. Modifier option on EXPAND_CONTENT:
@@ -147,6 +175,14 @@ public class QueryTask extends ServiceDocument {
             BROADCAST,
 
             /**
+             * Ensures read after write consistency for query results.
+             * This option requires that the membership quorum be set to a majority of the nodes in the
+             * node group and all services involved in the query needs to have ServiceOption.OWNER_SELECTION
+             * enabled
+             */
+            READ_AFTER_WRITE_CONSISTENCY,
+
+            /**
              * Filters query results based on the document owner ID.
              * If the owner ID of the document does not match the ID of the host executing the query,
              * the document is removed from the result
@@ -164,7 +200,33 @@ public class QueryTask extends ServiceDocument {
             /**
              * Groups results using the {@link QuerySpecification::groupByTerms}
              */
-            GROUP_BY
+            GROUP_BY,
+
+            /**
+             * Query will return latest versions of documents before {@link QuerySpecification#timeSnapshotBoundaryMicros}
+             */
+            TIME_SNAPSHOT,
+
+            /**
+             * Query pages will be deleted immediately after first access instead of at query task
+             * expiration time, and any index service resources backing the query will be deleted
+             * after the last page is accessed.
+             */
+            SINGLE_USE,
+
+            /**
+             * Query target documents have {@code DocumentIndexingOption#INDEX_METADATA} enabled,
+             * and the query contents can be rewritten to take advantage of the additional indexed
+             * metadata.
+             */
+            INDEXED_METADATA,
+
+            /**
+             * Query result will NOT create previous pages.
+             * When this option is used with BROADCAST option, it will also NOT create previous page
+             * for broadcast result({@link BroadcastQueryPageService}.
+             */
+            FORWARD_ONLY,
         }
 
         public enum SortOrder {
@@ -181,6 +243,13 @@ public class QueryTask extends ServiceDocument {
          * {@code QueryOption#SELECT_LINKS}
          */
         public List<QueryTerm> linkTerms;
+
+        /**
+         * Property names of fields to select. Used in combination with
+         * {@code QueryOption#SELECT_FIELDS}
+         */
+        @Since(ReleaseConstants.RELEASE_VERSION_1_4_2)
+        public List<QueryTerm> selectTerms;
 
         /**
          * Property name to use for primary sort. Used in combination with {@code QueryOption#SORT}
@@ -235,6 +304,14 @@ public class QueryTask extends ServiceDocument {
         public Integer groupResultLimit;
 
         /**
+         * Skip number of documents.
+         * General usage would be combined with TOP_RESULTS option with sorting term specified, but not limited to.
+         * When used with resultLimit, documents on the first result page start from the one after skipping N offset documents.
+         */
+        @Since(ReleaseConstants.RELEASE_VERSION_1_5_2)
+        public Integer offset;
+
+        /**
          * The query is retried until the result count matches the
          * specified value or the query expires.
          */
@@ -249,6 +326,12 @@ public class QueryTask extends ServiceDocument {
          * Infrastructure use only
          */
         public transient QueryRuntimeContext context = new QueryRuntimeContext();
+
+        /**
+         * Used with {@link QueryOption#TIME_SNAPSHOT}
+         */
+        @Since(ReleaseConstants.RELEASE_VERSION_1_3_6)
+        public Long timeSnapshotBoundaryMicros;
 
         public static String buildCompositeFieldName(String... fieldNames) {
             StringBuilder sb = new StringBuilder();
@@ -318,12 +401,14 @@ public class QueryTask extends ServiceDocument {
         public void copyTo(QuerySpecification clonedSpec) {
             clonedSpec.context.documentLinkWhiteList = this.context.documentLinkWhiteList;
             clonedSpec.context.filter = this.context.filter;
+            clonedSpec.context.kindScope = this.context.kindScope;
             clonedSpec.context.nativePage = this.context.nativePage;
             clonedSpec.context.nativeQuery = this.context.nativeQuery;
             clonedSpec.context.nativeSearcher = this.context.nativeSearcher;
             clonedSpec.context.nativeSort = this.context.nativeSort;
             clonedSpec.expectedResultCount = this.expectedResultCount;
             clonedSpec.linkTerms = this.linkTerms;
+            clonedSpec.selectTerms = this.selectTerms;
             clonedSpec.groupByTerm = this.groupByTerm;
             clonedSpec.options = EnumSet.copyOf(this.options);
             clonedSpec.query = this.query;
@@ -332,6 +417,8 @@ public class QueryTask extends ServiceDocument {
             clonedSpec.sortTerm = this.sortTerm;
             clonedSpec.groupSortTerm = this.groupSortTerm;
             clonedSpec.groupSortOrder = this.groupSortOrder;
+            clonedSpec.timeSnapshotBoundaryMicros = this.timeSnapshotBoundaryMicros;
+            clonedSpec.offset = this.offset;
         }
     }
 
@@ -1014,6 +1101,11 @@ public class QueryTask extends ServiceDocument {
             return this;
         }
 
+        public Builder setOffset(int offset) {
+            this.querySpec.offset = offset;
+            return this;
+        }
+
         /**
          * Set the expected number of results.
          * @param expectedResultCount the expected result count.
@@ -1114,6 +1206,20 @@ public class QueryTask extends ServiceDocument {
         }
 
         /**
+         * Add the given field name to the {@code QuerySpecification#fieldTerms}
+         */
+        public Builder addSelectTerm(String selectFieldName) {
+            QueryTerm fieldTerm = new QueryTerm();
+            fieldTerm.propertyName = selectFieldName;
+            fieldTerm.propertyType = TypeName.STRING;
+            if (this.querySpec.selectTerms == null) {
+                this.querySpec.selectTerms = new ArrayList<>();
+            }
+            this.querySpec.selectTerms.add(fieldTerm);
+            return this;
+        }
+
+        /**
          * Sets the {@code QuerySpecification#groupByTerm}
          */
         public Builder setGroupByTerm(String fieldName) {
@@ -1149,6 +1255,14 @@ public class QueryTask extends ServiceDocument {
          */
         public Builder setIndexLink(String indexLink) {
             this.queryTask.indexLink = indexLink;
+            return this;
+        }
+
+        /**
+         *
+         */
+        public Builder setQueryTimeStamp(Long documentsUpdatedBeforeInMicros) {
+            this.querySpec.timeSnapshotBoundaryMicros = documentsUpdatedBeforeInMicros;
             return this;
         }
 

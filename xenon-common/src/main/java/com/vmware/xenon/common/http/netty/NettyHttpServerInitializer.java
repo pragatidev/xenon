@@ -13,6 +13,8 @@
 
 package com.vmware.xenon.common.http.netty;
 
+import java.util.logging.Level;
+
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
@@ -42,6 +44,7 @@ import io.netty.util.AsciiString;
 
 import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.ServiceHost.ServiceHostState.SslClientAuthMode;
+import com.vmware.xenon.common.Utils;
 import com.vmware.xenon.services.common.ServiceUriPaths;
 
 public class NettyHttpServerInitializer extends ChannelInitializer<SocketChannel> {
@@ -51,8 +54,7 @@ public class NettyHttpServerInitializer extends ChannelInitializer<SocketChannel
         private NettyHttpServerInitializer initializer;
         private SslHandler sslHandler;
 
-        public Http2NegotiationHandler(NettyHttpServerInitializer initializer,
-                SslHandler sslHandler) {
+        Http2NegotiationHandler(NettyHttpServerInitializer initializer, SslHandler sslHandler) {
             super(ApplicationProtocolNames.HTTP_1_1);
             this.initializer = initializer;
             this.sslHandler = sslHandler;
@@ -61,15 +63,39 @@ public class NettyHttpServerInitializer extends ChannelInitializer<SocketChannel
         @Override
         protected void configurePipeline(ChannelHandlerContext ctx, String protocol)
                 throws Exception {
-            if (ApplicationProtocolNames.HTTP_2.equals(protocol)) {
-                this.initializer.initializeHttp2Pipeline(ctx.pipeline(), this.sslHandler);
-                return;
+            try {
+                if (ApplicationProtocolNames.HTTP_2.equals(protocol)) {
+                    this.initializer.initializeHttp2Pipeline(ctx.pipeline(), this.sslHandler);
+                    return;
+                }
+                if (ApplicationProtocolNames.HTTP_1_1.equals(protocol)) {
+                    this.initializer.initializeHttpPipeline(ctx.pipeline(), this.sslHandler);
+                    return;
+                }
+                throw new IllegalStateException("Unexpected protocol: " + protocol);
+            } catch (Exception ex) {
+                log(Level.WARNING, "Pipeline initialization failed: %s", Utils.toString(ex));
+                ctx.close();
             }
-            if (ApplicationProtocolNames.HTTP_1_1.equals(protocol)) {
-                this.initializer.initializeHttpPipeline(ctx.pipeline(), this.sslHandler);
-                return;
-            }
-            throw new IllegalStateException("Unexpected protocol: " + protocol);
+        }
+
+        @Override
+        protected void handshakeFailure(ChannelHandlerContext ctx, Throwable cause)
+                throws Exception {
+            log(Level.WARNING, "TLS handshake failed: %s", Utils.toString(cause));
+            ctx.close();
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause)
+                throws Exception {
+            log(Level.WARNING, "ALPN protocol negotiation failed: %s", Utils.toString(cause));
+            ctx.close();
+        }
+
+        private void log(Level level, String fmt, Object... args) {
+            Utils.log(Http2NegotiationHandler.class, Http2NegotiationHandler.class.getSimpleName(),
+                    level, fmt, args);
         }
     }
 
@@ -86,14 +112,16 @@ public class NettyHttpServerInitializer extends ChannelInitializer<SocketChannel
     private ServiceHost host;
     private NettyHttpListener listener;
     private int responsePayloadSizeLimit;
+    private boolean secureAuthCookie;
     private static final boolean debugLogging = false;
 
     public NettyHttpServerInitializer(NettyHttpListener listener, ServiceHost host,
-            SslContext sslContext, int responsePayloadSizeLimit) {
+            SslContext sslContext, int responsePayloadSizeLimit, boolean secureAuthCookie) {
         this.sslContext = sslContext;
         this.host = host;
         this.listener = listener;
         this.responsePayloadSizeLimit = responsePayloadSizeLimit;
+        this.secureAuthCookie = secureAuthCookie;
         NettyLoggingUtil.setupNettyLogging();
     }
 
@@ -185,7 +213,7 @@ public class NettyHttpServerInitializer extends ChannelInitializer<SocketChannel
                 ServiceUriPaths.WEB_SOCKET_SERVICE_PREFIX));
         p.addLast(HTTP_REQUEST_HANDLER,
                 new NettyHttpClientRequestHandler(this.host, this.listener, sslHandler,
-                        this.responsePayloadSizeLimit));
+                        this.responsePayloadSizeLimit, this.secureAuthCookie));
     }
 
     /**

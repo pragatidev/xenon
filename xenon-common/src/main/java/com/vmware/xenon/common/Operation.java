@@ -13,23 +13,28 @@
 
 package com.vmware.xenon.common;
 
+import static java.lang.String.format;
+
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.security.Principal;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.Consumer;
-
 import javax.security.cert.X509Certificate;
 
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.ServiceDocumentDescription.Builder;
+import com.vmware.xenon.common.ServiceErrorResponse.ErrorDetail;
+import com.vmware.xenon.common.ServiceHost.ServiceNotFoundException;
 import com.vmware.xenon.services.common.QueryFilter;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.SystemUserService;
@@ -371,6 +376,75 @@ public class Operation implements Cloneable {
         }
     }
 
+    public static void fail(Operation request, int statusCode, int errorCode, Throwable e) {
+        request.setStatusCode(statusCode);
+        ServiceErrorResponse r = Utils.toServiceErrorResponse(e);
+        r.statusCode = statusCode;
+        r.errorCode = errorCode;
+
+        if (e instanceof ServiceNotFoundException) {
+            r.stackTrace = null;
+        }
+        request.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON).fail(e, r);
+    }
+
+    static void failOwnerMismatch(Operation op, String id, ServiceDocument body) {
+        String owner = body != null ? body.documentOwner : "";
+        op.setStatusCode(Operation.STATUS_CODE_CONFLICT);
+        Throwable e = new IllegalStateException(format(
+                "Owner in body: %s, computed locally: %s",
+                owner, id));
+        ServiceErrorResponse rsp = ServiceErrorResponse.create(e, op.getStatusCode(),
+                EnumSet.of(ErrorDetail.SHOULD_RETRY));
+        rsp.setInternalErrorCode(ServiceErrorResponse.ERROR_CODE_OWNER_MISMATCH);
+        op.fail(e, rsp);
+    }
+
+    public static void failActionNotSupported(Operation request) {
+        request.setStatusCode(Operation.STATUS_CODE_BAD_METHOD).fail(
+                new IllegalStateException("Action not supported: " + request.getAction()));
+    }
+
+    public static void failLimitExceeded(Operation request, int errorCode, String queueDescription) {
+        // Add a header indicating retry should be attempted after some interval.
+        // Currently set to just one second, subject to change in the future
+        request.addResponseHeader(Operation.RETRY_AFTER_HEADER, "1");
+        fail(request, Operation.STATUS_CODE_UNAVAILABLE,
+                errorCode,
+                new CancellationException(format("queue limit exceeded (%s)", queueDescription)));
+    }
+
+    public static void failForwardedRequest(Operation op, Operation fo, Throwable fe) {
+        op.setStatusCode(fo.getStatusCode());
+        op.setBodyNoCloning(fo.getBodyRaw()).fail(fe);
+    }
+
+    public static void failServiceNotFound(Operation inboundOp) {
+        failServiceNotFound(inboundOp,
+                ServiceErrorResponse.ERROR_CODE_INTERNAL_MASK);
+    }
+
+    public static void failServiceNotFound(Operation inboundOp, int errorCode,
+            String errorMsg) {
+        fail(inboundOp, Operation.STATUS_CODE_NOT_FOUND,
+                errorCode,
+                new ServiceNotFoundException(inboundOp.getUri().toString(), errorMsg));
+    }
+
+    public static void failServiceNotFound(Operation inboundOp, int errorCode) {
+        fail(inboundOp, Operation.STATUS_CODE_NOT_FOUND,
+                errorCode,
+                new ServiceNotFoundException(inboundOp.getUri().toString()));
+    }
+
+    static void failServiceMarkedDeleted(String documentSelfLink,
+            Operation serviceStartPost) {
+        fail(serviceStartPost, Operation.STATUS_CODE_CONFLICT,
+                ServiceErrorResponse.ERROR_CODE_STATE_MARKED_DELETED,
+                new IllegalStateException("Service marked deleted: "
+                        + documentSelfLink));
+    }
+
     // HTTP Header definitions
     public static final String REFERER_HEADER = "referer";
     public static final String CONNECTION_HEADER = "connection";
@@ -387,8 +461,12 @@ public class Operation implements Cloneable {
     public static final String USER_AGENT_HEADER = "user-agent";
     public static final String HOST_HEADER = "host";
     public static final String ACCEPT_HEADER = "accept";
-    public static final String AUTHORIZATION_HEADER = "Authorization";
+    public static final String ACCEPT_ENCODING_HEADER = "accept-encoding";
+    public static final String AUTHORIZATION_HEADER = "authorization";
     public static final String ACCEPT_LANGUAGE_HEADER = "accept-language";
+    public static final String TRANSFER_ENCODING_HEADER = "transfer-encoding";
+    public static final String CHUNKED_ENCODING = "chunked";
+    public static final String LAST_EVENT_ID_HEADER = "last-event-id";
 
     // HTTP2 Header definitions
     public static final String STREAM_ID_HEADER = "x-http2-stream-id";
@@ -447,8 +525,7 @@ public class Operation implements Cloneable {
     public static final String PRAGMA_DIRECTIVE_SYNCH_PEER = "xn-synch-peer";
 
     /**
-     * Advanced use. Instructs the runtime to queue a request, for a service to become available
-     * independent of the service options.
+     * Advanced use. Instructs the runtime to queue a request, for a service to become available.
      */
     public static final String PRAGMA_DIRECTIVE_QUEUE_FOR_SERVICE_AVAILABILITY = "xn-queue";
 
@@ -527,6 +604,18 @@ public class Operation implements Cloneable {
      */
     public static final String PRAGMA_DIRECTIVE_AUTHN_INVALIDATE = "xn-authn-invalidate";
 
+    /**
+     * Set when a MigrationTaskService invokes operations against the destination cluster.
+     */
+    public static final String PRAGMA_DIRECTIVE_FROM_MIGRATION_TASK = "xn-from-migration";
+
+    /**
+     * Infrastructure use only. Indicate document state was not modified by the update request.
+     * When this pragma is set in handler methods, rest of the pipeline will not update the
+     * indexed/cached state.
+     */
+    public static final String PRAGMA_DIRECTIVE_STATE_NOT_MODIFIED = "xn-state-not-modified";
+
     public static final String TX_ENSURE_COMMIT = "ensure-commit";
     public static final String TX_COMMIT = "commit";
     public static final String TX_ABORT = "abort";
@@ -543,6 +632,7 @@ public class Operation implements Cloneable {
     public static final String MEDIA_TYPE_APPLICATION_JAVASCRIPT = "application/javascript";
     public static final String MEDIA_TYPE_IMAGE_SVG_XML = "image/svg+xml";
     public static final String MEDIA_TYPE_APPLICATION_FONT_WOFF2 = "application/font-woff2";
+    public static final String MEDIA_TYPE_TEXT_EVENT_STREAM = "text/event-stream";
 
     public static final String CONTENT_ENCODING_GZIP = "gzip";
 
@@ -598,6 +688,10 @@ public class Operation implements Cloneable {
     private short retriesRemaining;
 
     private EnumSet<OperationOption> options = EnumSet.of(OperationOption.KEEP_ALIVE);
+
+    private volatile Consumer<ServerSentEvent> serverSentEventHandler;
+
+    private volatile Consumer<Operation> headersReceivedHandler;
 
     public static Operation create(SerializedOperation ctx, ServiceHost host) {
         Operation op = new Operation();
@@ -717,6 +811,27 @@ public class Operation implements Cloneable {
         return Utils.toJsonHtml(sop);
     }
 
+    /**
+     * Returns a string summary of the operation appropriate for logging
+     */
+    public String toLogString() {
+        StringBuilder sb = Utils.getBuilder();
+        sb.append(this.action.toString()).append(" ")
+                .append(this.getUri()).append(" ")
+                .append(this.id).append(" ")
+                .append(this.getRefererAsString()).append(" ");
+        if (this.contextId != null) {
+            sb.append("[ctxId] ").append(this.contextId);
+        }
+        if (this.transactionId != null) {
+            sb.append("[txId] ").append(this.transactionId);
+        }
+        if (this.authorizationCtx != null && this.authorizationCtx.claims != null) {
+            sb.append("[subject] ").append(this.authorizationCtx.claims.getSubject());
+        }
+        return sb.toString();
+    }
+
     @Override
     public Operation clone() {
         Operation clone;
@@ -786,13 +901,9 @@ public class Operation implements Cloneable {
     /**
      * Sets (overwrites) the authorization context of this operation.
      *
-     * The visibility of this method is intentionally package-local. It is intended to
-     * only be called by functions in this package, so that we can apply white listing
-     * to limit the set of services that is able to set it.
-     *
-     * @param ctx the authorization context to set.
+     * Infrastructure use only.
      */
-    Operation setAuthorizationContext(AuthorizationContext ctx) {
+    public Operation setAuthorizationContext(AuthorizationContext ctx) {
         this.authorizationCtx = ctx;
         return this;
     }
@@ -846,6 +957,18 @@ public class Operation implements Cloneable {
     public Operation setBodyNoCloning(Object body) {
         this.body = body;
         return this;
+    }
+
+    public ServiceErrorResponse getErrorResponseBody() {
+        if (!hasBody()) {
+            return null;
+        }
+        ServiceErrorResponse rsp = getBody(ServiceErrorResponse.class);
+        if (rsp.message == null && rsp.statusCode == 0) {
+            // very likely not a error response body
+            return null;
+        }
+        return rsp;
     }
 
     /**
@@ -924,9 +1047,10 @@ public class Operation implements Cloneable {
         return this;
     }
 
-    public void setCookies(Map<String, String> cookies) {
+    public Operation setCookies(Map<String, String> cookies) {
         allocateRemoteContext();
         this.remoteCtx.cookies = cookies;
+        return this;
     }
 
     public Map<String, String> getCookies() {
@@ -985,6 +1109,54 @@ public class Operation implements Cloneable {
             successHandler.accept(op);
         };
         return this;
+    }
+
+    /**
+     * Sets the handler to be invoked upon receiving {@link ServerSentEvent}.
+     * @param serverSentEventHandler called when {@link ServerSentEvent} is received
+     * @return operation
+     */
+    public Operation setServerSentEventHandler(Consumer<ServerSentEvent> serverSentEventHandler) {
+        this.serverSentEventHandler = serverSentEventHandler;
+        return this;
+    }
+
+    /**
+     * Inserts a handler in LIFO style.
+     * @see #nestHeadersReceivedHandler(Consumer)
+     * @see #nestCompletion(CompletionHandler)
+     * @param serverSentEventHandler
+     * @return
+     */
+    public Operation nestServerSentEventHandler(Consumer<ServerSentEvent> serverSentEventHandler) {
+        if (this.serverSentEventHandler != null) {
+            serverSentEventHandler = serverSentEventHandler.andThen(this.serverSentEventHandler);
+        }
+        return this.setServerSentEventHandler(serverSentEventHandler);
+    }
+
+    /**
+     * Sets the handler to be invoked upon receiving the headers.
+     * @param handler called after the headers are received.
+     * @return operation
+     */
+    public Operation setHeadersReceivedHandler(Consumer<Operation> handler) {
+        this.headersReceivedHandler = handler;
+        return this;
+    }
+
+    /**
+     * Inserts a handler in LIFO style.
+     * @see #nestServerSentEventHandler(Consumer)
+     * @see #nestCompletion(CompletionHandler)
+     * @param handler
+     * @return
+     */
+    public Operation nestHeadersReceivedHandler(Consumer<Operation> handler) {
+        if (this.headersReceivedHandler != null) {
+            handler = handler.andThen(this.headersReceivedHandler);
+        }
+        return this.setHeadersReceivedHandler(handler);
     }
 
     public CompletionHandler getCompletion() {
@@ -1049,7 +1221,7 @@ public class Operation implements Cloneable {
         if (this.referer instanceof String) {
             try {
                 this.referer = new URI((String) this.referer);
-            } catch (Throwable e) {
+            } catch (Exception e) {
                 throw new RuntimeException(e);
             }
         }
@@ -1111,14 +1283,70 @@ public class Operation implements Cloneable {
         fail(e, null);
     }
 
+    /**
+     * Sends a &quot;server sent event&quot;. See <a href=https://www.w3.org/TR/eventsource/>SSE specification</a>}
+     * @param event The event to send.
+     */
+    public void sendServerSentEvent(ServerSentEvent event) {
+        if (this.serverSentEventHandler == null) {
+            return;
+        }
+
+        // Keep track of current operation context
+        OperationContext originalContext = OperationContext.getOperationContext();
+        try {
+            OperationContext.setFrom(this);
+            this.serverSentEventHandler.accept(event);
+        } catch (Exception outer) {
+            Utils.logWarning("Uncaught failure inside serverSentEventHandler: %s", Utils.toString(outer));
+        } finally {
+            // Restore original context
+            OperationContext.setFrom(originalContext);
+        }
+    }
+
+    /**
+     * Sends the headers to the channel.
+     * This effectively enables streaming.
+     */
+    public void sendHeaders() {
+        if (this.headersReceivedHandler == null) {
+            return;
+        }
+
+        // Keep track of current operation context
+        OperationContext originalContext = OperationContext.getOperationContext();
+        try {
+            OperationContext.setFrom(this);
+            this.headersReceivedHandler.accept(this);
+        } catch (Exception outer) {
+            Utils.logWarning("Uncaught failure inside headersReceivedHandler: %s", Utils.toString(outer));
+        } finally {
+            // Restore original context
+            OperationContext.setFrom(originalContext);
+        }
+    }
+
+    /**
+     * Send the appropriate headers and prepare the connection for streaming.
+     */
+    public void startEventStream() {
+        setContentType(MEDIA_TYPE_TEXT_EVENT_STREAM);
+        addResponseHeader(Operation.TRANSFER_ENCODING_HEADER, Operation.CHUNKED_ENCODING);
+        sendHeaders();
+    }
+
     public void fail(int statusCode) {
         setStatusCode(statusCode);
         switch (statusCode) {
         case STATUS_CODE_FORBIDDEN:
             fail(new IllegalAccessError("forbidden"));
             break;
+        case STATUS_CODE_TIMEOUT:
+            fail(new TimeoutException());
+            break;
         default:
-            fail(new Exception("request failed, no additional details provided"));
+            fail(new Exception("request failed with " + statusCode + ", no additional details provided"));
             break;
         }
     }
@@ -1150,7 +1378,7 @@ public class Operation implements Cloneable {
                     if (rsp.message != null) {
                         hasErrorResponseBody = true;
                     }
-                } catch (Throwable ex) {
+                } catch (Exception ex) {
                     // the body is not JSON, ignore
                 }
             } else {
@@ -1169,9 +1397,9 @@ public class Operation implements Cloneable {
             ServiceErrorResponse rsp;
             if (Utils.isValidationError(e)) {
                 this.statusCode = STATUS_CODE_BAD_REQUEST;
-                rsp = Utils.toValidationErrorResponse(e);
+                rsp = Utils.toValidationErrorResponse(e, this);
             } else {
-                rsp = Utils.toServiceErrorResponse(e, this);
+                rsp = Utils.toServiceErrorResponse(e);
             }
             rsp.statusCode = this.statusCode;
             setBodyNoCloning(rsp).setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
@@ -1200,7 +1428,7 @@ public class Operation implements Cloneable {
         try {
             OperationContext.setFrom(this);
             c.handle(this, e);
-        } catch (Throwable outer) {
+        } catch (Exception outer) {
             Utils.logWarning("Uncaught failure inside completion: %s", Utils.toString(outer));
         }
 
@@ -1235,6 +1463,33 @@ public class Operation implements Cloneable {
         return this;
     }
 
+    /**
+     * Add CompletionHandler in LIFO style, with support for cloned operations.
+     *
+     * This is a workaround for https://www.pivotaltracker.com/story/show/151798288
+     * which has some complications for a root cause fix.
+     *
+     * This is symmetric to {@link #appendCompletion(CompletionHandler)}.
+     * <pre>
+     * {@code
+     *   op.setCompletion(ORG);
+     *   op.nestCompletion(A);
+     *   op.nestCompletion(B);
+     *   // complete() will trigger: B -> A -> ORG
+     * }
+     * </pre>
+     */
+    public Operation nestCompletionCloneSafe(CompletionHandler h) {
+        final CompletionHandler existing = this.completion;
+        this.completion = (o, e) -> {
+            this.statusCode = o.statusCode;
+            o.completion = existing;
+            h.handle(o, e);
+        };
+        return this;
+
+    }
+
     public void nestCompletion(Consumer<Operation> successHandler) {
         CompletionHandler existing = this.completion;
         this.completion = (o, e) -> {
@@ -1246,7 +1501,7 @@ public class Operation implements Cloneable {
             }
             try {
                 successHandler.accept(o);
-            } catch (Throwable ex) {
+            } catch (Exception ex) {
                 fail(ex);
             }
         };
@@ -1362,16 +1617,33 @@ public class Operation implements Cloneable {
      * Checks if a directive is present. Lower case strings must be used.
      */
     public boolean hasPragmaDirective(String directive) {
-        String existingDirectives = getRequestHeader(PRAGMA_HEADER, false);
+        String existingDirectives = getRequestHeaderAsIs(PRAGMA_HEADER);
         return existingDirectives != null
                 && indexOfPragmaDirective(existingDirectives, directive) != -1;
+    }
+
+    /**
+     * Checks if a directive is present. Lower case strings must be used.
+     */
+    public boolean hasAnyPragmaDirective(List<String> directives) {
+        String existingDirectives = getRequestHeaderAsIs(PRAGMA_HEADER);
+        if (existingDirectives == null) {
+            return false;
+        }
+
+        for (String directive : directives) {
+            if (indexOfPragmaDirective(existingDirectives, directive) != -1) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
      * Removes a directive. Lower case strings must be used.
      */
     public Operation removePragmaDirective(String directive) {
-        String existingDirectives = getRequestHeader(PRAGMA_HEADER, false);
+        String existingDirectives = getRequestHeaderAsIs(PRAGMA_HEADER);
         if (existingDirectives != null) {
             int i = indexOfPragmaDirective(existingDirectives, directive);
             if (i == -1) {
@@ -1641,19 +1913,6 @@ public class Operation implements Cloneable {
     }
 
     /**
-     * Value indicating the service target is replicated and might not yet be available. Set this to
-     * true to enable availability registration for a service that might not be locally present yet.
-     * It prevents the operation failing with 404 (not found)
-     *
-     * @param enable - true or false
-     * @return
-     */
-    public Operation setTargetReplicated(boolean enable) {
-        toggleOption(OperationOption.REPLICATED_TARGET, enable);
-        return this;
-    }
-
-    /**
      * Value indicating whether the target service is replicated and might not yet be available
      * locally
      *
@@ -1771,7 +2030,7 @@ public class Operation implements Cloneable {
         return hasOption(OperationOption.NOTIFICATION_DISABLED);
     }
 
-    boolean isForwardingDisabled() {
+    public boolean isForwardingDisabled() {
         return hasPragmaDirective(PRAGMA_DIRECTIVE_NO_FORWARDING);
     }
 
@@ -1792,11 +2051,11 @@ public class Operation implements Cloneable {
         return isSynchronizeOwner() || isSynchronizePeer();
     }
 
-    boolean isSynchronizeOwner() {
+    public boolean isSynchronizeOwner() {
         return hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_OWNER);
     }
 
-    boolean isSynchronizePeer() {
+    public boolean isSynchronizePeer() {
         return hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_PEER);
     }
 

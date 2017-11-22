@@ -16,17 +16,23 @@ package com.vmware.xenon.services.common;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toSet;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
 import java.net.URI;
+import java.net.URL;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPInputStream;
 
 import org.junit.After;
 import org.junit.Test;
@@ -47,6 +53,7 @@ import com.vmware.xenon.common.test.TestNodeGroupManager;
 import com.vmware.xenon.common.test.TestRequestSender;
 import com.vmware.xenon.common.test.TestRequestSender.FailureResponse;
 import com.vmware.xenon.common.test.VerificationHost;
+import com.vmware.xenon.services.common.ExampleService.ExampleODLService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.NodeGroupService.NodeGroupState;
 
@@ -64,7 +71,8 @@ public class TestExampleService {
 
         // to speed up tests, set short maintenance interval.
         // it needs to "explicitly" set for VerificationHost instance
-        host.setMaintenanceIntervalMicros(TimeUnit.MILLISECONDS.toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
+        host.setMaintenanceIntervalMicros(
+                TimeUnit.MILLISECONDS.toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
         host.start();
 
         // add to the list for cleanup after each test run
@@ -78,6 +86,51 @@ public class TestExampleService {
         this.hostsToCleanup.clear();
     }
 
+    @Test
+    public void strictUpdateVersionCheck() throws Throwable {
+        VerificationHost host = createAndStartHost(false);
+        // Make sure example factory is started. the host does not wait for it
+        // to start since its not a core service. Note that in production code
+        // this is all asynchronous, you should not block and wait, just pass a
+        // completion.
+        host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
+
+        TestRequestSender sender = new TestRequestSender(host);
+
+        ExampleServiceState initialState = new ExampleServiceState();
+        initialState.name = UUID.randomUUID().toString();
+        initialState.counter = Long.MAX_VALUE;
+
+        // Create an example service
+        Operation createPost = Operation.createPost(host, ExampleService.FACTORY_LINK).setBody(initialState);
+        ExampleServiceState rsp = sender.sendAndWait(createPost, ExampleServiceState.class);
+
+        // Make some regular updates
+        initialState.name = rsp.name + "update-1";
+        ExampleServiceState state = sender.sendAndWait(Operation.createPatch(host, rsp.documentSelfLink)
+                .setBody(initialState), ExampleServiceState.class);
+        assertThat(state.name).endsWith("update-1");
+
+        initialState.name = rsp.name + "update-2";
+        initialState.counter = 1L;
+        state = sender.sendAndWait(Operation.createPatch(host, rsp.documentSelfLink)
+                .setBody(initialState), ExampleServiceState.class);
+        assertThat(state.name).endsWith("update-2");
+
+        // Verify that strict update succeeds with correct version
+        ExampleService.StrictUpdateRequest strictUpdateRequest = new ExampleService.StrictUpdateRequest();
+        strictUpdateRequest.documentVersion = state.documentVersion;
+        strictUpdateRequest.name = rsp.name + "update-3";
+        strictUpdateRequest.kind = Utils.buildKind(ExampleService.StrictUpdateRequest.class);
+        state = sender.sendAndWait(Operation.createPatch(host, rsp.documentSelfLink)
+                .setBody(strictUpdateRequest), ExampleServiceState.class);
+        assertThat(state.name).endsWith("update-3");
+
+        // Verify that strict update fails with wrong version
+        strictUpdateRequest.documentVersion = state.documentVersion - 1;
+        sender.sendAndWaitFailure(Operation.createPatch(host, rsp.documentSelfLink)
+                .setBody(strictUpdateRequest));
+    }
 
     @Test
     public void singleNodeFactoryPost() throws Throwable {
@@ -107,7 +160,8 @@ public class TestExampleService {
         ServiceDocumentQueryResult templateResult = sender.sendGetAndWait(uri,
                 ServiceDocumentQueryResult.class);
 
-        assertTrue(templateResult.documentLinks.size() == templateResult.documents.size());
+        assertThat(templateResult.documentLinks).hasSameSizeAs(templateResult.documents.keySet());
+
         ExampleServiceState childTemplate = Utils.fromJson(
                 templateResult.documents.get(templateResult.documentLinks.iterator().next()),
                 ExampleServiceState.class);
@@ -115,15 +169,13 @@ public class TestExampleService {
         assertNotNull(childTemplate.counter);
         assertNotNull(childTemplate.name);
         assertNotNull(childTemplate.documentDescription);
-        assertNotNull(childTemplate.documentDescription.propertyDescriptions);
-        assertTrue(childTemplate.documentDescription.propertyDescriptions.size() > 0);
-        assertTrue(childTemplate.documentDescription.propertyDescriptions.containsKey("name"));
-        assertTrue(childTemplate.documentDescription.propertyDescriptions.containsKey("counter"));
+        assertThat(childTemplate.documentDescription.propertyDescriptions).size().isGreaterThan(3);
+        assertThat(childTemplate.documentDescription.propertyDescriptions).containsKeys("name", "counter");
 
         PropertyDescription pdMap = childTemplate.documentDescription.propertyDescriptions
                 .get(ExampleServiceState.FIELD_NAME_KEY_VALUES);
-        assertTrue(pdMap.usageOptions.contains(PropertyUsageOption.OPTIONAL));
-        assertTrue(pdMap.indexingOptions.contains(PropertyIndexingOption.EXPAND));
+        assertThat(pdMap.usageOptions).contains(PropertyUsageOption.OPTIONAL);
+        assertThat(pdMap.indexingOptions).contains(PropertyIndexingOption.EXPAND);
     }
 
     @Test
@@ -143,7 +195,7 @@ public class TestExampleService {
         //test that example services are created correctly
         for (ExampleServiceState s : childStates) {
             assertEquals(COUNTER_VALUE, s.counter);
-            assertTrue(s.name.startsWith(PREFIX));
+            assertThat(s.name).startsWith(PREFIX);
             assertEquals(host.getId(), s.documentOwner);
             assertEquals(3, s.keyValues.size());
             assertEquals("test-value-1", s.keyValues.get("test-key-1"));
@@ -169,7 +221,7 @@ public class TestExampleService {
         List<ExampleServiceState> patchedStates = getExampleServiceStates(host, childPaths);
         for (ExampleServiceState s : patchedStates) {
             assertEquals(COUNTER_VALUE, s.counter);
-            assertTrue(s.name.startsWith(PREFIX));
+            assertThat(s.name).startsWith(PREFIX);
             assertEquals(host.getId(), s.documentOwner);
             assertEquals(3, s.keyValues.size());
             assertEquals("test-value-1-patch-1", s.keyValues.get("test-key-1"));
@@ -195,7 +247,7 @@ public class TestExampleService {
         List<ExampleServiceState> patchesToSetNullStates = getExampleServiceStates(host, childPaths);
         for (ExampleServiceState s : patchesToSetNullStates) {
             assertEquals(COUNTER_VALUE, s.counter);
-            assertTrue(s.name.startsWith(PREFIX));
+            assertThat(s.name).startsWith(PREFIX);
             assertEquals(host.getId(), s.documentOwner);
             assertEquals(1, s.keyValues.size());
             assertEquals("test-value-1-patch-1", s.keyValues.get("test-key-1"));
@@ -299,6 +351,160 @@ public class TestExampleService {
 
         // validate get result...
         assertEquals("FOO", getResult.name);
+
+        QueryTask.Query q = QueryTask.Query.Builder.create()
+                .addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK, getResult.documentSelfLink)
+                .build();
+        QueryTask queryTask = QueryTask.Builder.createDirectTask()
+                .addOption(QueryTask.QuerySpecification.QueryOption.EXPAND_CONTENT)
+                .setQuery(q)
+                .build();
+        ExampleServiceState d1 = Utils.fromJson(sender.sendAndWait(Operation.createPost(host1, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS)
+                .setBody(queryTask), QueryTask.class).results.documents.values().iterator().next(), ExampleServiceState.class);
+        ExampleServiceState d2 = Utils.fromJson(sender.sendAndWait(Operation.createPost(host2, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS)
+                .setBody(queryTask), QueryTask.class).results.documents.values().iterator().next(), ExampleServiceState.class);
+        assertEquals(getResult.documentUpdateTimeMicros, d1.documentUpdateTimeMicros);
+        assertEquals(getResult.documentUpdateTimeMicros, d2.documentUpdateTimeMicros);
+        assertEquals(getResult.documentVersion, d1.documentVersion);
+        assertEquals(getResult.documentVersion, d2.documentVersion);
+
+        //update
+        Operation put = Operation.createPut(peer, servicePath).setBody(body);
+        sender.sendAndWait(put, ExampleServiceState.class);
+        get = Operation.createGet(peer, servicePath);
+        getResult = sender.sendAndWait(get, ExampleServiceState.class);
+        d1 = Utils.fromJson(sender.sendAndWait(Operation.createPost(host1, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS)
+                .setBody(queryTask), QueryTask.class).results.documents.values().iterator().next(), ExampleServiceState.class);
+        d2 = Utils.fromJson(sender.sendAndWait(Operation.createPost(host2, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS)
+                .setBody(queryTask), QueryTask.class).results.documents.values().iterator().next(), ExampleServiceState.class);
+        assertEquals(getResult.documentUpdateTimeMicros, d1.documentUpdateTimeMicros);
+        assertEquals(getResult.documentUpdateTimeMicros, d2.documentUpdateTimeMicros);
+        assertEquals(getResult.documentVersion, d1.documentVersion);
+        assertEquals(getResult.documentVersion, d2.documentVersion);
+    }
+
+    @Test
+    public void multiNodeCompression() throws Throwable {
+        // scenario:
+        //   create 2 nodes and join to default group
+        //   post & get example service with compression enabled
+
+        // prepare multiple nodes (for simplicity, using VerificationHost)
+        VerificationHost host1 = createAndStartHost(false);
+        VerificationHost host2 = createAndStartHost(false);
+
+        TestNodeGroupManager nodeGroup = new TestNodeGroupManager();
+        nodeGroup.addHost(host1);
+        nodeGroup.addHost(host2);
+
+        // make node group join to the "default" node group, then wait cluster to be stabilized
+        nodeGroup.joinNodeGroupAndWaitForConvergence();
+
+        // wait the service to be available in cluster
+        nodeGroup.waitForFactoryServiceAvailable(ExampleService.FACTORY_LINK);
+
+        // prepare operation sender(client)
+        ServiceHost peer = nodeGroup.getHost();
+        TestRequestSender sender = new TestRequestSender(peer);
+
+        // POST request. create a doc with static selflink: /core/examples/foo
+        String suffix = "foo";
+        ExampleServiceState body = new ExampleServiceState();
+        body.name = "FOO";
+        body.documentSelfLink = suffix;
+        Operation post = Operation.createPost(peer, ExampleService.FACTORY_LINK).setBody(body);
+
+        // enable compression and test a more complex Accept-Encoding header works correctly
+        post.addRequestHeader(Operation.CONTENT_ENCODING_HEADER, Operation.CONTENT_ENCODING_GZIP);
+        post.addRequestHeader(Operation.ACCEPT_ENCODING_HEADER, "br;q=1.0, gzip;q=0.8, *;q=0.1");
+
+        // verify post response
+        ExampleServiceState result = sender.sendAndWait(post, ExampleServiceState.class);
+        assertEquals("FOO", result.name);
+
+        // make get and validate result
+        String servicePath = UriUtils.buildUriPath(ExampleService.FACTORY_LINK, suffix);
+        Operation get = Operation.createGet(peer, servicePath);
+        get.addRequestHeader(Operation.CONTENT_ENCODING_HEADER, Operation.CONTENT_ENCODING_GZIP);
+        post.addRequestHeader(Operation.ACCEPT_ENCODING_HEADER, "br;q=1.0, gzip;q=0.8, *;q=0.1");
+
+        ExampleServiceState getResult = sender.sendAndWait(get, ExampleServiceState.class);
+
+        // validate get result...
+        assertEquals("FOO", getResult.name);
+
+        // now do a manual get with manual gunzip to check compresion was actually used
+        URL url = new URL(peer.getUri() + getResult.documentSelfLink);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestProperty(Operation.ACCEPT_ENCODING_HEADER, "br;q=1.0, gzip;q=0.8, *;q=0.1");
+
+        InputStream inputStream = conn.getInputStream();
+        ByteArrayOutputStream baos;
+        try (GZIPInputStream zis = new GZIPInputStream(inputStream)) {
+            baos = new ByteArrayOutputStream();
+            byte[] buffer = new byte[1024];
+            int read = 0;
+            while ((read = zis.read(buffer, 0, buffer.length)) != -1) {
+                baos.write(buffer, 0, read);
+            }   baos.flush();
+        }
+
+        String json = new String(baos.toByteArray(), Utils.CHARSET);
+        ExampleServiceState manualResult = Utils.fromJson(json, ExampleServiceState.class);
+        assertEquals("FOO", manualResult.name);
+    }
+
+    @Test
+    public void multiNodeOnDemandLoad() throws Throwable {
+        // scenario:
+        //   create 2 nodes and join to default group
+        //   post & get example service
+
+        // prepare multiple nodes (for simplicity, using VerificationHost)
+        VerificationHost host1 = createAndStartHost(false);
+        host1.startFactory(ExampleODLService::createFactory, ExampleODLService.FACTORY_LINK);
+        VerificationHost host2 = createAndStartHost(false);
+        host2.startFactory(ExampleODLService::createFactory, ExampleODLService.FACTORY_LINK);
+
+        TestNodeGroupManager nodeGroup = new TestNodeGroupManager();
+        int maintMillis = VerificationHost.FAST_MAINT_INTERVAL_MILLIS / 2;
+        nodeGroup.setMaintenanceInterval(Duration.ofMillis(maintMillis));
+        host1.setServiceCacheClearDelayMicros(TimeUnit.MILLISECONDS.toMicros(maintMillis));
+        nodeGroup.addHost(host1);
+        nodeGroup.addHost(host2);
+
+        // make node group join to the "default" node group, then wait cluster to be stabilized
+        nodeGroup.joinNodeGroupAndWaitForConvergence();
+
+        // wait the service to be available in cluster
+        nodeGroup.waitForFactoryServiceAvailable(ExampleODLService.FACTORY_LINK);
+
+        // create a request sender which can be any host in this scenario
+        TestRequestSender sender = new TestRequestSender(host1);
+
+        String suffix = "foo";
+        ExampleServiceState postBody = new ExampleServiceState();
+        postBody.name = suffix;
+        postBody.counter = 0L;
+        postBody.documentSelfLink = suffix; // static self link: /core/examples/foo
+
+        Operation post = Operation.createPost(host1, ExampleODLService.FACTORY_LINK)
+                .setBody(postBody);
+
+        // send POST and wait for response
+        sender.sendAndWait(post, ExampleServiceState.class);
+
+        String servicePath = UriUtils.buildUriPath(ExampleODLService.FACTORY_LINK, suffix);
+
+        for (int i = 0; i < 5; i++) {
+            ExampleServiceState patchBody = new ExampleServiceState();
+            patchBody.name = "foo-" + i;
+            patchBody.counter = (long) (i + 1);
+            Operation patch = Operation.createPatch(host1, servicePath).setBody(patchBody);
+            sender.sendAndWait(patch);
+            host1.log("Sent patch, now sleeping to induce on demand stop / load");
+            Thread.sleep(maintMillis * 5);
+        }
     }
 
     @Test
@@ -350,7 +556,7 @@ public class TestExampleService {
                 .map(ServiceHost::getId)
                 .collect(toSet());
         String msg = String.format("DocumentOwner %s is not in %s", postResult.documentOwner, expectedOwnerIds);
-        assertTrue(msg, expectedOwnerIds.contains(postResult.documentOwner));
+        assertThat(expectedOwnerIds).as(msg).contains(postResult.documentOwner);
 
 
         // send a GET to host4 which is in groupB. It should fail.

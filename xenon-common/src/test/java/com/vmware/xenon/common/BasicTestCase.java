@@ -75,7 +75,7 @@ public class BasicTestCase {
         VerificationHost.initialize(host, args);
     }
 
-    public void beforeHostStart(VerificationHost host) throws Exception {
+    public void beforeHostStart(VerificationHost host) throws Throwable {
 
     }
 
@@ -95,6 +95,7 @@ public class BasicTestCase {
      * @param handler
      * @return
      */
+    @Deprecated
     public CompletionHandler getSafeHandler(CompletionHandler handler) {
         return this.host.getSafeHandler(handler);
     }

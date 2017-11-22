@@ -16,25 +16,28 @@ package com.vmware.xenon.common;
 import java.io.IOException;
 import java.net.URI;
 
+import com.vmware.xenon.common.config.XenonConfiguration;
+
 public interface ServiceRequestListener {
-    public static final String PROPERTY_NAME_RESPONSE_PAYLOAD_SIZE =
-            Utils.PROPERTY_NAME_PREFIX + "ServiceRequestListener.RESPONSE_PAYLOAD_SIZE_LIMIT";
+
 
     /**
      * Default maximum size limit of a response payload that can be returned by a Xenon host.
      */
-    public static final int RESPONSE_PAYLOAD_SIZE_LIMIT = Integer.getInteger(
-            PROPERTY_NAME_RESPONSE_PAYLOAD_SIZE, 1024 * 1024 * 64);
+    int RESPONSE_PAYLOAD_SIZE_LIMIT = XenonConfiguration.integer(
+            ServiceRequestListener.class,
+            "RESPONSE_PAYLOAD_SIZE_LIMIT",
+            1024 * 1024 * 64);
 
     long getActiveClientCount();
 
     int getPort();
 
-    void setSSLContextFiles(URI certFile, URI keyFile) throws Throwable;
+    void setSSLContextFiles(URI certFile, URI keyFile) throws Exception;
 
-    void setSSLContextFiles(URI certFile, URI keyFile, String keyPassphrase) throws Throwable;
+    void setSSLContextFiles(URI certFile, URI keyFile, String keyPassphrase) throws Exception;
 
-    void start(int port, String bindAddress) throws Throwable;
+    void start(int port, String bindAddress) throws Exception;
 
     void handleMaintenance(Operation op);
 
@@ -47,4 +50,8 @@ public interface ServiceRequestListener {
     void setResponsePayloadSizeLimit(int responsePayloadSizeLimit);
 
     int getResponsePayloadSizeLimit();
+
+    void setSecureAuthCookie(boolean secureAuthCookie);
+
+    boolean getSecureAuthCookie();
 }

@@ -32,6 +32,7 @@ import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.ServiceClient;
 import com.vmware.xenon.common.ServiceConfigUpdateRequest;
 import com.vmware.xenon.common.ServiceConfiguration;
+import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceErrorResponse;
 import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.StatelessService;
@@ -98,6 +99,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
 
     public ConsistentHashingNodeSelectorService() {
         super(NodeSelectorState.class);
+        super.toggleOption(ServiceOption.CORE, true);
         super.toggleOption(ServiceOption.PERIODIC_MAINTENANCE, true);
         super.toggleOption(ServiceOption.INSTRUMENTATION, true);
     }
@@ -115,6 +117,10 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         getHost().getClient().setConnectionLimitPerTag(
                 ServiceClient.CONNECTION_TAG_REPLICATION,
                 NodeSelectorService.REPLICATION_TAG_CONNECTION_LIMIT);
+
+        getHost().getClient().setConnectionLimitPerTag(
+                ServiceClient.CONNECTION_TAG_SYNCHRONIZATION,
+                NodeSelectorService.SYNCHRONIZATION_TAG_CONNECTION_LIMIT);
 
         getHost().getClient().setConnectionLimitPerTag(
                 ServiceClient.CONNECTION_TAG_FORWARDING,
@@ -211,6 +217,14 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
     @Override
     public void handleRequest(Operation op) {
         if (op.getAction() == Action.GET) {
+            // this.cachedState might be stale if NodeSelector status is UNAVAILABLE.
+            // Status gets actively updated if we are going from AVAILABLE TO UNAVAILABLE status.
+            // But transition to AVAILABLE is lazy so we update it on GET request.
+            if (!NodeSelectorState.isAvailable(this.cachedState)) {
+                synchronized (this.cachedState) {
+                    NodeSelectorState.updateStatus(getHost(), this.cachedGroupState, this.cachedState);
+                }
+            }
             op.setBody(this.cachedState).complete();
             return;
         }
@@ -220,8 +234,14 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             return;
         }
 
+        // update to node selector state
+        if (op.getAction() == Action.PATCH) {
+            super.handleRequest(op);
+            return;
+        }
+
         if (op.getAction() != Action.POST) {
-            getHost().failRequestActionNotSupported(op);
+            Operation.failActionNotSupported(op);
             return;
         }
 
@@ -240,6 +260,24 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
     }
 
     @Override
+    public void handlePatch(Operation patch) {
+        if (!patch.hasBody()) {
+            patch.fail(new IllegalArgumentException("Body is required"));
+            return;
+        }
+        ServiceDocument s = patch.getBody(ServiceDocument.class);
+        if (s.documentKind == null) {
+            patch.fail(new IllegalArgumentException("Kind is required"));
+            return;
+        }
+        if (UpdateReplicationQuorumRequest.KIND.equals(s.documentKind)) {
+            updateReplicationQuorum(patch, patch.getBody(UpdateReplicationQuorumRequest.class));
+            return;
+        }
+        patch.fail(new IllegalArgumentException("Unexpected request kind " + s.documentKind));
+    }
+
+    @Override
     public void handleConfigurationRequest(Operation op) {
         if (op.getAction() == Action.PATCH && op.hasBody()) {
             ServiceConfigUpdateRequest body = op.getBody(ServiceConfigUpdateRequest.class);
@@ -248,9 +286,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             }
         }
         if (op.getAction() == Action.GET) {
-            ServiceConfiguration cfg = new ServiceConfiguration();
-            cfg.options = getOptions();
-            cfg.maintenanceIntervalMicros = getMaintenanceIntervalMicros();
+            ServiceConfiguration cfg = Utils.buildServiceConfig(new ServiceConfiguration(), this);
             cfg.epoch = 0;
             cfg.operationQueueLimit = (int) this.operationQueueLimit;
             op.setBodyNoCloning(cfg).complete();
@@ -478,7 +514,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         if (this.cachedGroupState == null) {
             op.fail(null);
         }
-        this.replicationUtility.replicateUpdate(this.cachedGroupState, op, body, response);
+        this.replicationUtility.replicateUpdate(this.cachedGroupState, op, body, response, this.cachedState.replicationQuorum);
     }
 
     /**
@@ -515,7 +551,9 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
         // approximate check for queue limit (not atomic)
         if (this.operationQueueLimit <= this.pendingOperationCount.get()) {
             adjustStat(STAT_NAME_LIMIT_EXCEEDED_FAILED_REQUEST_COUNT, 1);
-            this.getHost().failRequestLimitExceeded(op);
+            Operation.failLimitExceeded(op,
+                    ServiceErrorResponse.ERROR_CODE_SERVICE_QUEUE_LIMIT_EXCEEDED,
+                    "pendingRequestQueue on " + getSelfLink());
             return true;
         }
 
@@ -538,7 +576,10 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
     @Override
     public void handleMaintenance(Operation maintOp) {
         performPendingRequestMaintenance();
-        checkAndScheduleSynchronization(this.cachedGroupState.membershipUpdateTimeMicros);
+        if (checkAndScheduleSynchronization(this.cachedGroupState.membershipUpdateTimeMicros,
+                maintOp)) {
+            return;
+        }
         maintOp.complete();
     }
 
@@ -564,7 +605,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             this.pendingOperationCount.decrementAndGet();
 
             if (getHost().isStopping()) {
-                req.associatedOp.fail(new CancellationException());
+                req.associatedOp.fail(new CancellationException("Host is stopping"));
                 continue;
             }
             selectAndForward(req, req.associatedOp, this.cachedGroupState);
@@ -572,51 +613,55 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
 
     }
 
-    private void checkAndScheduleSynchronization(long membershipUpdateMicros) {
+    private boolean checkAndScheduleSynchronization(long membershipUpdateMicros,
+            Operation maintOp) {
         if (getHost().isStopping()) {
-            return;
+            return false;
         }
 
         if (!this.isSynchronizationRequired) {
             // this boolean is set to false on notifications for node group changes
-            return;
+            return false;
         }
 
         if (!NodeGroupUtils.isMembershipSettled(getHost(), getHost().getMaintenanceIntervalMicros(),
                 this.cachedGroupState)) {
-            checkConvergence(membershipUpdateMicros);
-            return;
+            checkConvergence(membershipUpdateMicros, maintOp);
+            return true;
         }
 
         if (!this.isNodeGroupConverged) {
-            checkConvergence(membershipUpdateMicros);
-            return;
+            checkConvergence(membershipUpdateMicros, maintOp);
+            return true;
         }
 
         if (!getHost().isPeerSynchronizationEnabled()
                 || !this.isSynchronizationRequired) {
-            return;
+            return false;
         }
 
         this.isSynchronizationRequired = false;
         logInfo("Scheduling synchronization (%d nodes)", this.cachedGroupState.nodes.size());
         adjustStat(STAT_NAME_SYNCHRONIZATION_COUNT, 1);
         getHost().scheduleNodeGroupChangeMaintenance(getSelfLink());
+        return false;
     }
 
-    private void checkConvergence(long membershipUpdateMicros) {
+    private void checkConvergence(long membershipUpdateMicros, Operation maintOp) {
 
         CompletionHandler c = (o, e) -> {
             if (e != null) {
                 if (!getHost().isStopping()) {
                     logSevere(e);
                 }
+                maintOp.complete();
                 return;
             }
 
             final int quorumWarningsBeforeQuiet = 10;
             if (!o.hasBody()) {
                 logWarning("Missing node group state");
+                maintOp.complete();
                 return;
             }
             NodeGroupState ngs = o.getBody(NodeGroupState.class);
@@ -633,6 +678,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
                                 if (e1 != null) {
                                     logWarning("Failed convergence check, will retry: %s",
                                             e1.getMessage());
+                                    maintOp.complete();
                                     return;
                                 }
 
@@ -644,6 +690,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
                                         logWarning("Synchronization quorum not met, warning will be silenced");
                                     }
                                     this.synchQuorumWarningCount++;
+                                    maintOp.complete();
                                     return;
                                 }
 
@@ -655,6 +702,7 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
                                         this.synchQuorumWarningCount = 0;
                                     }
                                 }
+                                maintOp.complete();
                             }));
         };
 
@@ -715,6 +763,59 @@ public class ConsistentHashingNodeSelectorService extends StatelessService imple
             } else {
                 return;
             }
+        }
+    }
+
+    @Override
+    public void updateReplicationQuorum(Operation op, UpdateReplicationQuorumRequest r) {
+        if (r.replicationQuorum == null) {
+            op.fail(new IllegalArgumentException("replication quorum is required"));
+            return;
+        }
+        int replicationQuorum = r.replicationQuorum;
+        int replicationFactor = this.cachedState.replicationFactor != null ?
+                this.cachedState.replicationFactor.intValue() : this.cachedGroupState.nodes.size();
+        if (replicationQuorum > replicationFactor) {
+            String errorMsg = String.format(
+                    "replicationQuorum %d > replicationFactor %d", replicationQuorum, replicationFactor);
+            op.fail(new IllegalArgumentException(errorMsg));
+            return;
+        }
+        // broadcast
+        logInfo("replicationQuorum update from %d to %d", this.cachedState.replicationQuorum, replicationQuorum);
+        this.cachedState.replicationQuorum = replicationQuorum;
+        if (!r.isGroupUpdate) {
+            op.complete();
+            return;
+        }
+        r.isGroupUpdate = false;
+        AtomicInteger pending = new AtomicInteger(this.cachedGroupState.nodes.size());
+        CompletionHandler c = (o, e) -> {
+            if (e != null) {
+                // fail the original update request if one peer update failed
+                op.fail(e);
+                return;
+            }
+            int p = pending.decrementAndGet();
+            if (p != 0) {
+                return;
+            }
+            op.complete();
+        };
+        for (NodeState node : this.cachedGroupState.nodes.values()) {
+            if (!NodeState.isAvailable(node, getHost().getId(), true)) {
+                c.handle(null, null);
+                continue;
+            }
+            URI peerNodeSelectorService = UriUtils.buildUri(node.groupReference.getScheme(),
+                    node.groupReference.getHost(),
+                    node.groupReference.getPort(),
+                    getSelfLink(), null);
+            Operation p = Operation
+                    .createPatch(peerNodeSelectorService)
+                    .setBody(r)
+                    .setCompletion(c);
+            sendRequest(p);
         }
     }
 

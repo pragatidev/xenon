@@ -15,7 +15,11 @@ package com.vmware.xenon.common.serialization;
 
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Type;
+import java.nio.file.Path;
 import java.util.Collection;
+import java.util.Date;
+import java.util.EnumSet;
+import java.util.Set;
 import java.util.function.Consumer;
 
 import com.google.gson.ExclusionStrategy;
@@ -23,33 +27,64 @@ import com.google.gson.FieldAttributes;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonSyntaxException;
+import com.google.gson.internal.Streams;
+import com.google.gson.internal.bind.JsonTreeWriter;
+import com.google.gson.stream.JsonWriter;
 
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentDescription;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.config.XenonConfiguration;
 
 /**
- * A helper that serializes/deserializes service documents to/from JSON. The implementation uses a
- * pair of {@link Gson} instances: one for compact printing; the other for pretty-printed,
- * HTML-friendly output.
+ * A helper that serializes/deserializes service documents to/from JSON. The implementation
+ * supports a variety of {@link JsonOptions}.
+ *
+ * The implementation creates and utilizes {@link Gson} instances for each supported option
+ * configuration.
  */
 public class JsonMapper {
 
+
+    private static final boolean JSON_SUPPRESS_GSON_SERIALIZATION_ERRORS = XenonConfiguration.bool(
+            "json",
+            "suppressGsonSerializationErrors",
+            false
+    );
+
+
     private static final int MAX_SERIALIZATION_ATTEMPTS = 100;
+    private static final String JSON_INDENT = "  ";
+
+    /** Describes supported JSON serialization options. */
+    public enum JsonOptions {
+        /**
+         * Output JSON in compact form (without spaces or newlines). If this option is not used,
+         * JSON will be in a pretty-printed, HTML-friendly output.
+         */
+        COMPACT,
+
+        /** Exclude fields annotated with {@link ServiceDocumentDescription.PropertyUsageOption#SENSITIVE} */
+        EXCLUDE_SENSITIVE,
+
+        /** Exclude built-in fields. See {@link ServiceDocument#isBuiltInDocumentField(String)} */
+        EXCLUDE_BUILTIN
+    }
 
     private final Gson compact;
-    private final Gson pretty;
+    private Gson hashing;
     private final Gson compactSensitive;
-    private final Gson prettySensitive;
+    private final Gson compactExcludeBuiltin;
+    private final Gson compactSensitiveAndExcludeBuiltin;
+    private boolean jsonSuppressGsonSerializationErrors = JSON_SUPPRESS_GSON_SERIALIZATION_ERRORS;
 
     /**
      * Instantiates a mapper with default GSON configurations.
      */
     public JsonMapper() {
-        this(createDefaultGson(true, false),
-                createDefaultGson(false, false),
-                createDefaultGson(true, true),
-                createDefaultGson(false, true));
+        this(createDefaultGson(EnumSet.of(JsonOptions.COMPACT)),
+                createDefaultGson(EnumSet.of(JsonOptions.COMPACT, JsonOptions.EXCLUDE_SENSITIVE)));
     }
 
     /**
@@ -59,27 +94,41 @@ public class JsonMapper {
      * and compact instances.
      */
     public JsonMapper(Consumer<GsonBuilder> gsonConfigCallback) {
-        this(createCustomGson(true, false, gsonConfigCallback),
-                createCustomGson(false, false, gsonConfigCallback),
-                createCustomGson(true, true, gsonConfigCallback),
-                createCustomGson(false, true, gsonConfigCallback));
+        this(createCustomGson(EnumSet.of(JsonOptions.COMPACT), gsonConfigCallback),
+                createCustomGson(EnumSet.of(JsonOptions.COMPACT, JsonOptions.EXCLUDE_SENSITIVE), gsonConfigCallback));
+        this.hashing = createHashingGson(gsonConfigCallback);
     }
 
     /**
      * Instantiates a mapper with the compact and pretty GSON instances explicitly supplied.
      */
-    public JsonMapper(Gson compact, Gson pretty, Gson compactSensitive, Gson prettySensitive) {
+    public JsonMapper(Gson compact, Gson compactSensitive) {
         this.compact = compact;
-        this.pretty = pretty;
         this.compactSensitive = compactSensitive;
-        this.prettySensitive = prettySensitive;
+        this.hashing = createHashingGson(null);
+        this.compactExcludeBuiltin = createDefaultGson(EnumSet.of(JsonOptions.COMPACT, JsonOptions.EXCLUDE_BUILTIN));
+        this.compactSensitiveAndExcludeBuiltin = createDefaultGson(EnumSet.of(JsonOptions.COMPACT, JsonOptions.EXCLUDE_BUILTIN, JsonOptions.EXCLUDE_SENSITIVE));
+    }
+
+    private Gson createHashingGson(Consumer<GsonBuilder> gsonConfigCallback) {
+        GsonBuilder bldr = new GsonBuilder();
+
+        registerCommonGsonTypeAdapters(bldr);
+
+        bldr.disableHtmlEscaping();
+
+        bldr.registerTypeAdapterFactory(new SortedKeysMapViewAdapterFactory());
+        if (gsonConfigCallback != null) {
+            gsonConfigCallback.accept(bldr);
+        }
+        return bldr.create();
     }
 
     /**
      * Outputs a JSON representation of the given object in compact JSON.
      */
     public String toJson(Object body) {
-        for (int i = 1;; i++) {
+        for (int i = 1; ; i++) {
             try {
                 return this.compact.toJson(body);
             } catch (IllegalStateException e) {
@@ -89,7 +138,7 @@ public class JsonMapper {
     }
 
     public void toJson(Object body, Appendable appendable) {
-        for (int i = 1;; i++) {
+        for (int i = 1; ; i++) {
             try {
                 this.compact.toJson(body, appendable);
                 return;
@@ -100,12 +149,20 @@ public class JsonMapper {
     }
 
     /**
-     * Outputs a JSON representation of the given object in pretty-printed, HTML-friendly JSON.
+     * Convert an object to JsonElement without intermediate string representations.
+     * @param body
+     * @return
      */
-    public String toJsonHtml(Object body) {
-        for (int i = 1;; i++) {
+    public JsonElement toJsonElement(Object body) {
+        if (body == null) {
+            return null;
+        }
+
+        for (int i = 1; ; i++) {
             try {
-                return this.pretty.toJson(body);
+                JsonTreeWriter writer = new JsonTreeWriter();
+                this.compact.toJson(body, body.getClass(), writer);
+                return writer.get();
             } catch (IllegalStateException e) {
                 handleIllegalStateException(e, i);
             }
@@ -113,29 +170,50 @@ public class JsonMapper {
     }
 
     /**
-     * Outputs a JSON representation of the given object using useHTMLFormatting to create pretty-printed,
-     * HTML-friendly JSON or compact JSON. If hideSensitiveFields is set the JSON will not include fields
-     * with the annotation {@link com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption#SENSITIVE}.
+     * Outputs a JSON representation of the given object in pretty-printed, HTML-friendly JSON.
      */
-    public void toJson(boolean hideSensitiveFields, boolean useHtmlFormatting, Object body, Appendable appendable) {
-        for (int i = 1;; i++) {
+    public String toJsonHtml(Object body) {
+        if (body == null) {
+            return this.compact.toJson(null);
+        }
+
+        for (int i = 1; ; i++) {
             try {
-                if (hideSensitiveFields) {
-                    if (useHtmlFormatting) {
-                        this.prettySensitive.toJson(body, appendable);
-                        return;
-                    } else {
-                        this.compactSensitive.toJson(body, appendable);
-                        return;
-                    }
+                StringBuilder appendable = new StringBuilder();
+                this.toJsonHtml(body, appendable);
+                return appendable.toString();
+            } catch (IllegalStateException e) {
+                handleIllegalStateException(e, i);
+            }
+        }
+    }
+
+    private Gson getGsonForOptions(Set<JsonOptions> options) {
+        if (options.containsAll(EnumSet.of(JsonOptions.EXCLUDE_BUILTIN, JsonOptions.EXCLUDE_SENSITIVE))) {
+            return this.compactSensitiveAndExcludeBuiltin;
+        }
+        if (options.contains(JsonOptions.EXCLUDE_BUILTIN)) {
+            return this.compactExcludeBuiltin;
+        }
+        if (options.contains(JsonOptions.EXCLUDE_SENSITIVE)) {
+            return this.compactSensitive;
+        }
+        return this.compact;
+    }
+
+    /**
+     * Outputs a JSON representation of the given {@code body} based on the provided JSON {@code options}
+     */
+    public void toJson(Set<JsonOptions> options, Object body, Appendable appendable) {
+        Gson gson = getGsonForOptions(options);
+        for (int i = 1; ; i++) {
+            try {
+                if (!options.contains(JsonOptions.COMPACT)) {
+                    gson.toJson(body, body.getClass(), makePrettyJsonWriter(appendable));
+                    return;
                 } else {
-                    if (useHtmlFormatting) {
-                        this.pretty.toJson(body, appendable);
-                        return;
-                    } else {
-                        this.compact.toJson(body, appendable);
-                        return;
-                    }
+                    gson.toJson(body, appendable);
+                    return;
                 }
             } catch (IllegalStateException e) {
                 handleIllegalStateException(e, i);
@@ -179,55 +257,104 @@ public class JsonMapper {
      * Deserializes the given JSON to the target {@link Type}.
      */
     public <T> T fromJson(Object json, Type type) {
-        if (json instanceof JsonElement) {
-            return this.compact.fromJson((JsonElement) json, type);
-        } else {
-            return this.compact.fromJson(json.toString(), type);
+        try {
+            if (json instanceof JsonElement) {
+                return this.compact.fromJson((JsonElement) json, type);
+            } else {
+                return this.compact.fromJson(json.toString(), type);
+            }
+        } catch (RuntimeException e) {
+            if (this.jsonSuppressGsonSerializationErrors) {
+                throw new JsonSyntaxException("JSON body could not be parsed");
+            } else {
+                throw e;
+            }
         }
     }
 
-    private static Gson createDefaultGson(boolean isCompact, boolean isSensitive) {
-        return createDefaultGsonBuilder(isCompact, isSensitive).create();
+    public void setJsonSuppressGsonSerializationErrors(boolean suppressErrors) {
+        this.jsonSuppressGsonSerializationErrors = suppressErrors;
     }
 
-    private static Gson createCustomGson(boolean isCompact, boolean isSensitive,
-            Consumer<GsonBuilder> gsonConfigCallback) {
-        GsonBuilder bldr = createDefaultGsonBuilder(isCompact, isSensitive);
+    private static Gson createDefaultGson(EnumSet<JsonOptions> options) {
+        return createDefaultGsonBuilder(options).create();
+    }
+
+    private static Gson createCustomGson(EnumSet<JsonOptions> options, Consumer<GsonBuilder> gsonConfigCallback) {
+        GsonBuilder bldr = createDefaultGsonBuilder(options);
         gsonConfigCallback.accept(bldr);
         return bldr.create();
     }
 
-    public static GsonBuilder createDefaultGsonBuilder(boolean isCompact, boolean isSensitive) {
+
+    public static GsonBuilder createDefaultGsonBuilder(EnumSet<JsonOptions> options) {
         GsonBuilder bldr = new GsonBuilder();
 
         registerCommonGsonTypeAdapters(bldr);
 
-        if (!isCompact) {
+        if (!options.contains(JsonOptions.COMPACT)) {
             bldr.setPrettyPrinting();
         }
 
         bldr.disableHtmlEscaping();
 
-        if (isSensitive) {
+        if (options.contains(JsonOptions.EXCLUDE_SENSITIVE)) {
             bldr.addSerializationExclusionStrategy(new SensitiveAnnotationExclusionStrategy());
         }
 
+        if (options.contains(JsonOptions.EXCLUDE_BUILTIN)) {
+            bldr.addSerializationExclusionStrategy(new BuiltInServiceDocumentFieldsExclusionStrategy());
+        }
         return bldr;
     }
 
     private static void registerCommonGsonTypeAdapters(GsonBuilder bldr) {
+        bldr.registerTypeAdapter(ObjectCollectionTypeConverter.TYPE_LIST, ObjectCollectionTypeConverter.INSTANCE);
+        bldr.registerTypeAdapter(ObjectCollectionTypeConverter.TYPE_SET, ObjectCollectionTypeConverter.INSTANCE);
+        bldr.registerTypeAdapter(ObjectCollectionTypeConverter.TYPE_COLLECTION, ObjectCollectionTypeConverter.INSTANCE);
         bldr.registerTypeAdapter(ObjectMapTypeConverter.TYPE, ObjectMapTypeConverter.INSTANCE);
         bldr.registerTypeAdapter(InstantConverter.TYPE, InstantConverter.INSTANCE);
         bldr.registerTypeAdapter(ZonedDateTimeConverter.TYPE, ZonedDateTimeConverter.INSTANCE);
         bldr.registerTypeHierarchyAdapter(byte[].class, new ByteArrayToBase64TypeAdapter());
         bldr.registerTypeAdapter(RequestRouteConverter.TYPE, RequestRouteConverter.INSTANCE);
+        bldr.registerTypeHierarchyAdapter(Path.class, PathConverter.INSTANCE);
+        bldr.registerTypeHierarchyAdapter(Date.class, UtcDateTypeAdapter.INSTANCE);
     }
 
     public void toJsonHtml(Object body, Appendable appendable) {
-        for (int i = 1;; i++) {
+        if (body == null) {
+            this.compact.toJson(null, appendable);
+            return;
+        }
+
+        for (int i = 1; ; i++) {
             try {
-                this.pretty.toJson(body, appendable);
+                JsonWriter jsonWriter = makePrettyJsonWriter(appendable);
+                this.compact.toJson(body, body.getClass(), jsonWriter);
                 return;
+            } catch (IllegalStateException e) {
+                handleIllegalStateException(e, i);
+            }
+        }
+    }
+
+    private JsonWriter makePrettyJsonWriter(Appendable appendable) {
+        JsonWriter jsonWriter = new JsonWriter(Streams.writerForAppendable(appendable));
+        jsonWriter.setIndent(JSON_INDENT);
+        return jsonWriter;
+    }
+
+    public long hashJson(Object body, long seed) {
+        if (body == null) {
+            return seed;
+        }
+
+        for (int i = 1; ; i++) {
+            try {
+                HashingJsonWriter w = new HashingJsonWriter(seed);
+                this.hashing.toJson(body, body.getClass(), w);
+
+                return w.getHash();
             } catch (IllegalStateException e) {
                 handleIllegalStateException(e, i);
             }
@@ -246,7 +373,7 @@ public class JsonMapper {
             for (Annotation a : annotations) {
                 if (ServiceDocument.UsageOptions.class.equals(a.annotationType())) {
                     ServiceDocument.UsageOptions usageOptions = (ServiceDocument.UsageOptions) a;
-                    for (ServiceDocument.UsageOption usageOption: usageOptions.value()) {
+                    for (ServiceDocument.UsageOption usageOption : usageOptions.value()) {
                         if (usageOption.option().equals(ServiceDocumentDescription.PropertyUsageOption.SENSITIVE)) {
                             return true;
                         }
@@ -271,6 +398,19 @@ public class JsonMapper {
         @Override
         public boolean shouldSkipClass(Class<?> aClass) {
             return false;
+        }
+    }
+
+    /** Excludes all "built-in" fields, such as {@code documentVersion}. */
+    private static class BuiltInServiceDocumentFieldsExclusionStrategy implements ExclusionStrategy {
+        @Override
+        public boolean shouldSkipClass(Class<?> aClass) {
+            return false;
+        }
+
+        @Override
+        public boolean shouldSkipField(FieldAttributes fieldAttributes) {
+            return ServiceDocument.isBuiltInDocumentField(fieldAttributes.getName());
         }
     }
 }

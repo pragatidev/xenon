@@ -37,6 +37,7 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SupportedCipherSuiteFilter;
 
+import com.vmware.xenon.common.NamedThreadFactory;
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.SocketContext;
 import com.vmware.xenon.common.ServiceHost;
@@ -75,6 +76,7 @@ public class NettyHttpListener implements ServiceRequestListener {
     private NioEventLoopGroup eventLoopGroup;
     private ExecutorService nettyExecutorService;
     private SslContext sslContext;
+    private boolean secureAuthCookie;
     private ChannelHandler childChannelHandler;
     private boolean isListening;
     private int responsePayloadSizeLimit = RESPONSE_PAYLOAD_SIZE_LIMIT;
@@ -98,16 +100,14 @@ public class NettyHttpListener implements ServiceRequestListener {
     }
 
     @Override
-    public void start(int port, String bindAddress) throws Throwable {
+    public void start(int port, String bindAddress) throws Exception {
         this.nettyExecutorService = Executors.newFixedThreadPool(EVENT_LOOP_THREAD_COUNT,
-                r -> new Thread(r, this.host.getUri().toString() + "/netty-listener/"
-                        + this.host.getId()));
+                new NamedThreadFactory(this.host.getUri() + "/netty-listener"));
 
         this.eventLoopGroup = new NioEventLoopGroup(EVENT_LOOP_THREAD_COUNT, this.nettyExecutorService);
         if (this.childChannelHandler == null) {
             this.childChannelHandler = new NettyHttpServerInitializer(this, this.host,
-                    this.sslContext,
-                    this.responsePayloadSizeLimit);
+                    this.sslContext, this.responsePayloadSizeLimit, this.secureAuthCookie);
         }
 
         ServerBootstrap b = new ServerBootstrap();
@@ -173,7 +173,7 @@ public class NettyHttpListener implements ServiceRequestListener {
                 c.config().setAutoRead(true);
             }
             op.complete();
-        } catch (Throwable e) {
+        } catch (Exception e) {
             op.fail(e);
         }
     }
@@ -212,12 +212,12 @@ public class NettyHttpListener implements ServiceRequestListener {
     }
 
     @Override
-    public void setSSLContextFiles(URI certFile, URI keyFile) throws Throwable {
+    public void setSSLContextFiles(URI certFile, URI keyFile) throws Exception {
         setSSLContextFiles(certFile, keyFile, null);
     }
 
     @Override
-    public void setSSLContextFiles(URI certFile, URI keyFile, String keyPassphrase) throws Throwable {
+    public void setSSLContextFiles(URI certFile, URI keyFile, String keyPassphrase) throws Exception {
         if (isListening()) {
             throw new IllegalStateException("listener already started");
         }
@@ -259,5 +259,18 @@ public class NettyHttpListener implements ServiceRequestListener {
     @Override
     public int getResponsePayloadSizeLimit() {
         return this.responsePayloadSizeLimit;
+    }
+
+    @Override
+    public boolean getSecureAuthCookie() {
+        return this.secureAuthCookie;
+    }
+
+    @Override
+    public void setSecureAuthCookie(boolean secureAuthCookie) {
+        if (isListening()) {
+            throw new IllegalStateException("Already started listening");
+        }
+        this.secureAuthCookie = secureAuthCookie;
     }
 }

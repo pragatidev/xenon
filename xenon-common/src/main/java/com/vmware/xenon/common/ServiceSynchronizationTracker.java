@@ -35,7 +35,6 @@ import com.vmware.xenon.common.ServiceMaintenanceRequest.MaintenanceReason;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
 import com.vmware.xenon.services.common.NodeGroupService;
 import com.vmware.xenon.services.common.NodeGroupService.NodeGroupState;
-import com.vmware.xenon.services.common.NodeGroupUtils;
 import com.vmware.xenon.services.common.NodeSelectorSynchronizationService.SynchronizePeersRequest;
 import com.vmware.xenon.services.common.ServiceUriPaths;
 
@@ -151,60 +150,56 @@ class ServiceSynchronizationTracker {
     }
 
     void failWithNotFoundOrSynchronize(Service parent, String path, Operation op) {
-        CompletionHandler ch = (completedOp, ex) -> {
-            if (ex != null) {
-                this.host.log(Level.INFO,
-                        "Service %s not found on owner. On-demand synchronizing.", op.getUri());
-                // Factory service is not available. This indicates that the node-group
-                // hasn't reached steady state for this factory. We kick-off on-demand
-                // synchronization.
-                String documentSelfLink = UriUtils.getLastPathSegment(op.getUri());
-                sendSynchRequest(parent.getUri(), documentSelfLink, (o, e) -> {
-                    if (e == null) {
-                        // Service was found on a remote peer and has been
-                        // synchronized successfully. We go ahead and retry
-                        // the original request now.
-                        this.host.handleRequest(null, op);
-                        return;
-                    }
+        // Because the service uses 1X replication, we don't need to synchronize it on-demand.
+        if (parent.getPeerNodeSelectorPath().equals(ServiceUriPaths.DEFAULT_1X_NODE_SELECTOR)) {
+            Operation.failServiceNotFound(op);
+            return;
+        }
 
-                    boolean markedDeleted = false;
-                    boolean notFound = o.getStatusCode() == Operation.STATUS_CODE_NOT_FOUND;
+        this.host.log(Level.INFO,
+                "Service %s not found on owner. On-demand synchronizing.", op.getUri());
 
-                    if (o.getStatusCode() == Operation.STATUS_CODE_CONFLICT) {
-                        if (o.hasBody()) {
-                            ServiceErrorResponse error = o.getBody(ServiceErrorResponse.class);
-                            markedDeleted = error.getErrorCode() ==
-                                    ServiceErrorResponse.ERROR_CODE_STATE_MARKED_DELETED;
-                        }
-                    }
+        String documentSelfLink;
+        if (ServiceHost.isHelperServicePath(op.getUri().getPath())) {
+            documentSelfLink = UriUtils.getLastPathSegment(
+                    UriUtils.getParentPath(op.getUri().getPath()));
+        } else {
+            documentSelfLink = UriUtils.getLastPathSegment(op.getUri().getPath());
+        }
 
-                    if (notFound || markedDeleted) {
-                        if (op.getAction() == Action.DELETE) {
-                            // do not queue DELETE actions for services not present, complete with success
-                            op.complete();
-                            return;
-                        }
-                        this.host.failRequestServiceNotFound(op);
-                        return;
-                    }
-
-                    this.host.log(Level.SEVERE, "Failed to synch service not found on owner. Failure: %s", e);
-                    op.fail(e);
-                });
+        sendSynchRequest(parent.getUri(), documentSelfLink, (o, e) -> {
+            if (e == null) {
+                // Service was found on a remote peer and has been
+                // synchronized successfully. We go ahead and retry
+                // the original request now.
+                this.host.handleRequest(null, op);
                 return;
             }
 
-            if (op.getAction() == Action.DELETE) {
-                op.complete();
+            boolean markedDeleted = false;
+            boolean notFound = o.getStatusCode() == Operation.STATUS_CODE_NOT_FOUND;
+
+            if (o.getStatusCode() == Operation.STATUS_CODE_CONFLICT) {
+                if (o.hasBody()) {
+                    ServiceErrorResponse error = o.getBody(ServiceErrorResponse.class);
+                    markedDeleted = error.getErrorCode() ==
+                            ServiceErrorResponse.ERROR_CODE_STATE_MARKED_DELETED;
+                }
+            }
+
+            if (notFound || markedDeleted) {
+                if (op.getAction() == Action.DELETE) {
+                    // do not queue DELETE actions for services not present, complete with success
+                    op.complete();
+                    return;
+                }
+                Operation.failServiceNotFound(op);
                 return;
             }
-            // Since the factory is marked available, we assume steady state for the node-group
-            // and fail the request with NOT-FOUND.
-            this.host.failRequestServiceNotFound(op);
-        };
 
-        NodeGroupUtils.checkServiceAvailability(ch, parent);
+            this.host.log(Level.SEVERE, "Failed to synch service not found on owner. Failure: %s", e);
+            op.fail(e);
+        });
     }
 
     private void sendSynchRequest(URI parentUri, String documentSelfLink, CompletionHandler ch) {
@@ -231,19 +226,26 @@ class ServiceSynchronizationTracker {
      * This method is called in the following cases:
      *
      * 1) Synchronization of a factory service, due to node group change. This includes
-     * synchronization after host restart. In this case isFactorySync is true and we proceed
-     * with synchronizing state on behalf of the factory, even if the local node is not owner
-     * for the specific child service. This solves the case where a new node is elected owner
-     * for a factory but does not have any services
+     * synchronization after host restart. Since factory synchronization uses SYNCH_OWNER
+     * request that is ONLY sent to the document owner, this function will not be executed
+     * on non-owner nodes (during factory synchronization).
      *
      * 2) Synchronization due to conflict on epoch, version or owner, on a specific stateful
      * service instance. The service instance will call this method to synchronize peers.
      *
-     * Note that case 1) actually causes PUTs to be send out, which implicitly invokes 2). Its
-     * this recursion that we need to break which is why we check in the completion below if
-     * the rsp.isLocalHostOwner == true || isFactorySync.
+     * 3) When an On-demand load service is re-started due to an incoming request.
+     *
+     * Note that case 1) actually causes SYNCH_PEER requests to be sent out to peers, that can
+     * implicitly invoke case 2). That's because a SYNCH_PEER POST request is converted to a PUT
+     * on the peer node and is forwarded to the StatefulService. Validating ownership in this
+     * method is critical to avoid recursive loops between OWNER and PEERs trying to synchronize
+     * each other endlessly.
+     *
+     * Also note that the SYNCH_OWNER request since it is only sent to owner nodes, it is
+     * not really required to again validate document ownership in this method. So, a future
+     * optimization could be to skip ownership validation for case 1) ONLY.
      */
-    void selectServiceOwnerAndSynchState(Service s, Operation op, boolean isFactorySync) {
+    void selectServiceOwnerAndSynchState(Service s, Operation op) {
         CompletionHandler c = (o, e) -> {
             if (e != null) {
                 this.host.log(Level.WARNING, "Failure partitioning %s: %s", op.getUri(),
@@ -265,7 +267,7 @@ class ServiceSynchronizationTracker {
 
             s.toggleOption(ServiceOption.DOCUMENT_OWNER, rsp.isLocalHostOwner);
 
-            if (ServiceHost.isServiceCreate(op) || (!isFactorySync && !rsp.isLocalHostOwner)) {
+            if (ServiceHost.isServiceCreate(op) || !rsp.isLocalHostOwner) {
                 // if this is from a client, do not synchronize. an conflict can be resolved
                 // when we attempt to replicate the POST.
                 // if this is synchronization attempt and we are not the owner, do nothing
@@ -291,6 +293,7 @@ class ServiceSynchronizationTracker {
         // (or the most valid one, depending on peer consensus)
 
         SynchronizePeersRequest t = SynchronizePeersRequest.create();
+        t.indexLink = s.getDocumentIndexPath();
         t.stateDescription = this.host.buildDocumentDescription(s);
         t.options = s.getOptions();
         t.state = op.hasBody() ? op.getBody(s.getStateType()) : null;
@@ -309,7 +312,7 @@ class ServiceSynchronizationTracker {
             ServiceDocument template = null;
             try {
                 template = s.getStateType().newInstance();
-            } catch (Throwable e) {
+            } catch (Exception e) {
                 this.host.log(Level.SEVERE, "Could not create instance state type: %s",
                         e.toString());
                 op.fail(e);
@@ -329,10 +332,8 @@ class ServiceSynchronizationTracker {
         op.removePragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_OWNER);
 
         CompletionHandler c = (o, e) -> {
-            ServiceDocument selectedState = null;
-
             if (this.host.isStopping()) {
-                op.fail(new CancellationException());
+                op.fail(new CancellationException("Host is stopping"));
                 return;
             }
 
@@ -342,27 +343,27 @@ class ServiceSynchronizationTracker {
                 return;
             }
 
-            if (o.hasBody()) {
-                selectedState = o.getBody(s.getStateType());
-            } else {
+            if (!o.hasBody()) {
                 // peers did not have a better state to offer
-                op.linkState(null);
+                if (ServiceDocument.isDeleted(t.state)) {
+                    Operation.failServiceMarkedDeleted(t.state.documentSelfLink, op);
+                    return;
+                }
+
+                // avoid duplicate document version on owner
+                op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE);
+
                 op.complete();
                 return;
             }
 
+            ServiceDocument selectedState = o.getBody(s.getStateType());
+            boolean isVersionSame = ServiceDocument
+                    .compare(selectedState, t.state, t.stateDescription, Utils.getTimeComparisonEpsilonMicros())
+                    .contains(ServiceDocument.DocumentRelationship.EQUAL_VERSION);
+
             if (ServiceDocument.isDeleted(selectedState)) {
-                Exception ex = new IllegalStateException(
-                        "Document marked deleted by peers: " + s.getSelfLink());
-                ServiceErrorResponse rsp = ServiceErrorResponse.create(ex, Operation.STATUS_CODE_CONFLICT);
-                rsp.setInternalErrorCode(ServiceErrorResponse.ERROR_CODE_STATE_MARKED_DELETED);
-                op.setStatusCode(Operation.STATUS_CODE_CONFLICT);
-                op.fail(ex, rsp);
-
-                boolean isVersionSame = ServiceDocument
-                        .compare(selectedState, t.state, t.stateDescription, Utils.getTimeComparisonEpsilonMicros())
-                        .contains(ServiceDocument.DocumentRelationship.EQUAL_VERSION);
-
+                Operation.failServiceMarkedDeleted(t.state.documentSelfLink, op);
                 // Only save the document, if the selected state is a newer version of the document
                 // than the local copy.
                 if (!isVersionSame ) {
@@ -377,6 +378,11 @@ class ServiceSynchronizationTracker {
 
             // indicate that synchronization occurred, we got an updated state from peers
             op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_SYNCH_PEER);
+
+            if (isVersionSame) {
+                // avoid duplicate document version on owner
+                op.addPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE);
+            }
 
             // The remote peers have a more recent state than the one we loaded from the store.
             // Use the peer service state as the initial state. Also update the linked state,
@@ -542,15 +548,6 @@ class ServiceSynchronizationTracker {
             Long lastSynchTime = en.getValue();
 
             if (lastSynchTime >= selectorSynchTime) {
-                continue;
-            }
-
-            if (this.synchronizationActiveServices.get(link) != null) {
-                // service actively synchronizing, do not re-schedule
-                this.host.log(Level.WARNING, "Skipping synch for service %s, already in progress",
-                        link);
-                // service can cancel a pending synchronization if it detects node group has
-                // changed since it started synchronization for the current epoch
                 continue;
             }
 

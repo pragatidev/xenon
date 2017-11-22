@@ -41,7 +41,6 @@ import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.LinkedList;
@@ -65,9 +64,9 @@ public final class FileUtils {
     }
 
     public static class ContentRange {
-        long start;
-        long end;
-        long fileSize;
+        public long start;
+        public long end;
+        public long fileSize;
 
         public static final int CHUNK_SIZE = 512 * 1024;
         public static final int MAX_IN_FLIGHT_CHUNKS = 10;
@@ -80,13 +79,13 @@ public final class FileUtils {
         private static final String RANGE_PATTERN = "=(\\d*)[-](\\d*)";
         private static final Pattern rangePattern = Pattern.compile(RANGE_PATTERN);
 
-        ContentRange() {
+        public ContentRange() {
             this.start = 0;
             this.end = CHUNK_SIZE;
             this.fileSize = 0;
         }
 
-        ContentRange(String headerString) {
+        public ContentRange(String headerString) {
             if (headerString == null || headerString.isEmpty()) {
                 return;
             }
@@ -100,13 +99,13 @@ public final class FileUtils {
             this.fileSize = Long.parseLong(m.group(3));
         }
 
-        ContentRange(int start, int end, int fileSize) {
+        public ContentRange(int start, int end, int fileSize) {
             this.start = start;
             this.end = Integer.min(end, fileSize);
             this.fileSize = fileSize;
         }
 
-        ContentRange(int fileSize) {
+        public ContentRange(int fileSize) {
             this.start = 0;
             this.end = Integer.min(fileSize, CHUNK_SIZE);
             this.fileSize = fileSize;
@@ -307,7 +306,7 @@ public final class FileUtils {
                 }
                 files.add(f);
             }
-        } catch (Throwable e) {
+        } catch (Exception e) {
             Logger.getAnonymousLogger().warning(Utils.toString(e));
         }
         return files;
@@ -461,7 +460,7 @@ public final class FileUtils {
                                     op.setContentLength(bb.limit());
                                 }
                                 op.complete();
-                            } catch (Throwable e) {
+                            } catch (Exception e) {
                                 failed(e, v);
                             }
                         }
@@ -472,7 +471,7 @@ public final class FileUtils {
                             op.fail(arg0);
                         }
                     });
-        } catch (Throwable e) {
+        } catch (Exception e) {
             if (channel != null) {
                 closeFileChannelSafe(channel);
             }
@@ -509,7 +508,7 @@ public final class FileUtils {
                         }
 
                     });
-        } catch (Throwable e) {
+        } catch (Exception e) {
             closeFileChannelSafe(channel);
             op.fail(e);
         }
@@ -527,9 +526,9 @@ public final class FileUtils {
     /**
      * GET a file.
      *
-     * @param h  ServiceClient used to connect to the host
+     * @param h   ServiceClient used to connect to the host
      * @param get The Operation used to GET the given file URI
-     * @param f File to write to
+     * @param f   File to write to
      * @throws IOException
      */
     public static void getFile(ServiceClient h, final Operation get, File f) throws IOException {
@@ -553,7 +552,7 @@ public final class FileUtils {
                                 f.toString()));
                 // no content ranges
                 writeBody(get, o, ch, bytesWritten);
-            } catch (Throwable ex) {
+            } catch (Exception ex) {
                 get.fail(ex);
             }
 
@@ -580,7 +579,7 @@ public final class FileUtils {
             AsynchronousFileChannel ch,
             AtomicInteger bytesWritten) {
 
-        final ContentRange[] range = { nextRange };
+        final ContentRange[] range = {nextRange};
         for (int chunksInFlight = 0; (chunksInFlight < ContentRange.MAX_IN_FLIGHT_CHUNKS)
                 && !range[0].isDone(); chunksInFlight++) {
 
@@ -604,18 +603,17 @@ public final class FileUtils {
                                         getChunks(h, range[0], parentGet, ch,
                                                 bytesWritten);
                                     }
-                                } catch (Throwable exx) {
+                                } catch (Exception exx) {
                                     parentGet.fail(exx);
                                 }
                             });
 
             h.send(nextGet);
         }
-
     }
 
     private static void writeBody(Operation parentOp, Operation o, AsynchronousFileChannel ch,
-            AtomicInteger bytesWritten) throws Throwable {
+            AtomicInteger bytesWritten) throws Exception {
 
         byte[] b = (byte[]) o.getBodyRaw();
         if (b == null || b.length == 0) {
@@ -653,15 +651,14 @@ public final class FileUtils {
                         parentOp.fail(exc);
                     }
                 });
-
     }
 
     /**
      * Given a POST operation and a File, post the file to the URI.
      *
-     * @param h ServiceClient
+     * @param h   ServiceClient
      * @param put Operation used to PUT the file at the given URL
-     * @param f File to put
+     * @param f   File to put
      * @throws IOException
      */
     public static void putFile(ServiceClient h, final Operation put, File f) throws IOException {
@@ -671,7 +668,7 @@ public final class FileUtils {
         AtomicInteger completionCount = new AtomicInteger(0);
         String contentType = FileUtils.getContentType(f.toURI());
 
-        final boolean[] fileIsDone = { false };
+        final boolean[] fileIsDone = {false};
 
         putChunks(h, put, ch, contentType, f.length(), 0, completionCount, fileIsDone);
     }
@@ -736,7 +733,7 @@ public final class FileUtils {
                                 }
 
                                 h.send(rangePut);
-                            } catch (Throwable e) {
+                            } catch (Exception e) {
                                 failed(e, r);
                             }
                         }
@@ -750,7 +747,7 @@ public final class FileUtils {
                         private void close(AsynchronousFileChannel channel) {
                             try {
                                 channel.close();
-                            } catch (Throwable e) {
+                            } catch (Exception e) {
                                 Logger.getAnonymousLogger().log(Level.WARNING,
                                         String.format("PUT of file failed %s",
                                                 e.toString()));
@@ -769,11 +766,14 @@ public final class FileUtils {
      *
      * Infrastructure use only!!!  Do not use in production without spinning your own thread.
      */
-    public static URI zipFiles(List<URI> inFiles, String outFileName) throws Exception {
+    public static URI zipFiles(List<URI> inFiles, String outFileName) throws IOException {
+        File zipFile = File.createTempFile(outFileName, ".zip", null);
+        return zipFiles(inFiles, zipFile);
+    }
+
+    public static URI zipFiles(List<URI> inFiles, File zipFile) throws IOException {
         byte[] buffer = new byte[4096]; // Create a buffer for copying
         int bytes_read;
-
-        File zipFile = File.createTempFile(outFileName, ".zip", null);
 
         // Create a stream to compress data and write it to the zipfile
         ZipOutputStream out = new ZipOutputStream(new FileOutputStream(zipFile));
@@ -808,7 +808,7 @@ public final class FileUtils {
 
         Logger.getAnonymousLogger().info(
                 String.format("backup written to %s (bytes:%s md5sum:%s)", zipFile,
-                        zipFile.length(), md5sum(zipFile)));
+                        zipFile.length(), md5sumSafely(zipFile)));
 
         return zipFile.toURI();
     }
@@ -829,10 +829,9 @@ public final class FileUtils {
             // walk the zip file tree and copy files to the destination
             Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
                 @Override
-                public FileVisitResult visitFile(Path file,
-                        BasicFileAttributes attrs) throws IOException {
-                    final Path destFile = Paths.get(destDir.toString(),
-                            file.toString());
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    // due to ProviderMismatchException, need to construct a Path based on string
+                    Path destFile = Paths.get(destDir.toString(), file.toString());
 
                     Logger.getAnonymousLogger().info("Extracting file " + destFile);
                     Files.copy(file, destFile, StandardCopyOption.REPLACE_EXISTING);
@@ -851,6 +850,14 @@ public final class FileUtils {
                     return FileVisitResult.CONTINUE;
                 }
             });
+        }
+    }
+
+    private static String md5sumSafely(File f) {
+        try {
+            return md5sum(f);
+        } catch (Exception e) {
+            return "";
         }
     }
 
@@ -880,18 +887,11 @@ public final class FileUtils {
         Properties properties = new Properties();
         try {
             properties.load(url.openStream());
-        } catch (Throwable e) {
+        } catch (Exception e) {
             String message = String.format("Unable to load properties from %s", url.toString());
             throw new IOException(message, e);
         }
         return properties;
     }
 
-    public static List<URI> filesToUris(String parentDir, Collection<String> files) {
-        ArrayList<URI> fileUris = new ArrayList<>();
-        for (String f : files) {
-            fileUris.add(new File(parentDir, f).toURI());
-        }
-        return fileUris;
-    }
 }

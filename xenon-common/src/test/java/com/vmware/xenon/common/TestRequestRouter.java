@@ -14,14 +14,19 @@
 package com.vmware.xenon.common;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.net.URI;
+
+import java.util.Collections;
+import java.util.List;
 
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import com.vmware.xenon.common.OperationProcessingChain.FilterReturnCode;
 import com.vmware.xenon.common.Service.Action;
 
 class RequestBody {
@@ -64,13 +69,25 @@ public class TestRequestRouter {
         for (int i = 0; i < NUM; i++) {
             String uri = i % 2 == 0 ? "http://localhost/?action=doX"
                     : "http://localhost/?action=doY";
-            if (this.router.test(Operation.createPatch(new URI(uri)))) {
+            if (this.router.processRequest(Operation.createPatch(new URI(uri)), null) == FilterReturnCode.CONTINUE_PROCESSING) {
                 fail("route not found");
             }
         }
 
         assertEquals(NUM / 2, this.xCount);
         assertEquals(NUM / 2, this.yCount);
+
+        // Test the serialize and deserialize of Routes
+        List<RequestRouter.Route> routes = this.router.getRoutes().get(Action.PATCH);
+        RequestRouter.Route r = routes.get(0);
+
+        String routeSer = Utils.toJson(r);
+        assertTrue(routeSer.contains("condition"));
+        // Deserialize of route
+        RequestRouter.Route route = Utils.fromJson(routeSer, RequestRouter.Route.class);
+        assertTrue(route.parameters.size() == 1);
+        assertEquals("doX", route.parameters.get(0).value);
+        assertEquals(RequestRouter.ParamDef.QUERY, route.parameters.get(0).paramDef);
     }
 
     @Test
@@ -97,7 +114,8 @@ public class TestRequestRouter {
                 break;
             }
 
-            if (this.router.test(Operation.createPatch(new URI("http://localhost/")).setBody(body))) {
+            if (this.router.processRequest(Operation.createPatch(new URI("http://localhost/")).setBody(body),
+                    null) == FilterReturnCode.CONTINUE_PROCESSING) {
                 this.zCount++;
             }
         }
@@ -105,6 +123,69 @@ public class TestRequestRouter {
         assertEquals(NUM / 3, this.xCount);
         assertEquals(NUM / 3, this.yCount);
         assertEquals(NUM / 3, this.zCount);
+
+        // Test the serialize and deserialize of Routes
+        List<RequestRouter.Route> routes = this.router.getRoutes().get(Action.PATCH);
+        RequestRouter.Route r = routes.get(0);
+
+        String routeSer = Utils.toJson(r);
+        assertTrue(routeSer.contains("condition"));
+        // Deserialize of route
+        RequestRouter.Route route = Utils.fromJson(routeSer, RequestRouter.Route.class);
+        assertTrue(route.parameters.size() == 1);
+        assertEquals("X", route.parameters.get(0).value);
+        assertEquals(RequestRouter.ParamDef.BODY, route.parameters.get(0).paramDef);
+    }
+
+    @Test
+    public void testRouteSerializationWithEmptyCondition() {
+        RequestRouter.Route route = new RequestRouter.Route();
+        route.action = Action.PATCH;
+        route.description = "Testing Empty Matcher";
+
+        String routeSer = Utils.toJson(route);
+        assertTrue(routeSer.contains(route.description));
+        assertTrue(!routeSer.contains("condition"));
+        RequestRouter.Route routeDeserialize = Utils.fromJson(routeSer, RequestRouter.Route.class);
+        assertEquals(route.action, routeDeserialize.action);
+        assertEquals(route.description, routeDeserialize.description);
+        assertEquals(null, routeDeserialize.parameters);
+    }
+
+    @Test
+    public void testRouteSerializationWithParameters() {
+        RequestRouter.Route route = new RequestRouter.Route();
+        route.action = Action.PATCH;
+        route.description = "Testing Empty Matcher";
+        route.parameters = Collections.singletonList(new RequestRouter.Parameter("key", "desc",
+                ServiceDocumentDescription.TypeName.STRING.name(), false, "value",
+                RequestRouter.ParamDef.BODY));
+
+        String routeSer = Utils.toJson(route);
+        assertTrue(routeSer.contains(route.description));
+        assertTrue(!routeSer.contains("condition"));
+        assertTrue(routeSer.contains("parameters"));
+        RequestRouter.Route routeDeserialize = Utils.fromJson(routeSer, RequestRouter.Route.class);
+        assertEquals(route.action, routeDeserialize.action);
+        assertEquals(route.description, routeDeserialize.description);
+        assertEquals(1, routeDeserialize.parameters.size());
+    }
+
+    @Test
+    public void testSerializationWithPath() {
+        RequestRouter.Route route = new RequestRouter.Route();
+        route.action = Action.PATCH;
+        route.description = "Testing Empty Matcher";
+        route.path = "/subresource";
+
+        String routeSer = Utils.toJson(route);
+        assertTrue(routeSer.contains(route.description));
+        assertTrue(routeSer.contains("path"));
+
+        RequestRouter.Route routeDeserialize = Utils.fromJson(routeSer, RequestRouter.Route.class);
+        assertEquals(route.action, routeDeserialize.action);
+        assertEquals(route.description, routeDeserialize.description);
+        assertEquals(route.path, routeDeserialize.path);
     }
 
     private void doX(Operation op) {

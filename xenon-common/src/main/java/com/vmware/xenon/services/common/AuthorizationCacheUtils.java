@@ -16,7 +16,6 @@ package com.vmware.xenon.services.common;
 import java.util.EnumSet;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
-
 import java.util.logging.Level;
 
 import com.vmware.xenon.common.Operation;
@@ -27,6 +26,7 @@ import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentQueryResult;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.config.XenonConfiguration;
 import com.vmware.xenon.services.common.AuthorizationTokenCacheService.AuthorizationTokenCacheServiceState;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.QueryTask.Query.Builder;
@@ -35,6 +35,12 @@ import com.vmware.xenon.services.common.RoleService.RoleState;
 import com.vmware.xenon.services.common.UserGroupService.UserGroupState;
 
 public final class AuthorizationCacheUtils {
+
+    private static final int resultLimit = XenonConfiguration.integer(
+            AuthorizationCacheUtils.class,
+            "defaultResultLimit",
+            1000
+    );
 
     private AuthorizationCacheUtils() {
 
@@ -103,6 +109,7 @@ public final class AuthorizationCacheUtils {
             QueryTask queryTask = new QueryTask();
             queryTask.querySpec = new QuerySpecification();
             queryTask.querySpec.query = userGroupState.query;
+            queryTask.querySpec.resultLimit = resultLimit;
             queryTask.setDirect(true);
             Operation postOp = Operation.createPost(s, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS)
                     .setBody(queryTask)
@@ -113,33 +120,57 @@ public final class AuthorizationCacheUtils {
                         }
                         QueryTask queryTaskResult = queryOp.getBody(QueryTask.class);
                         ServiceDocumentQueryResult result = queryTaskResult.results;
-                        if (result.documentLinks == null || result.documentLinks.isEmpty()) {
+                        if (result == null || result.nextPageLink == null) {
                             op.complete();
                             return;
                         }
-                        AtomicInteger completionCount = new AtomicInteger(0);
-                        CompletionHandler handler = (clearOp, clearEx) -> {
-                            if (clearEx != null) {
-                                s.getHost().log(Level.SEVERE, Utils.toString(clearEx));
-                                op.fail(clearEx);
-                                return;
-                            }
-                            if (completionCount.incrementAndGet() == result.documentLinks.size()) {
-                                op.complete();
-                            }
-                        };
-                        for (String userLink : result.documentLinks) {
-                            Operation clearUserOp = new Operation();
-                            clearUserOp.setUri(UriUtils.buildUri(s.getHost(), userLink));
-                            clearUserOp.setCompletion(handler);
-                            clearAuthzCacheForUser(s, clearUserOp);
-                            clearUserOp.complete();
-                        }
-                    }
-                );
+                        handleClearAuthzCacheForUserGroupQueryCompletion(s, op, result.nextPageLink);
+                    });
+
             s.setAuthorizationContext(postOp, s.getSystemAuthorizationContext());
             s.sendRequest(postOp);
         });
+    }
+
+    private static void handleClearAuthzCacheForUserGroupQueryCompletion(Service s, Operation op, String nextPageLink) {
+        Operation getOp = Operation.createGet(s, nextPageLink)
+                .setCompletion((queryOp, queryEx) -> {
+                    if (queryEx != null) {
+                        op.fail(queryEx);
+                        return;
+                    }
+                    QueryTask queryTaskResult = queryOp.getBody(QueryTask.class);
+                    ServiceDocumentQueryResult result = queryTaskResult.results;
+                    if (result.documentLinks == null || result.documentLinks.isEmpty()) {
+                        op.complete();
+                        return;
+                    }
+                    AtomicInteger completionCount = new AtomicInteger(0);
+                    CompletionHandler handler = (clearOp, clearEx) -> {
+                        if (clearEx != null) {
+                            s.getHost().log(Level.SEVERE, Utils.toString(clearEx));
+                            op.fail(clearEx);
+                            return;
+                        }
+                        if (completionCount.incrementAndGet() == result.documentLinks.size()) {
+                            if (result.nextPageLink == null) {
+                                op.complete();
+                            } else {
+                                handleClearAuthzCacheForUserGroupQueryCompletion(s, op, result.nextPageLink);
+                            }
+                        }
+                    };
+                    for (String userLink : result.documentLinks) {
+                        Operation clearUserOp = new Operation();
+                        clearUserOp.setUri(UriUtils.buildUri(s.getHost(), userLink));
+                        clearUserOp.setCompletion(handler);
+                        clearAuthzCacheForUser(s, clearUserOp);
+                        clearUserOp.complete();
+                    }
+                });
+
+        s.setAuthorizationContext(getOp, s.getSystemAuthorizationContext());
+        s.sendRequest(getOp);
     }
 
     /**
@@ -212,6 +243,7 @@ public final class AuthorizationCacheUtils {
             queryTask.querySpec.options =
                     EnumSet.of(QueryTask.QuerySpecification.QueryOption.EXPAND_CONTENT);
             queryTask.querySpec.query = resourceGroupQuery;
+            queryTask.querySpec.resultLimit = resultLimit;
             queryTask.setDirect(true);
             Operation postOp = Operation.createPost(s, ServiceUriPaths.CORE_LOCAL_QUERY_TASKS)
                     .setBody(queryTask)
@@ -223,32 +255,56 @@ public final class AuthorizationCacheUtils {
 
                         QueryTask queryTaskResult = queryOp.getBody(QueryTask.class);
                         ServiceDocumentQueryResult result = queryTaskResult.results;
-                        if (result.documents == null || result.documents.isEmpty()) {
+                        if (result == null || result.nextPageLink == null) {
                             op.complete();
                             return;
                         }
-                        AtomicInteger completionCount = new AtomicInteger(0);
-                        CompletionHandler handler = (subOp, subEx) -> {
-                            if (subEx != null) {
-                                op.fail(subEx);
-                                return;
-                            }
-                            if (completionCount.incrementAndGet() == result.documents.size()) {
-                                op.complete();
-                            }
-                        };
-                        for (Object doc : result.documents.values()) {
-                            RoleState roleState = Utils.fromJson(doc, RoleState.class);
-                            Operation roleOp = new Operation();
-                            roleOp.setCompletion(handler);
-                            clearAuthzCacheForRole(s, roleOp, roleState);
-                            roleOp.complete();
-                        }
-                    }
-                );
+                        handleClearAuthzCacheForResourceGroupQueryCompletion(s, op, result.nextPageLink);
+                    });
             s.setAuthorizationContext(postOp, s.getSystemAuthorizationContext());
             s.sendRequest(postOp);
         });
+    }
+
+    private static void handleClearAuthzCacheForResourceGroupQueryCompletion(Service s, Operation op,
+            String nextPageLink) {
+        Operation getOp = Operation.createGet(s, nextPageLink)
+                .setCompletion((queryOp, queryEx) -> {
+                    if (queryEx != null) {
+                        op.fail(queryEx);
+                        return;
+                    }
+
+                    QueryTask queryTaskResult = queryOp.getBody(QueryTask.class);
+                    ServiceDocumentQueryResult result = queryTaskResult.results;
+                    if (result.documents == null || result.documents.isEmpty()) {
+                        op.complete();
+                        return;
+                    }
+                    AtomicInteger completionCount = new AtomicInteger(0);
+                    CompletionHandler handler = (subOp, subEx) -> {
+                        if (subEx != null) {
+                            op.fail(subEx);
+                            return;
+                        }
+                        if (completionCount.incrementAndGet() == result.documents.size()) {
+                            if (result.nextPageLink == null) {
+                                op.complete();
+                            } else {
+                                handleClearAuthzCacheForResourceGroupQueryCompletion(s, op, result.nextPageLink);
+                            }
+                        }
+                    };
+                    for (Object doc : result.documents.values()) {
+                        RoleState roleState = Utils.fromJson(doc, RoleState.class);
+                        Operation roleOp = new Operation();
+                        roleOp.setCompletion(handler);
+                        clearAuthzCacheForRole(s, roleOp, roleState);
+                        roleOp.complete();
+                    }
+                });
+        s.setAuthorizationContext(getOp, s.getSystemAuthorizationContext());
+        s.sendRequest(getOp);
     }
 
     /**
@@ -296,24 +352,13 @@ public final class AuthorizationCacheUtils {
             return false;
         }
 
-        // For replication requests, create(POST) comes through factory service and it is not two
-        // phased.
-        // For PUT/PATCH, when requests are pending, it does NOT issue explicit commit.
-        // the next update(version N+1) is an implicit commit for version N.
-        // Therefore, we eagerly clear auth cache for PUT/PATCH.
-        // On the other hand, DELETE is always two phased. Therefore, only clear the auth cache at commit phase.
         if (op.isFromReplication()) {
-            if (op.getAction() == Action.POST) {
-                if (!op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED)) {
-                    // do not clear at restart.
-                    return false;
-                }
-            } else if (op.getAction() == Action.DELETE) {
-                if (!op.isCommit()) {
-                    return false;
-                }
+            if (op.getAction() == Action.POST && !op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_CREATED)) {
+                // do not clear at restart.
+                return false;
             }
         }
+
         return true;
     }
 

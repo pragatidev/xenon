@@ -12,11 +12,17 @@
 
      <!-- Findbugs reports that we use a hardcoded filename, but it's hardcoded resource -->
      <!-- name, which is reasonable and safe -->
-     <Match>
-       <Bug pattern="DMI_HARDCODED_ABSOLUTE_FILENAME"/>
-       <Class name="com.vmware.xenon.common.ServiceHost"/>
-       <Method name="discoverUiResources"/>
-     </Match>
+    <Match>
+      <Bug pattern="DMI_HARDCODED_ABSOLUTE_FILENAME"/>
+      <Class name="com.vmware.xenon.common.ServiceHost"/>
+      <Method name="getBaseUriPath"/>
+    </Match>
+
+    <Match>
+      <Bug pattern="ES_COMPARING_STRINGS_WITH_EQ"/>
+      <Class name="com.vmware.xenon.common.http.netty.NettyHttpClientRequestHandler"/>
+      <Method name="buildFullUri"/>
+    </Match>
 
      <!-- Findbugs reports that we call System.exit, and that's a bad practice -->
      <!-- We do it intentionally in /core/management, so we disable the warning -->
@@ -24,5 +30,12 @@
        <Bug pattern="DM_EXIT"/>
        <Class name="com.vmware.xenon.services.common.ServiceHostManagementService"/>
        <Method name="handleDelete"/>
+     </Match>
+
+     <!-- bug in findbugs -->
+     <Match>
+       <Bug pattern="NP_NONNULL_PARAM_VIOLATION"/>
+       <Class name="com.vmware.xenon.common.ServiceHost"/>
+       <Method name="allocateExecutors"/>
      </Match>
 </FindBugsFilter>

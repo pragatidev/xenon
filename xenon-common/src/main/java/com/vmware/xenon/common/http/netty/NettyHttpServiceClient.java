@@ -16,6 +16,7 @@ package com.vmware.xenon.common.http.netty;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.EnumSet;
+import java.util.Map;
 import java.util.Map.Entry;
 import java.util.SortedMap;
 import java.util.concurrent.CancellationException;
@@ -150,7 +151,7 @@ public class NettyHttpServiceClient implements ServiceClient {
             sc.setHttpProxy(new URI(proxy));
         }
 
-        sc.setConnectionLimitPerHost(DEFAULT_CONNECTION_LIMIT_PER_HOST);
+        sc.setPendingRequestQueueLimit(ServiceClient.DEFAULT_PENDING_REQUEST_QUEUE_LIMIT);
         sc.setConnectionLimitPerTag(ServiceClient.CONNECTION_TAG_DEFAULT,
                 DEFAULT_CONNECTIONS_PER_HOST);
         sc.setConnectionLimitPerTag(ServiceClient.CONNECTION_TAG_HTTP2_DEFAULT,
@@ -294,7 +295,17 @@ public class NettyHttpServiceClient implements ServiceClient {
             return;
         }
         // Set cookies for outbound request
-        clone.setCookies(this.cookieJar.list(clone.getUri()));
+        Map<String, String> cookies = this.cookieJar.list(clone.getUri());
+        if (cookies == null || cookies.isEmpty()) {
+            return;
+        }
+
+        Map<String, String> existingCookies = clone.getCookies();
+        if (existingCookies == null) {
+            clone.setCookies(cookies);
+        } else {
+            cookies.forEach(existingCookies::putIfAbsent);
+        }
     }
 
     private void startTracking(Operation op) {
@@ -393,12 +404,23 @@ public class NettyHttpServiceClient implements ServiceClient {
                 return;
             }
             if (e != null) {
-                op.setBody(ServiceErrorResponse.create(e, Operation.STATUS_CODE_BAD_REQUEST,
-                        EnumSet.of(ErrorDetail.SHOULD_RETRY)));
-                fail(e, op, op.getBodyRaw());
+                Object originalBody = op.getBodyRaw();
+                ServiceErrorResponse rsp = null;
+                if (o.hasBody() && (o.getBodyRaw() instanceof ServiceErrorResponse)) {
+                    rsp = (ServiceErrorResponse) o.getBodyRaw();
+                    if (rsp.details == null) {
+                        rsp.details = EnumSet.of(ErrorDetail.SHOULD_RETRY);
+                    } else {
+                        rsp.details.add(ErrorDetail.SHOULD_RETRY);
+                    }
+                } else {
+                    rsp = ServiceErrorResponse.create(e, Operation.STATUS_CODE_BAD_REQUEST,
+                            EnumSet.of(ErrorDetail.SHOULD_RETRY));
+                }
+                op.setBodyNoCloning(rsp);
+                fail(e, op, originalBody);
                 return;
             }
-            op.toggleOption(OperationOption.SOCKET_ACTIVE, true);
             sendHttpRequest(op);
         });
 
@@ -410,7 +432,7 @@ public class NettyHttpServiceClient implements ServiceClient {
     private void sendHttpRequest(Operation op) {
         final Object originalBody = op.getBodyRaw();
         try {
-            byte[] body = Utils.encodeBody(op);
+            byte[] body = Utils.encodeBody(op, true);
             if (op.getContentLength() > getRequestPayloadSizeLimit()) {
                 String error = String.format("Content length %d, limit is %d",
                         op.getContentLength(), getRequestPayloadSizeLimit());
@@ -440,7 +462,7 @@ public class NettyHttpServiceClient implements ServiceClient {
             HttpMethod method = toHttpMethod(op.getAction());
             if (body == null || body.length == 0) {
                 request = new NettyFullHttpRequest(HttpVersion.HTTP_1_1, method, pathAndQuery,
-                        Unpooled.buffer(0), false);
+                        Unpooled.EMPTY_BUFFER, false);
             } else {
                 ByteBuf content = Unpooled.wrappedBuffer(body, 0, (int) op.getContentLength());
                 request = new NettyFullHttpRequest(HttpVersion.HTTP_1_1, method, pathAndQuery,
@@ -449,7 +471,7 @@ public class NettyHttpServiceClient implements ServiceClient {
 
             HttpHeaders httpHeaders = request.headers();
 
-            /**
+            /*
              * NOTE: Pay close attention to calls that access the operation request headers, since
              * they will cause a memory allocation. We avoid the allocation by first checking if
              * the operation has any custom headers to begin with, then we check for the specific
@@ -542,6 +564,10 @@ public class NettyHttpServiceClient implements ServiceClient {
                 }
 
                 httpHeaders.add(HttpHeaderNames.HOST, op.getUri().getHost());
+            } else {
+                if (acceptValue != null) {
+                    httpHeaders.add(HttpHeaderNames.ACCEPT, acceptValue);
+                }
             }
 
             if (LOGGER.isLoggable(Level.FINEST)) {
@@ -560,14 +586,16 @@ public class NettyHttpServiceClient implements ServiceClient {
                 if (doCookieJarUpdate) {
                     updateCookieJarFromResponseHeaders(o);
                 }
+
                 // After request is sent control is transferred to the
                 // NettyHttpServerResponseHandler. The response handler will nest completions
                 // and call complete() when response is received, which will invoke this completion
                 op.complete();
             });
 
+            op.toggleOption(OperationOption.SOCKET_ACTIVE, true);
             op.getSocketContext().writeHttpRequest(request);
-        } catch (Throwable e) {
+        } catch (Exception e) {
             op.setBody(ServiceErrorResponse.create(e, Operation.STATUS_CODE_BAD_REQUEST,
                     EnumSet.of(ErrorDetail.SHOULD_RETRY)));
             fail(e, op, originalBody);
@@ -642,6 +670,7 @@ public class NettyHttpServiceClient implements ServiceClient {
             NettyChannelPool pool;
             Runnable r = null;
             if (nettyCtx.getProtocol() == NettyChannelContext.Protocol.HTTP2) {
+                nettyCtx.removeStreamForOperation(op);
                 if (this.http2SslChannelPool != null
                         && this.http2SslChannelPool.isContextInUse(nettyCtx)) {
                     pool = this.http2SslChannelPool;
@@ -670,7 +699,7 @@ public class NettyHttpServiceClient implements ServiceClient {
         }
 
         if (this.scheduledExecutor.isShutdown()) {
-            op.fail(new CancellationException());
+            op.fail(new CancellationException("Host is stopping"));
             return;
         }
 
@@ -829,29 +858,29 @@ public class NettyHttpServiceClient implements ServiceClient {
     }
 
     /**
-     * @see ServiceClient#setConnectionLimitPerHost(int)
+     * @see ServiceClient#setPendingRequestQueueLimit(int)
      */
     @Override
-    public ServiceClient setConnectionLimitPerHost(int limit) {
-        this.channelPool.setConnectionLimitPerHost(limit);
+    public ServiceClient setPendingRequestQueueLimit(int limit) {
+        this.channelPool.setPendingRequestQueueLimit(limit);
         if (this.sslChannelPool != null) {
-            this.sslChannelPool.setConnectionLimitPerHost(limit);
+            this.sslChannelPool.setPendingRequestQueueLimit(limit);
         }
         if (this.http2ChannelPool != null) {
-            this.http2ChannelPool.setConnectionLimitPerHost(limit);
+            this.http2ChannelPool.setPendingRequestQueueLimit(limit);
         }
         if (this.http2SslChannelPool != null) {
-            this.http2SslChannelPool.setConnectionLimitPerHost(limit);
+            this.http2SslChannelPool.setPendingRequestQueueLimit(limit);
         }
         return this;
     }
 
     /**
-     * @see ServiceClient#getConnectionLimitPerHost()
+     * @see ServiceClient#getPendingRequestQueueLimit()
      */
     @Override
-    public int getConnectionLimitPerHost() {
-        return this.channelPool.getConnectionLimitPerHost();
+    public int getPendingRequestQueueLimit() {
+        return this.channelPool.getPendingRequestQueueLimit();
     }
 
     /**
@@ -931,7 +960,34 @@ public class NettyHttpServiceClient implements ServiceClient {
     }
 
     @Override
-    public ConnectionPoolMetrics getConnectionPoolMetrics(String tag) {
+    public ConnectionPoolMetrics getConnectionPoolMetrics(boolean http2) {
+        if (http2) {
+            return getPoolMetrics(this.http2ChannelPool, this.http2SslChannelPool);
+        } else {
+            return getPoolMetrics(this.channelPool, this.sslChannelPool);
+        }
+    }
+
+    private ConnectionPoolMetrics getPoolMetrics(NettyChannelPool p1, NettyChannelPool p2) {
+        ConnectionPoolMetrics metrics = null;
+        if (p1 != null) {
+            metrics = p1.getConnectionTagInfo(null);
+        }
+        if (p2 != null) {
+            ConnectionPoolMetrics cpm = p2.getConnectionTagInfo(null);
+            if (metrics == null) {
+                metrics = cpm;
+            } else if (cpm != null) {
+                metrics.inUseConnectionCount += cpm.inUseConnectionCount;
+                metrics.availableConnectionCount += cpm.availableConnectionCount;
+                metrics.pendingRequestCount += cpm.pendingRequestCount;
+            }
+        }
+        return metrics;
+    }
+
+    @Override
+    public ConnectionPoolMetrics getConnectionPoolMetricsPerTag(String tag) {
         if (tag == null) {
             throw new IllegalArgumentException("tag is required");
         }

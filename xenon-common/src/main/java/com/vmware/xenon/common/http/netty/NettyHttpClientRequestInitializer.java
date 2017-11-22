@@ -58,9 +58,9 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
         private NettyHttpClientRequestInitializer initializer;
         private ChannelPromise settingsPromise;
 
-        public Http2NegotiationHandler(NettyHttpClientRequestInitializer initializer,
+        Http2NegotiationHandler(NettyHttpClientRequestInitializer initializer,
                 ChannelPromise settingsPromise) {
-            super("");
+            super("Fallback protocol");
             this.initializer = initializer;
             this.settingsPromise = settingsPromise;
         }
@@ -68,12 +68,36 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
         @Override
         protected void configurePipeline(ChannelHandlerContext ctx, String protocol)
                 throws Exception {
-            if (ApplicationProtocolNames.HTTP_2.equals(protocol)) {
-                this.initializer.initializeHttp2Pipeline(ctx.pipeline(), this.settingsPromise);
-                return;
+            try {
+                if (ApplicationProtocolNames.HTTP_2.equals(protocol)) {
+                    this.initializer.initializeHttp2Pipeline(ctx.pipeline(), this.settingsPromise);
+                    return;
+                }
+                throw new IllegalStateException("Unexpected protocol: " + protocol);
+            } catch (Exception ex) {
+                log(Level.WARNING, "HTTP/2 pipeline initialization failed: %s",
+                        Utils.toString(ex));
+                ctx.close();
             }
+        }
+
+        @Override
+        protected void handshakeFailure(ChannelHandlerContext ctx, Throwable cause)
+                throws Exception {
+            log(Level.WARNING, "TLS handshake failed: %s", Utils.toString(cause));
             ctx.close();
-            throw new IllegalStateException("Unexpected protocol: " + protocol);
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause)
+                throws Exception {
+            log(Level.WARNING, "ALPN protocol negotiation failed: %s", Utils.toString(cause));
+            ctx.close();
+        }
+
+        private void log(Level level, String fmt, Object... args) {
+            Utils.log(Http2NegotiationHandler.class, Http2NegotiationHandler.class.getSimpleName(),
+                    level, fmt, args);
         }
     }
 
@@ -86,6 +110,7 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
     public static final String AGGREGATOR_HANDLER = "aggregator";
     public static final String XENON_HANDLER = "xenon";
     public static final String EVENT_LOGGER = "event-logger";
+    public static final String EVENT_STREAM_HANDLER = "event-stream-handler";
 
     private final NettyChannelPool pool;
     private boolean isHttp2Only = false;
@@ -155,13 +180,14 @@ public class NettyHttpClientRequestInitializer extends ChannelInitializer<Socket
                 p.addLast(UPGRADE_REQUEST, new UpgradeRequestHandler());
                 p.addLast("settings-handler", new Http2SettingsHandler(settingsPromise));
                 p.addLast(EVENT_LOGGER, new NettyHttp2UserEventLogger(this.debugLogging));
-            } catch (Throwable ex) {
+            } catch (Exception ex) {
                 Utils.log(NettyHttpClientRequestInitializer.class,
                         NettyHttpClientRequestInitializer.class.getSimpleName(),
                         Level.WARNING, "Channel Initializer exception: %s", ex);
                 throw ex;
             }
         } else {
+            p.addLast(EVENT_STREAM_HANDLER, new NettyHttpEventStreamHandler());
             // The HttpObjectAggregator is not needed for HTTP/2. For HTTP/1.1 it
             // aggregates the HttpMessage and HttpContent into the FullHttpResponse
             p.addLast(AGGREGATOR_HANDLER,

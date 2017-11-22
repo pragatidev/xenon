@@ -13,27 +13,34 @@
 
 package com.vmware.xenon.common;
 
+import static java.lang.String.format;
+
 import java.util.ArrayDeque;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Map.Entry;
 import java.util.NavigableMap;
 import java.util.Queue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentSkipListMap;
 
-public class RoundRobinOperationQueue {
+public final class RoundRobinOperationQueue {
 
-    public static final int INITIAL_CAPACITY = 256;
-
-    public static RoundRobinOperationQueue create() {
-        return new RoundRobinOperationQueue();
-    }
+    private static final int INITIAL_CAPACITY = 256;
 
     private final NavigableMap<String, Queue<Operation>> queues = new ConcurrentSkipListMap<>();
 
     private String activeKey = "";
 
-    private RoundRobinOperationQueue() {
+    private String description = "";
 
+    private final int limit;
+
+    private int totalCount;
+
+    public RoundRobinOperationQueue(String description, int limit) {
+        this.description = description;
+        this.limit = limit;
     }
 
     /**
@@ -41,18 +48,24 @@ public class RoundRobinOperationQueue {
      */
     public synchronized boolean offer(String key, Operation op) {
         if (key == null || op == null) {
-            throw new IllegalArgumentException("key and operation are required");
+            throw new IllegalArgumentException(format("key and operation are required (%s)", this.description));
         }
 
-        Queue<Operation> q = this.queues.computeIfAbsent(key, (k) -> new ArrayDeque<>(INITIAL_CAPACITY));
-
-        if (!q.offer(op)) {
+        if (this.totalCount >= this.limit) {
             op.setStatusCode(Operation.STATUS_CODE_UNAVAILABLE);
-            op.fail(new CancellationException("queue limit exceeded"));
+            op.fail(new CancellationException(format("Limit for queue %s exceeded: %d", this.description, this.limit)));
             return false;
         }
 
+        Queue<Operation> q = this.queues.computeIfAbsent(key, this::makeQueue);
+        q.offer(op);
+        this.totalCount++;
+
         return true;
+    }
+
+    private Queue<Operation> makeQueue(String key) {
+        return new ArrayDeque<>(INITIAL_CAPACITY);
     }
 
     /**
@@ -70,6 +83,7 @@ public class RoundRobinOperationQueue {
             this.activeKey = nextActive.getKey();
             Operation op = nextActive.getValue().poll();
             if (op != null) {
+                this.totalCount--;
                 return op;
             } else {
                 this.queues.remove(nextActive.getKey());
@@ -81,5 +95,16 @@ public class RoundRobinOperationQueue {
 
     public boolean isEmpty() {
         return this.queues.isEmpty();
+    }
+
+    public Map<String, Integer> sizesByKey() {
+        Map<String, Integer> sizes = new HashMap<>();
+        synchronized (this) {
+            for (Entry<String, Queue<Operation>> queueEntry : this.queues.entrySet()) {
+                sizes.put(queueEntry.getKey(), queueEntry.getValue().size());
+            }
+        }
+
+        return sizes;
     }
 }

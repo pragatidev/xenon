@@ -19,8 +19,9 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Map.Entry;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.logging.Level;
-
 import javax.net.ssl.SSLSession;
 
 import io.netty.buffer.ByteBuf;
@@ -30,28 +31,38 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.DefaultHttpResponse;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.QueryStringDecoder;
+import io.netty.handler.codec.http.cookie.Cookie;
+import io.netty.handler.codec.http.cookie.DefaultCookie;
+import io.netty.handler.codec.http.cookie.ServerCookieEncoder;
 import io.netty.handler.codec.http2.HttpConversionUtil;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.util.AsciiString;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.Operation.AuthorizationContext;
+import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Operation.OperationOption;
+import com.vmware.xenon.common.ServerSentEvent;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.ServiceErrorResponse;
 import com.vmware.xenon.common.ServiceHost;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.common.config.XenonConfiguration;
+import com.vmware.xenon.common.serialization.ServerSentEventConverter;
+import com.vmware.xenon.services.common.ServiceUriPaths;
 import com.vmware.xenon.services.common.authn.AuthenticationConstants;
 
 /**
@@ -60,9 +71,16 @@ import com.vmware.xenon.services.common.authn.AuthenticationConstants;
  */
 public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<Object> {
 
+    public static final boolean DISABLE_HTTP_ONLY_AUTH_COOKIE = XenonConfiguration.bool(
+            NettyHttpClientRequestHandler.class,
+            "DISABLE_HTTP_ONLY_AUTH_COOKIE",
+            false
+    );
+
     private static final String ERROR_MSG_DECODING_FAILURE = "Failure decoding HTTP request";
 
     private final ServiceHost host;
+    private final URI hostLocalUri;
 
     private final SslHandler sslHandler;
 
@@ -70,13 +88,23 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
 
     private NettyHttpListener listener;
 
+    private boolean secureAuthCookie;
+
     public NettyHttpClientRequestHandler(ServiceHost host, NettyHttpListener listener,
-            SslHandler sslHandler,
-            int responsePayloadSizeLimit) {
+            SslHandler sslHandler, int responsePayloadSizeLimit, boolean secureAuthCookie) {
         this.host = host;
+        try {
+            URI uri = host.getUri();
+            this.hostLocalUri = new URI(uri.getScheme(), null,
+                    ServiceHost.LOCAL_HOST, uri.getPort(), "", null, null);
+        } catch (URISyntaxException e) {
+            throw new IllegalStateException(e);
+        }
+
         this.listener = listener;
         this.sslHandler = sslHandler;
         this.responsePayloadSizeLimit = responsePayloadSizeLimit;
+        this.secureAuthCookie = secureAuthCookie;
     }
 
     @Override
@@ -101,6 +129,13 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
+        double startTime = 0;
+        String requestedPath = null;
+
+        if (this.host.isRequestLoggingEnabled()) {
+            startTime = System.nanoTime();
+        }
+
         Operation request = null;
         Integer streamId = null;
         try {
@@ -127,16 +162,18 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
                 request.setBody(ServiceErrorResponse.create(
                         new IllegalArgumentException(ERROR_MSG_DECODING_FAILURE),
                         request.getStatusCode()));
-                sendResponse(ctx, request, streamId);
+                sendResponse(ctx, request, streamId, null, startTime);
                 return;
             }
 
             parseRequestHeaders(ctx, request, nettyRequest);
 
             parseRequestUri(request, nettyRequest);
+            requestedPath = request.getUri().getPath();
 
-            decodeRequestBody(ctx, request, nettyRequest.content(), streamId);
-        } catch (Throwable e) {
+            decodeRequestBody(ctx, request, nettyRequest.content(), streamId,
+                    requestedPath, startTime);
+        } catch (Exception e) {
             this.host.log(Level.SEVERE, "Uncaught exception: %s", Utils.toString(e));
             if (request == null) {
                 request = Operation.createGet(this.host.getUri());
@@ -147,28 +184,13 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
             }
             request.setKeepAlive(false).setStatusCode(sc)
                     .setBodyNoCloning(ServiceErrorResponse.create(e, sc));
-            sendResponse(ctx, request, streamId);
+            sendResponse(ctx, request, streamId, requestedPath, startTime);
         }
     }
 
     private void parseRequestUri(Operation request, FullHttpRequest nettyRequest)
             throws URISyntaxException {
-        URI targetUri = new URI(nettyRequest.uri());
-        String decodedQuery = null;
-
-        if (!request.isForwarded() && !request.isFromReplication()) {
-            // do conservative parsing, normalization and decoding for non peer requests
-            targetUri = targetUri.normalize();
-            decodedQuery = targetUri.getQuery();
-            if (decodedQuery != null && !decodedQuery.isEmpty()) {
-                decodedQuery = QueryStringDecoder.decodeComponent(targetUri.getQuery());
-            }
-        }
-
-        String query = decodedQuery == null ? targetUri.getRawQuery() : decodedQuery;
-        URI uri = new URI(UriUtils.HTTP_SCHEME, targetUri.getUserInfo(),
-                ServiceHost.LOCAL_HOST,
-                this.host.getPort(), targetUri.getPath(), query, targetUri.getFragment());
+        URI uri = buildFullUri(request, nettyRequest.uri());
         request.setUri(uri);
 
         if (!request.hasReferer() && request.isFromReplication()) {
@@ -178,17 +200,59 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         }
     }
 
+    private URI buildFullUri(Operation request, String uriStr) throws URISyntaxException {
+        URI hostUri = this.hostLocalUri;
+        URI res;
+
+        // probably uri contains a userInfo
+        if (uriStr.charAt(0) != '/') {
+            URI t = new URI(uriStr);
+            res = new URI(
+                    hostUri.getScheme(),
+                    t.getUserInfo(),
+                    ServiceHost.LOCAL_HOST,
+                    hostUri.getPort(),
+                    t.getPath(),
+                    t.getQuery(),
+                    t.getFragment());
+        } else {
+            res = new URI(hostUri.toString() + uriStr);
+        }
+
+        if (!request.isForwarded() && !request.isFromReplication()) {
+            // do conservative parsing, normalization and decoding for non peer requests
+            res = res.normalize();
+            String orig = res.getQuery();
+            if (orig != null && !orig.isEmpty()) {
+                String decodedQuery = QueryStringDecoder.decodeComponent(orig);
+                if (decodedQuery != orig) {
+                    // something was really decoded, rebuild with the decoded query
+                    res = new URI(
+                            res.getScheme(),
+                            res.getUserInfo(),
+                            res.getHost(),
+                            res.getPort(),
+                            res.getPath(),
+                            decodedQuery,
+                            res.getFragment());
+                }
+            }
+        }
+
+        return res;
+    }
+
     private void decodeRequestBody(ChannelHandlerContext ctx, Operation request,
-            ByteBuf content, Integer streamId) throws Exception {
+            ByteBuf content, Integer streamId, String originalPath, double startTime) throws Exception {
         if (!content.isReadable()) {
             // skip body decode, request had no body
             request.setContentLength(0);
-            submitRequest(ctx, request, streamId);
+            submitRequest(ctx, request, streamId, originalPath, startTime);
             return;
         }
 
         Utils.decodeBody(request, content.nioBuffer(), true);
-        submitRequest(ctx, request, streamId);
+        submitRequest(ctx, request, streamId, originalPath, startTime);
     }
 
     private void parseRequestHeaders(ChannelHandlerContext ctx, Operation request,
@@ -216,7 +280,7 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         if (Operation.PRAGMA_DIRECTIVE_REPLICATED.equals(pragma)) {
             // replication requests will have a single PRAGMA directive. Set the right
             // options and remove the header to avoid further allocations
-            request.setFromReplication(true).setTargetReplicated(true);
+            request.setFromReplication(true);
         } else if (pragma != null) {
             request.addRequestHeader(Operation.PRAGMA_HEADER, pragma);
             if (pragma.contains(Operation.PRAGMA_DIRECTIVE_FORWARDED)) {
@@ -227,7 +291,7 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         if (pragma != null && pragma.contains(Operation.PRAGMA_DIRECTIVE_REPLICATED)) {
             // synchronization requests will have additional directives, so check again here
             // if the request is replicated
-            request.setFromReplication(true).setTargetReplicated(true);
+            request.setFromReplication(true);
         }
 
         request.setContextId(getAndRemove(headers, NettyHttpServiceClient.CONTEXT_ID_HEADER_ASCII));
@@ -285,12 +349,66 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         return headerValue;
     }
 
+    @SuppressWarnings("unchecked")
     private void submitRequest(ChannelHandlerContext ctx, Operation request,
-            Integer streamId) {
-        request.nestCompletion((o, e) -> {
-            request.setBodyNoCloning(o.getBodyRaw());
-            sendResponse(ctx, request, streamId);
-        });
+            Integer streamId, String originalPath, double startTime) {
+
+        final class CombinedHandler implements CompletionHandler, Consumer<Object> {
+            final AtomicBoolean isStreamingEnabled = new AtomicBoolean();
+
+            @Override
+            public void handle(Operation o, Throwable e) {
+                if (!this.isStreamingEnabled.get()) {
+                    request.setBodyNoCloning(o.getBodyRaw());
+                    sendResponse(ctx, request, streamId, originalPath, startTime);
+                } else {
+                    if (e != null) {
+                        ServerSentEvent errorEvent = new ServerSentEvent().setEvent(ServerSentEvent.EVENT_TYPE_ERROR)
+                                .setData(Utils.toJson(o.getBody(ServiceErrorResponse.class)));
+                        request.sendServerSentEvent(errorEvent);
+                    }
+                    concludeRequest(ctx, request, true);
+                }
+            }
+
+            @Override
+            public void accept(Object obj) {
+                if (obj instanceof ServerSentEvent) {
+                    ServerSentEvent event = (ServerSentEvent) obj;
+                    if (this.isStreamingEnabled.get()) {
+                        byte[] data = ServerSentEventConverter.INSTANCE.serialize(event).getBytes(ServerSentEventConverter.ENCODING_CHARSET);
+                        ByteBuf byteBuf = Unpooled.wrappedBuffer(data);
+                        ChannelFuture future = ctx.writeAndFlush(byteBuf);
+
+                        if (event.completionCallback != null) {
+                            future.addListener(f -> {
+                                if (f.isSuccess()) {
+                                    event.completionCallback.accept(null);
+                                } else {
+                                    String errMsg = String.format("Failed to push event. Failure: %s",
+                                            f.cause() != null ? f.cause().getMessage() : "unknown");
+                                    event.completionCallback.accept(
+                                            new IllegalStateException(errMsg, f.cause()));
+                                }
+                            });
+                        }
+                    } else {
+                        throw new RuntimeException("Call to startEventStream() or sendHeaders() is necessary to enable streaming!");
+                    }
+                } else {
+                    if (!this.isStreamingEnabled.getAndSet(true)) {
+                        HttpResponse response = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.valueOf(request.getStatusCode()));
+                        NettyHttpClientRequestHandler.this.addCommonHeaders(response, request, streamId);
+                        ctx.writeAndFlush(response);
+                    }
+                }
+            }
+        }
+
+        CompletionHandler ch = new CombinedHandler();
+        request.nestCompletion(ch);
+        request.nestHeadersReceivedHandler((Consumer<Operation>) ch);
+        request.nestServerSentEventHandler((Consumer<ServerSentEvent>) ch);
 
         request.toggleOption(OperationOption.CLONING_DISABLED, true);
 
@@ -301,11 +419,12 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         this.host.handleRequest(null, request);
     }
 
-    private void sendResponse(ChannelHandlerContext ctx, Operation request, Integer streamId) {
+    private void sendResponse(ChannelHandlerContext ctx, Operation request,
+            Integer streamId, String originalPath, double startTime) {
         try {
             applyRateLimit(ctx, request);
-            writeResponseUnsafe(ctx, request, streamId);
-        } catch (Throwable e1) {
+            writeResponseUnsafe(ctx, request, streamId, originalPath, startTime);
+        } catch (Exception e1) {
             this.host.log(Level.SEVERE, "%s", Utils.toString(e1));
         }
     }
@@ -319,12 +438,12 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
     }
 
     private void writeResponseUnsafe(ChannelHandlerContext ctx, Operation request,
-            Integer streamId) {
+            Integer streamId, String originalPath, double startTime) {
         ByteBuf bodyBuffer = null;
         FullHttpResponse response;
 
         try {
-            byte[] data = Utils.encodeBody(request);
+            byte[] data = Utils.encodeBody(request, false);
 
             // if some service returns a response that is greater than the maximum allowed size,
             // we return an INTERNAL_SERVER_ERROR.
@@ -332,17 +451,17 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
                 String errorMessage = "Content-Length " + request.getContentLength()
                         + " is greater than max size allowed " + this.responsePayloadSizeLimit;
                 this.host.log(Level.SEVERE, errorMessage);
-                writeInternalServerError(ctx, request, streamId, errorMessage);
+                writeInternalServerError(ctx, request, streamId, errorMessage, originalPath, startTime);
                 return;
             }
             if (data != null) {
                 bodyBuffer = Unpooled.wrappedBuffer(data);
             }
-        } catch (Throwable e1) {
+        } catch (Exception e1) {
             // Note that this is a program logic error - some service isn't properly checking or setting Content-Type
             this.host.log(Level.SEVERE, "Error encoding body: %s", Utils.toString(e1));
             writeInternalServerError(ctx, request, streamId,
-                    "Error encoding body: " + e1.getMessage());
+                    "Error encoding body: " + e1.getMessage(), originalPath, startTime);
             return;
         }
 
@@ -354,6 +473,13 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
                     HttpResponseStatus.valueOf(request.getStatusCode()), bodyBuffer, false, false);
         }
 
+        this.addCommonHeaders(response, request, streamId);
+        response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH,
+                response.content().readableBytes());
+        writeResponse(ctx, request, response, streamId, originalPath, startTime);
+    }
+
+    private void addCommonHeaders(HttpResponse response, Operation request, Integer streamId) {
         if (streamId != null) {
             // This is the stream ID from the incoming request: we need to use it for our
             // response so the client knows this is the response. If we don't set the stream
@@ -367,8 +493,6 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
 
         response.headers().set(HttpHeaderNames.CONTENT_TYPE,
                 request.getContentType());
-        response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH,
-                response.content().readableBytes());
 
         if (request.hasResponseHeaders()) {
             // add any other custom headers associated with operation
@@ -386,28 +510,36 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
             response.headers().add(Operation.REQUEST_AUTH_TOKEN_HEADER, token);
 
             // Client can also use the cookie if they prefer
-            StringBuilder buf = new StringBuilder()
-                    .append(AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE)
-                    .append('=')
-                    .append(token);
+            Cookie tokenCookie = new DefaultCookie(
+                    AuthenticationConstants.REQUEST_AUTH_TOKEN_COOKIE, token);
 
-            // Add Path qualifier, cookie applies everywhere
-            buf.append("; Path=/");
-            // Add an Max-Age qualifier if an expiration is set in the Claims object
-            if (authorizationContext.getClaims().getExpirationTime() != null) {
-                buf.append("; Max-Age=");
-                long maxAge = authorizationContext.getClaims().getExpirationTime()
-                        - Utils.getSystemNowMicrosUtc();
-                buf.append(maxAge > 0 ? TimeUnit.MICROSECONDS.toSeconds(maxAge) : 0);
+            // Add path qualifier, cookie applies everywhere
+            tokenCookie.setPath("/");
+
+            // Add a Max-Age qualifier if an expiration is set in the Claims object
+            Long expirationTime = authorizationContext.getClaims().getExpirationTime();
+            if (expirationTime != null) {
+                long nowSeconds = TimeUnit.MICROSECONDS.toSeconds(Utils.getSystemNowMicrosUtc());
+                long maxAge = expirationTime - nowSeconds;
+                tokenCookie.setMaxAge(maxAge > 0 ? maxAge : 0);
             }
-            response.headers().add(Operation.SET_COOKIE_HEADER, buf.toString());
-        }
 
-        writeResponse(ctx, request, response);
+            // Add an HTTP-only qualifier unless the caller has specified otherwise
+            if (!DISABLE_HTTP_ONLY_AUTH_COOKIE) {
+                tokenCookie.setHttpOnly(true);
+            }
+
+            // Toggle the secure qualifier according to the caller's specification.
+            tokenCookie.setSecure(this.secureAuthCookie);
+
+            // Encode the cookie and add the corresponding header to the HTTP response.
+            String tokenCookieString = ServerCookieEncoder.LAX.encode(tokenCookie);
+            response.headers().add(Operation.SET_COOKIE_HEADER, tokenCookieString);
+        }
     }
 
     private void writeInternalServerError(ChannelHandlerContext ctx, Operation request,
-            Integer streamId, String err) {
+            Integer streamId, String err, String originalPath, double startTime) {
         byte[] data;
         try {
             data = err.getBytes(Utils.CHARSET);
@@ -426,13 +558,12 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         response.headers().set(HttpHeaderNames.CONTENT_TYPE, Operation.MEDIA_TYPE_TEXT_HTML);
         response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH,
                 response.content().readableBytes());
-        writeResponse(ctx, request, response);
-        return;
+        writeResponse(ctx, request, response, streamId, originalPath, startTime);
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        Operation op = ctx.channel().attr(NettyChannelContext.OPERATION_KEY).get();
+        Operation op = ctx.channel().attr(NettyChannelContext.OPERATION_KEY).getAndSet(null);
         if (op != null) {
             this.host.log(Level.SEVERE,
                     "HTTP/1.1 listener channel exception: %s, in progress op: %s",
@@ -443,7 +574,6 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
             this.host.log(Level.SEVERE, "Listener channel exception: %s",
                     cause.getMessage());
         }
-        ctx.channel().attr(NettyChannelContext.OPERATION_KEY).set(null);
         ctx.close();
     }
 
@@ -457,13 +587,13 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
                     remote.getPort(),
                     path,
                     null));
-        } catch (Throwable e) {
+        } catch (Exception e) {
             this.host.log(Level.SEVERE, "%s", Utils.toString(e));
         }
     }
 
     private void writeResponse(ChannelHandlerContext ctx, Operation request,
-            FullHttpResponse response) {
+            FullHttpResponse response, Integer streamId, String originalPath, double startTime) {
         boolean isClose = !request.isKeepAlive() || response == null;
         Object rsp = Unpooled.EMPTY_BUFFER;
         if (response != null) {
@@ -473,8 +603,32 @@ public class NettyHttpClientRequestHandler extends SimpleChannelInboundHandler<O
         }
 
         ctx.channel().attr(NettyChannelContext.OPERATION_KEY).set(null);
-
         ChannelFuture future = ctx.writeAndFlush(rsp);
+
+        if (this.host.isRequestLoggingEnabled()) {
+            boolean avoidLogging =
+                    request.hasAnyPragmaDirective(this.host.getSkipLoggingPragmaDirectives()) ||
+                    (this.host.getRequestLoggingInfo().skipGossipRequests &&
+                            request.getUri().getPath().contains(ServiceUriPaths.NODE_GROUP_FACTORY));
+
+            if (!avoidLogging) {
+                double totalTimeMillis = (System.nanoTime() - startTime) / 1000000;
+                this.host.log(Level.INFO, "%s %s %s %s %d %d %.2fms",
+                        ctx.channel().remoteAddress(), request.getAction(), originalPath,
+                        streamId != null ? "HTTP/2" : "HTTP/1.1", request.getStatusCode(),
+                        request.getContentLength(), totalTimeMillis);
+            }
+        }
+
+        if (isClose) {
+            future.addListener(ChannelFutureListener.CLOSE);
+        }
+    }
+
+    private void concludeRequest(ChannelHandlerContext ctx, Operation request, boolean forceClose) {
+        boolean isClose = !request.isKeepAlive() || forceClose;
+        ctx.channel().attr(NettyChannelContext.OPERATION_KEY).set(null);
+        ChannelFuture future = ctx.writeAndFlush(Unpooled.EMPTY_BUFFER);
         if (isClose) {
             future.addListener(ChannelFutureListener.CLOSE);
         }

@@ -13,6 +13,7 @@
 
 package com.vmware.xenon.common;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -81,6 +82,22 @@ public final class ODataUtils {
             task.tenantLinks = tenantLinks;
         }
 
+        String commaSeparatedSelectFields = UriUtils.getODataSelectFieldsParamValue(op.getUri());
+        if (commaSeparatedSelectFields != null) {
+            task.querySpec.options.remove(QueryOption.EXPAND_CONTENT);
+            task.querySpec.options.add(QueryOption.EXPAND_SELECTED_FIELDS);
+
+            List<String> selectFields = Arrays.asList(commaSeparatedSelectFields.trim().split("\\s*,\\s*"));
+            List<QueryTerm> queryTerms = new ArrayList<>(selectFields.size());
+            for (String field : selectFields) {
+                QueryTerm fieldTerm = new QueryTerm();
+                fieldTerm.propertyName = field;
+                fieldTerm.propertyType = TypeName.STRING;
+                queryTerms.add(fieldTerm);
+            }
+            task.querySpec.selectTerms = queryTerms;
+        }
+
         UriUtils.ODataOrderByTuple orderBy = UriUtils.getODataOrderByParamValue(op.getUri());
         if (orderBy != null) {
             if (count && validate) {
@@ -121,9 +138,7 @@ public final class ODataUtils {
 
         Integer skip = UriUtils.getODataSkipParamValue(op.getUri());
         if (skip != null) {
-            op.fail(new IllegalArgumentException(
-                    UriUtils.URI_PARAM_ODATA_SKIP + " is not supported, see skipto"));
-            return null;
+            task.querySpec.offset = skip;
         }
 
         Integer limit = UriUtils.getODataLimitParamValue(op.getUri());

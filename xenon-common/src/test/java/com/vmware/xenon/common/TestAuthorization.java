@@ -30,6 +30,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
@@ -46,16 +47,20 @@ import org.junit.Test;
 import com.vmware.xenon.common.Operation.AuthorizationContext;
 import com.vmware.xenon.common.Operation.CompletionHandler;
 import com.vmware.xenon.common.Service.Action;
+import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.TestAuthorization.AuthzStatefulService.AuthzState;
 import com.vmware.xenon.common.test.AuthorizationHelper;
 import com.vmware.xenon.common.test.QueryTestUtils;
 import com.vmware.xenon.common.test.TestContext;
+import com.vmware.xenon.common.test.TestRequestSender;
+import com.vmware.xenon.common.test.TestRequestSender.FailureResponse;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.AuthorizationCacheUtils;
 import com.vmware.xenon.services.common.AuthorizationContextService;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.GuestUserService;
+import com.vmware.xenon.services.common.MinimalFactoryTestService;
 import com.vmware.xenon.services.common.MinimalTestService;
 import com.vmware.xenon.services.common.QueryTask;
 import com.vmware.xenon.services.common.QueryTask.Query;
@@ -64,6 +69,9 @@ import com.vmware.xenon.services.common.QueryTask.QueryTerm.MatchType;
 import com.vmware.xenon.services.common.RoleService;
 import com.vmware.xenon.services.common.RoleService.Policy;
 import com.vmware.xenon.services.common.RoleService.RoleState;
+import com.vmware.xenon.services.common.ServiceHostManagementService;
+import com.vmware.xenon.services.common.ServiceUriPaths;
+import com.vmware.xenon.services.common.TransactionService.TransactionServiceState;
 import com.vmware.xenon.services.common.UserGroupService;
 import com.vmware.xenon.services.common.UserGroupService.UserGroupState;
 import com.vmware.xenon.services.common.UserService.UserState;
@@ -140,6 +148,32 @@ public class TestAuthorization extends BasicTestCase {
     }
 
     @Test
+    public void factoryGetWithOData() {
+        // GET with ODATA will be implicitly converted to a query task. Query tasks
+        // require explicit authorization for the principal to be able to create them
+        URI exampleFactoryUriWithOData = UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK,
+                "$limit=10");
+        TestRequestSender sender = this.host.getTestRequestSender();
+        FailureResponse rsp = sender.sendAndWaitFailure(Operation.createGet(exampleFactoryUriWithOData));
+        ServiceErrorResponse errorRsp = rsp.op.getErrorResponseBody();
+        assertTrue(errorRsp.message.toLowerCase().contains("forbidden"));
+        assertTrue(errorRsp.message.contains(UriUtils.URI_PARAM_ODATA_TENANTLINKS));
+
+        exampleFactoryUriWithOData = UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK,
+                "$filter=name eq someone");
+        rsp = sender.sendAndWaitFailure(Operation.createGet(exampleFactoryUriWithOData));
+        errorRsp = rsp.op.getErrorResponseBody();
+        assertTrue(errorRsp.message.toLowerCase().contains("forbidden"));
+        assertTrue(errorRsp.message.contains(UriUtils.URI_PARAM_ODATA_TENANTLINKS));
+
+        // GET without ODATA should succeed but return empty result set
+        URI exampleFactoryUri = UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK);
+        Operation rspOp = sender.sendAndWait(Operation.createGet(exampleFactoryUri));
+        ServiceDocumentQueryResult queryRsp = rspOp.getBody(ServiceDocumentQueryResult.class);
+        assertEquals(0L, (long) queryRsp.documentCount);
+    }
+
+    @Test
     public void statelessServiceAuthorization() throws Throwable {
         // assume system identity so we can create roles
         this.host.setSystemAuthorizationContext();
@@ -204,6 +238,7 @@ public class TestAuthorization extends BasicTestCase {
         this.host.startService(post, new AuthzStatelessService());
         this.host.testWait();
 
+        this.host.setOperationTracingLevel(Level.FINER);
         // Verify PATCH
         Operation patch = Operation.createPatch(UriUtils.buildUri(this.host, serviceLink));
         patch.setBody(new ServiceDocument());
@@ -211,6 +246,7 @@ public class TestAuthorization extends BasicTestCase {
         patch.setCompletion(this.host.getCompletion());
         this.host.send(patch);
         this.host.testWait();
+        this.host.setOperationTracingLevel(Level.ALL);
 
         // Verify DENY PATCH
         this.host.resetAuthorizationContext();
@@ -359,27 +395,75 @@ public class TestAuthorization extends BasicTestCase {
 
         OperationContext.setAuthorizationContext(null);
 
-        // Execute get on factory trying to get all example services
-        final ServiceDocumentQueryResult[] factoryGetResult = new ServiceDocumentQueryResult[1];
-        Operation getFactory = Operation.createGet(
-                UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK))
-                .setCompletion((o, e) -> {
-                    if (e != null) {
-                        this.host.failIteration(e);
-                        return;
-                    }
+        TestRequestSender sender = this.host.getTestRequestSender();
+        Operation responseOp = sender.sendAndWait(Operation.createGet(this.host, ExampleService.FACTORY_LINK));
 
-                    factoryGetResult[0] = o.getBody(ServiceDocumentQueryResult.class);
-                    this.host.completeIteration();
-                });
-
-        this.host.testStart(1);
-        this.host.send(getFactory);
-        this.host.testWait();
+        Map<String, ServiceStats.ServiceStat> stat = this.host.getServiceStats(
+                UriUtils.buildUri(this.host, ServiceUriPaths.CORE_MANAGEMENT));
+        double currentInsertCount = stat.get(
+                ServiceHostManagementService.STAT_NAME_AUTHORIZATION_CACHE_INSERT_COUNT).latestValue;
 
         // Make sure only the authorized services were returned
-        assertAuthorizedServicesInResult("guest", exampleServices, factoryGetResult[0]);
+        ServiceDocumentQueryResult getResult = responseOp.getBody(ServiceDocumentQueryResult.class);
+        assertAuthorizedServicesInResult("guest", exampleServices, getResult);
 
+        // Make a second request and verify that the cache did not get updated, instead Xenon re-used
+        // the cached Guest authorization context.
+        sender.sendAndWait(Operation.createGet(this.host, ExampleService.FACTORY_LINK));
+        stat = this.host.getServiceStats(
+                UriUtils.buildUri(this.host, ServiceUriPaths.CORE_MANAGEMENT));
+        double newInsertCount = stat.get(
+                ServiceHostManagementService.STAT_NAME_AUTHORIZATION_CACHE_INSERT_COUNT).latestValue;
+        assertTrue(currentInsertCount == newInsertCount);
+
+        // Make sure that Authorization Context cache in Xenon has atleast one cached token.
+        double currentCacheSize = stat.get(
+                ServiceHostManagementService.STAT_NAME_AUTHORIZATION_CACHE_SIZE).latestValue;
+        assertTrue(currentCacheSize == newInsertCount);
+    }
+
+    @Test
+    public void testODLGetWithAuthorization() throws Throwable {
+        long cacheDelayInterval = TimeUnit.MILLISECONDS.toMicros(100);
+        this.host.setMaintenanceIntervalMicros(cacheDelayInterval);
+        this.host.setServiceCacheClearDelayMicros(cacheDelayInterval);
+
+        OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
+        AuthorizationHelper authsetupHelper = new AuthorizationHelper(this.host);
+        String email = "foo@foo.com";
+        String userLink = authsetupHelper.createUserService(this.host, email);
+        Query userGroupQuery = Query.Builder.create().addFieldClause(UserState.FIELD_NAME_EMAIL, email).build();
+        String userGroupLink = authsetupHelper.createUserGroup(this.host, email, userGroupQuery);
+        Query resourceGroupQuery = Query.Builder.create().addFieldClause(ServiceDocument.FIELD_NAME_SELF_LINK, "*", MatchType.WILDCARD).build();
+        String resourceGroupLink = authsetupHelper.createResourceGroup(this.host, email, resourceGroupQuery);
+
+        EnumSet<ServiceOption> caps = EnumSet.of(ServiceOption.PERSISTENCE, ServiceOption.FACTORY_ITEM);
+        // Start the factory service. it will be needed to start services on-demand
+        MinimalFactoryTestService factoryService = new MinimalFactoryTestService();
+        factoryService.setChildServiceCaps(caps);
+        this.host.startServiceAndWait(factoryService, "service", null);
+        // Start some test services
+        List<Service> services = this.host.doThroughputServiceStart(this.serviceCount,
+                MinimalTestService.class, this.host.buildMinimalTestState(), caps, null);
+        // verify services have stopped
+        this.host.waitFor("wait for services to stop.", () -> {
+            for (Service service : services) {
+                if (this.host.getServiceStage(service.getSelfLink()) != null) {
+                    return false;
+                }
+            }
+            return true;
+        });
+
+        this.host.assumeIdentity(userLink);
+        this.host.sendAndWaitExpectFailure(
+                Operation.createGet(UriUtils.buildUri(this.host, services.get(0).getSelfLink())));
+        OperationContext.setAuthorizationContext(this.host.getSystemAuthorizationContext());
+        authsetupHelper.createRole(this.host, userGroupLink, resourceGroupLink, EnumSet.of(Action.GET));
+        // Assume identity, GET should now succeed
+        this.host.assumeIdentity(userLink);
+        this.host.sendAndWaitExpectSuccess(
+                Operation.createGet(UriUtils.buildUri(this.host, services.get(0).getSelfLink())));
     }
 
     @Test
@@ -456,9 +540,10 @@ public class TestAuthorization extends BasicTestCase {
 
         // PATCH operation should be allowed
         for (String selfLink : selfLinks) {
+            URI uri = UriUtils.buildUri(this.host, selfLink);
             Operation patchOperation =
-                    Operation.createPatch(UriUtils.buildUri(this.host, selfLink))
-                        .setBody(exampleServices.get(selfLink))
+                    Operation.createPatch(uri)
+                        .setBody(exampleServices.get(uri))
                         .setCompletion((o, e) -> {
                             if (o.getStatusCode() != Operation.STATUS_CODE_OK) {
                                 String message = String.format("Expected %d, got %s",
@@ -705,6 +790,42 @@ public class TestAuthorization extends BasicTestCase {
 
         assertNull(this.host.getAuthorizationContext(s, authContext1.getToken()));
         assertNull(this.host.getAuthorizationContext(s, authContext2.getToken()));
+    }
+
+    @Test
+    public void transactionWithAuth() throws Throwable {
+        // assume system identity so we can create roles
+        this.host.setSystemAuthorizationContext();
+        String resourceGroupLink = this.authHelper.createResourceGroup(this.host,
+                "transaction-group", Builder.create()
+                        .addFieldClause(
+                                ServiceDocument.FIELD_NAME_KIND,
+                                Utils.buildKind(TransactionServiceState.class))
+                        .build());
+        this.authHelper.createRole(this.host, this.authHelper.getUserGroupLink(),
+                resourceGroupLink, EnumSet.allOf(Action.class));
+        this.host.resetAuthorizationContext();
+        // assume identity as Jane and test to see if example service documents can be created
+        this.host.assumeIdentity(this.userServicePath);
+        String txid = TestTransactionUtils.newTransaction(this.host);
+        OperationContext.setTransactionId(txid);
+        createExampleServices("jane");
+        boolean committed = TestTransactionUtils.commit(this.host, txid);
+        assertTrue(committed);
+        OperationContext.setTransactionId(null);
+        ServiceDocumentQueryResult res = host.getFactoryState(UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK));
+        assertEquals(Long.valueOf(this.serviceCount), res.documentCount);
+        // next create docs and abort; these documents must  not be present
+        txid = TestTransactionUtils.newTransaction(this.host);
+        OperationContext.setTransactionId(txid);
+        createExampleServices("jane");
+        res = host.getFactoryState(UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK));
+        assertEquals(Long.valueOf(2 * this.serviceCount), res.documentCount);
+        boolean aborted = TestTransactionUtils.abort(this.host, txid);
+        assertTrue(aborted);
+        OperationContext.setTransactionId(null);
+        res = host.getFactoryState(UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK));
+        assertEquals(Long.valueOf( this.serviceCount), res.documentCount);
     }
 
     @Test
